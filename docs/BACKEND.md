@@ -146,7 +146,7 @@ Step 2:  Retrieve from the Conversation Collection.
 Step 3:  Pass retrieved conversations + original question to Model A
          (a lightweight LLM or prompt-engineered call).
          → Model A extracts the most relevant conversation context
-           and produces a REWRITTEN QUERY that is more specific
+           and produces a REWRITTEN QUERY that is more specific (rewritten query becomes official user query in the remaining pipeline of RAG)
            and contextually enriched.
 
 Step 4:  Use the rewritten query to retrieve from Knowledge Facts Collection.
