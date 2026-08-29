@@ -154,4 +154,5 @@ RAG Application/
 | [BACKEND.md](./BACKEND.md) | Weaviate data model, retrieval pipeline, wizard CRUD operations, text processing pipeline |
 | [FRONTEND.md](./FRONTEND.md) | UI layout, chat mode, knowledge facts mode, policy mode |
 | [API.md](./API.md) | REST endpoint reference for chat, knowledge facts, and policy wizards |
+| [CONFIG_SPECS.md](./CONFIG_SPECS.md) | Models, hyperparameters, search top-k, chunking, and token budgets |
 | [DESIGN_DECISIONS.md](./DESIGN_DECISIONS.md) | Architectural rationale, non-functional requirements, future considerations |

@@ -116,19 +116,21 @@ All three collections follow the same two-stage retrieval procedure. Only the re
               └────────────────────────┘
 ```
 
-**Stage 1 — Hybrid Search:** Weaviate executes a combined dense vector similarity search and sparse BM25 keyword search, fusing scores via reciprocal rank fusion (or Weaviate's built-in alpha-weighted hybrid).
+**Stage 1 — Hybrid Search:** Weaviate executes a combined dense vector similarity search (`text-embedding-3-small`) and sparse BM25 keyword search, fused via `relativeScoreFusion` with `alpha = 0.70` (70% dense, 30% BM25).
 
 **Stage 2 — Reranking:**
-- **Conversation Collection:** Apply Maximal Marginal Relevance (MMR) to promote diversity among retrieved past conversations and reduce redundancy.
-- **Knowledge Facts & Policy Collections:** Apply a cross-encoder reranker for higher precision on factual/policy content where accuracy matters more than diversity.
+- **Conversation Collection:** Apply Maximal Marginal Relevance (MMR) with $\lambda = 0.70$ to promote diversity among retrieved past conversations and reduce redundancy.
+- **Knowledge Facts & Policy Collections:** Apply a cross-encoder reranker (`Cohere rerank-v4.0-fast`) for higher precision on factual/policy content where accuracy matters more than diversity.
 
-**Top-K Configuration (tunable per collection):**
+**Top-K Configuration:**
 
-| Collection | Hybrid Top-K (Stage 1) | Reranked Top-K (Stage 2) |
-|---|---|---|
-| Conversation | Configurable (e.g., 20) | Configurable (e.g., 5) |
-| Knowledge Facts | Configurable (e.g., 30) | Configurable (e.g., 10) |
-| Policy | Configurable (e.g., 20) | Configurable (e.g., 5) |
+| Collection | Hybrid Candidate (Stage 1) | Reranking Strategy | Stage 2 Final (Top-K) |
+|---|---|---|---|
+| Conversation | `20` | MMR ($\lambda = 0.70$) | `5` |
+| Knowledge Facts | `30` | Cross-Encoder (`Cohere rerank-v4.0-fast`) | `8` |
+| Policy | `20` | Cross-Encoder (`Cohere rerank-v4.0-fast`) | `5` |
+
+*(See [CONFIG_SPECS.md](./CONFIG_SPECS.md) for full configuration details.)*
 
 ---
 
@@ -325,7 +327,7 @@ This produces semantically meaningful paragraph divisions that respect topic shi
 
 **Output:** A dense vector embedding stored in Weaviate.
 
-**Model:** Use a high-quality sentence embedding model (e.g., `all-MiniLM-L6-v2`, `text-embedding-3-small`, or domain-tuned equivalent). The same model must be used for both indexing and query-time embedding to ensure compatible vector spaces.
+**Model:** `text-embedding-3-small` (OpenAI API). The same model must be used for both indexing and query-time embedding to ensure compatible vector spaces. (See [CONFIG_SPECS.md](./CONFIG_SPECS.md)).
 
 ---
 

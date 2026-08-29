@@ -10,4 +10,5 @@ Full-stack RAG application for Generative AI Engineer FAANG interview coaching. 
 | [BACKEND.md](./docs/BACKEND.md) | Weaviate data model, retrieval pipeline, wizard CRUD, text processing |
 | [FRONTEND.md](./docs/FRONTEND.md) | UI layout, chat mode, knowledge facts mode, policy mode |
 | [API.md](./docs/API.md) | REST endpoint reference (chat, knowledge facts, policy wizards) |
+| [CONFIG_SPECS.md](./docs/CONFIG_SPECS.md) | Models, hyperparameters, search top-k, chunking, and token budgets |
 | [DESIGN_DECISIONS.md](./docs/DESIGN_DECISIONS.md) | Architectural rationale, non-functional requirements, future roadmap |
