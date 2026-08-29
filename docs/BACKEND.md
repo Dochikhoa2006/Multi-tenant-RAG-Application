@@ -12,7 +12,7 @@ All backend logic for the Smart RAG Interview Preparation System. Covers Weaviat
 
 2. **Flat Chunk Equality.** Although metadata carries a parent–child hierarchy (document → paragraph → chunk), all chunk embeddings within a collection are treated as equals during retrieval. A chunk from Document A, Paragraph 2 competes on identical footing with a chunk from Document B, Paragraph 7. The hierarchy exists solely for lifecycle management (e.g., deleting a wizard removes all its descendant chunks).
 
-3. **Per-User Named Collections.** Each user gets three physically separate Weaviate collections, named using the convention `{user_id}_conversations`, `{user_id}_knowledge_facts`, and `{user_id}_policy`. Retrieval queries target only the current user's collections — there is no retrieve-then-filter pattern where overwhelming data from other users could dominate top-k results before filtering. One user's collections are invisible to and unreachable by another user.
+3. **Per-User Named Collections.** Each user gets three physically separate Weaviate collections. The logical namespaces remain `{user_id}_conversations`, `{user_id}_knowledge_facts`, and `{user_id}_policy`; their physical Weaviate names use the collision-free encoding below. Retrieval queries target only the current user's collections — there is no retrieve-then-filter pattern where overwhelming data from other users could dominate top-k results before filtering. One user's collections are invisible to and unreachable by another user.
 
 ### 1.2 Collection Schemas (Weaviate — Chunk-Level Only)
 
@@ -50,19 +50,31 @@ Identical schema to Knowledge Facts Collection. Stored and queried in a complete
 
 #### Collection Naming Convention
 
-Collections are created dynamically per user using the pattern:
+Weaviate collection names must begin with an uppercase character and contain
+only GraphQL-compatible identifier characters. The physical name encodes the
+exact UTF-8 bytes of `user_id` with unpadded RFC 4648 Base32:
 
 | Collection Type | Naming Pattern | Example |
 |---|---|---|
-| Conversation | `{user_id}_conversations` | `usr_abc123_conversations` |
-| Knowledge Facts | `{user_id}_knowledge_facts` | `usr_abc123_knowledge_facts` |
-| Policy | `{user_id}_policy` | `usr_abc123_policy` |
+| Conversation | `RagUser_{base32_user_id}_Conversations` | `RagUser_OVZXEX3BMJRTCMRT_Conversations` |
+| Knowledge Facts | `RagUser_{base32_user_id}_KnowledgeFacts` | `RagUser_OVZXEX3BMJRTCMRT_KnowledgeFacts` |
+| Policy | `RagUser_{base32_user_id}_Policy` | `RagUser_OVZXEX3BMJRTCMRT_Policy` |
 
-Each user's collections are physically separate Weaviate collections. Retrieval queries target only the specific user's collection — no post-retrieval filtering is needed.
+The encoding is reversible and does not sanitize or discard identifier
+characters, so distinct validated user IDs cannot map to the same physical
+name. `get_collection_name()` is authoritative for creation, existence checks,
+CRUD, and search. Each user's collections remain physically separate; no
+post-retrieval filtering is used.
 
 ### 1.3 Parent-Child Mapping Structure (Non-Weaviate)
 
-Parent entities do not have independent Weaviate schemas. They are lightweight mappings that track their child IDs, enabling lifecycle operations like cascading deletes. These mappings live in the application layer (e.g., in-memory, a relational database, or a key-value store — not in Weaviate).
+Parent entities do not have independent Weaviate schemas. They are lightweight mappings that track their child IDs, enabling lifecycle operations like cascading deletes. In Stage 2 these mappings are intentionally process-local and in-memory; the application must use one authoritative map instance per user and collection namespace.
+
+This is a single-process prototype limitation. Mapping state is lost on backend
+restart and cannot be coordinated safely across multiple workers. Production
+deployment therefore requires a separately approved durable mapping design.
+Adding Redis, SQL, or a fourth Weaviate metadata collection would change the
+documented architecture and is not part of Stage 2.
 
 ```
 Session
@@ -278,6 +290,11 @@ Step 8:  CONFIRM SAVE
 3. The deletion is permanent and irreversible. There is no soft-delete or recycle bin.
 4. Remove the wizard from the frontend display.
 
+The collection-layer `delete_many()` call is only a low-level,
+non-transactional deletion primitive. It does not by itself satisfy the
+application-level atomic wizard-delete requirement. Later wizard orchestration
+must own verification, compensation, and when the mapping/UI state is removed.
+
 ---
 
 ## 5. Conversation Embedding (Background)
@@ -358,4 +375,3 @@ The frontend uses an optimistic UI pattern — every button action immediately u
 - Expose a task status endpoint so the frontend can check whether a background operation succeeded or failed.
 - On failure, the frontend displays a non-blocking toast notification with a retry option.
 - Failed tasks do **not** automatically retry — the user must explicitly trigger a retry.
-

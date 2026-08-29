@@ -1,4 +1,5 @@
 sentence-transformers
 numpy
 tiktoken
+weaviate-client>=4.16.4,<5
 pytest

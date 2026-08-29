@@ -21,7 +21,15 @@ Separating them allows independent retrieval strategies (MMR for diverse convers
 
 ### Why Per-User Named Collections Instead of Shared Collections with Filtering?
 
-Each user gets three physically separate Weaviate collections (e.g., `user123_conversations`, `user123_knowledge_facts`, `user123_policy`) rather than sharing global collections with a `user_id` filter. This ensures retrieval queries only ever touch the current user's data at the storage level. A shared collection with post-retrieval filtering would risk a scenario where one user's overwhelming volume of data dominates the top-k results before filtering, leaving the actual user with poor or empty retrieval. Per-user named collections eliminate this class of failure entirely.
+Each user gets three physically separate Weaviate collections rather than sharing global collections with a `user_id` filter. Physical names use `RagUser_{unpadded_base32_utf8_user_id}_{collection_suffix}` so every validated user ID maps reversibly to a GraphQL-compatible namespace without collision-prone sanitization. This ensures retrieval queries only ever touch the current user's data at the storage level. A shared collection with post-retrieval filtering would risk a scenario where one user's overwhelming volume of data dominates the top-k results before filtering, leaving the actual user with poor or empty retrieval. Per-user named collections eliminate this class of failure entirely.
+
+### Stage 2 Mapping Durability
+
+Session, document, and paragraph mappings are intentionally in-memory for the
+single-process Stage 2 prototype. They are not restart-safe and must not be
+shared across independent backend workers. Before production deployment, a
+durable design consistent with Weaviate as the source of truth must be approved;
+that change may require revisiting the current three-collection data model.
 
 ### Why Cascade-Delete Sessions?
 

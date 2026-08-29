@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
+
+import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -31,12 +34,24 @@ def test_operational_config_is_overridable_but_collection_names_are_invariant(
     second_file.write_text("second", encoding="utf-16")
     code = """
 import sys
-from backend.config import COLLECTION_TYPES, get_collection_name
+from backend.config import (
+    COLLECTION_TYPES,
+    WEAVIATE_GRPC_PORT,
+    WEAVIATE_GRPC_SECURE,
+    WEAVIATE_URL,
+    get_collection_name,
+)
 from backend.processing.file_reader import read_text_files
 
 assert COLLECTION_TYPES == frozenset({'conversations', 'knowledge_facts', 'policy'})
-assert get_collection_name('user.name', 'conversations') == 'user.name_conversations'
-assert get_collection_name('usr_abc123', 'conversations') == 'usr_abc123_conversations'
+assert WEAVIATE_URL == 'https://weaviate.example.test:8443'
+assert WEAVIATE_GRPC_PORT == 50443
+assert WEAVIATE_GRPC_SECURE is False
+assert get_collection_name('user.name', 'conversations') == 'RagUser_OVZWK4RONZQW2ZI_Conversations'
+assert get_collection_name('usr_abc123', 'conversations') == 'RagUser_OVZXEX3BMJRTCMRT_Conversations'
+assert get_collection_name('客户/email@example.com', 'policy') == (
+    'RagUser_4WXKFZUIW4XWK3LBNFWEAZLYMFWXA3DFFZRW63I_Policy'
+)
 try:
     get_collection_name('user.name', 'memory')
 except ValueError:
@@ -52,7 +67,10 @@ assert read_text_files(sys.argv[1:]) == 'first||second'
             **os.environ,
             "COLLECTION_TYPES": "memory,rules",
             "COLLECTION_NAME_TEMPLATE": "{collection_type}__{user_id}",
-            "USER_ID_PATTERN": r"^[A-Za-z0-9_.-]+$",
+            "USER_ID_PATTERN": r"^.+$",
+            "WEAVIATE_URL": "https://weaviate.example.test:8443",
+            "WEAVIATE_GRPC_PORT": "50443",
+            "WEAVIATE_GRPC_SECURE": "false",
             "SUPPORTED_FILE_EXTENSIONS": ".data",
             "TEXT_FILE_ENCODING": "utf-16",
             "TEXT_FILE_JOIN_SEPARATOR": "||",
@@ -63,6 +81,36 @@ assert read_text_files(sys.argv[1:]) == 'first||second'
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_physical_collection_names_are_graphql_safe_and_collision_free() -> None:
+    from backend.config import get_collection_name
+
+    expected = {
+        "conversations": "RagUser_OVZXEX3BMJRTCMRT_Conversations",
+        "knowledge_facts": "RagUser_OVZXEX3BMJRTCMRT_KnowledgeFacts",
+        "policy": "RagUser_OVZXEX3BMJRTCMRT_Policy",
+    }
+    names = {
+        collection_type: get_collection_name("usr_abc123", collection_type)
+        for collection_type in expected
+    }
+
+    assert names == expected
+    assert all(re.fullmatch(r"[A-Z][_0-9A-Za-z]*", name) for name in names.values())
+    distinct_users = ["usr-1", "usr_1", "A", "a"]
+    physical_names = [
+        get_collection_name(user_id, "conversations") for user_id in distinct_users
+    ]
+    assert len(set(physical_names)) == len(distinct_users)
+
+
+@pytest.mark.parametrize("user_id", [" usr_abc123", "usr_abc123 ", "\tusr_abc123"])
+def test_collection_names_reject_lossy_user_id_normalization(user_id: str) -> None:
+    from backend.config import get_collection_name
+
+    with pytest.raises(ValueError, match="whitespace"):
+        get_collection_name(user_id, "conversations")
 
 
 def test_model_and_processing_configuration_is_environment_overridable() -> None:
