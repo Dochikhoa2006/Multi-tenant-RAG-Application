@@ -170,7 +170,7 @@ Step 5:  Use the rewritten query to retrieve from Policy Collection.
          → Hybrid search + cross-encoder reranking.
 
 Step 6:  Compose final prompt:
-           - Original user question
+           - Official rewritten query
            - Retrieved knowledge facts
            - Retrieved policy guidelines
          → Send to the primary LLM.
