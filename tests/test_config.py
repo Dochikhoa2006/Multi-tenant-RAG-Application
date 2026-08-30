@@ -289,6 +289,37 @@ def test_session_title_model_defaults_to_primary_generator_model() -> None:
     assert result.returncode == 0, result.stderr
 
 
+def test_onnx_execution_provider_defaults_to_cuda_without_fallback() -> None:
+    environment = os.environ.copy()
+    for name in (
+        "ONNX_EMBEDDING_EXECUTION_PROVIDER",
+        "ONNX_RERANKER_EXECUTION_PROVIDER",
+        "ONNX_EMBEDDING_DISABLE_CPU_FALLBACK",
+        "ONNX_RERANKER_DISABLE_CPU_FALLBACK",
+    ):
+        environment.pop(name, None)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from backend.model_config import ONNX_EMBEDDING, ONNX_RERANKER; "
+                "assert ONNX_EMBEDDING.execution_provider == 'CUDAExecutionProvider'; "
+                "assert ONNX_RERANKER.execution_provider == 'CUDAExecutionProvider'; "
+                "assert ONNX_EMBEDDING.disable_cpu_fallback is True; "
+                "assert ONNX_RERANKER.disable_cpu_fallback is True"
+            ),
+        ],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_invalid_environment_configuration_fails_fast() -> None:
     result = _run_python(
         "import backend.model_config",

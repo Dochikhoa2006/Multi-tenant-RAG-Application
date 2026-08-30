@@ -61,17 +61,21 @@ Even though chunks are organized under paragraphs and documents, retrieval treat
 
 Dense embedding uses `Alibaba-NLP/gte-modernbert-base` and Knowledge/Policy
 cross-encoder scoring uses `BAAI/bge-reranker-v2-m3`. Both execute through one
-reused ONNX Runtime CUDA/FP16 session with batched inputs. Embeddings are
+reused local ONNX Runtime session with batched FP16 artifacts; CUDA is the
+production-default provider. Embeddings are
 CLS-pooled, converted to float32, L2-normalized, and fixed at 768 dimensions;
 the reranker returns descending raw logits with original result indices.
 Runtime model downloads, remote code, CPU fallback, and paid embedding or
 reranking calls are deliberately prohibited.
 
-The embedding-space change requires an exclusive maintenance rebuild. All
-canonical records are first exported from `raw_text` with UUIDs and properties,
-checksummed, then each collection is recreated and verified before its vector
-profile changes from `rebuilding` to `ready`. The application refuses stale or
-partially rebuilt profiles, so incompatible vector dimensions cannot mix.
+The embedding-space change cannot preserve an existing populated prototype:
+its session, transcript/title, document, paragraph, and chunk-ownership maps
+are process-local and disappear when FastAPI stops. The supplied maintenance
+tool therefore fails on any stored object and only recreates explicitly
+disposable, empty canonical collection triplets. It rechecks zero counts before
+mutation and changes profiles from `rebuilding` to `ready` only after schema and
+empty-state verification. Populated migration requires a separately approved
+durable mapping/session design.
 
 ### Why Rewrite the Query Using Conversation History?
 

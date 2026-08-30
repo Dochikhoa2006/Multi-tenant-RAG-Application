@@ -379,14 +379,16 @@ This produces semantically meaningful paragraph divisions that respect topic shi
 
 **Output:** A dense vector embedding stored in Weaviate.
 
-**Model:** `Alibaba-NLP/gte-modernbert-base`, executed locally through ONNX Runtime CUDA/FP16. Embeddings use CLS pooling, float32 post-processing, L2 normalization, and exactly 768 dimensions. The same model/profile must be used for indexing and query-time embedding. Ready collections are tagged with `gte-modernbert-base-e7f32e3-fp16-cls-l2-768-v1`; old, missing, or rebuilding profiles are rejected. (See [CONFIG_SPECS.md](./CONFIG_SPECS.md)).
+**Model:** `Alibaba-NLP/gte-modernbert-base`, executed locally from an FP16 graph through the explicitly configured ONNX Runtime provider (CUDA by default). Embeddings use CLS pooling, float32 post-processing, L2 normalization, and exactly 768 dimensions. The same model/profile must be used for indexing and query-time embedding. Ready collections are tagged with `gte-modernbert-base-e7f32e3-fp16-cls-l2-768-v1`; old, missing, or rebuilding profiles are rejected. (See [CONFIG_SPECS.md](./CONFIG_SPECS.md)).
 
-Changing embedding spaces requires an exclusive maintenance rebuild with
-`scripts/migrate_onnx_vectors.py`: export exact UUIDs/properties/`raw_text`
-without old vectors, rebuild all three canonical collections using only new
-embeddings, verify object counts/properties/vector shape and normalization, and
-only then mark the collections `ready`. See `deployment/README.md` for the
-backup, export, rebuild, verification, and resume sequence.
+The supplied `scripts/migrate_onnx_vectors.py` does not migrate populated
+application state. Stopping FastAPI loses process-local session, transcript,
+title, document, paragraph, and chunk-ownership mappings that Weaviate records
+cannot reconstruct. The command requires explicit disposable-state
+confirmation, fails if any canonical collection contains an object, and only
+recreates empty canonical triplets under the new ready profile. A populated
+migration requires durable mapping/session preservation that is outside this
+prototype. See `deployment/README.md` for the guarded empty-state sequence.
 
 ---
 
@@ -431,16 +433,19 @@ The frontend uses an optimistic UI pattern — every button action immediately u
 ### 7.4 Production Composition
 
 Provider adapters are injected at the application composition root rather than
-implemented by Stage 5. A deployment-owned ASGI module constructs one shared
-manager and queue, the concrete provider clients, `RAGRuntime`, and
-`AppServices`. Its provider LLM is wrapped by `RoleRoutingLLMClient`, which sends
+implemented by Stage 5. No production ASGI composition module currently exists
+in this repository. Deployment remains blocked until the deployment-owned
+module constructs one shared manager and queue, exactly one shared
+`ONNXEmbeddingClient`, exactly one shared `ONNXCrossEncoderReranker`, the
+concrete provider clients, `RAGRuntime`, and `AppServices`. Its provider LLM is wrapped by `RoleRoutingLLMClient`, which sends
 only the configured query-rewrite role to the configured Granite adapter and
 delegates title completion and answer
 streaming. Production uses `SGLangGraniteQueryRewriter`, which calls the
 always-warm Modal CUDA service. The explicit `transformers` engine is a
 redeploy-only CUDA rollback and is never selected automatically after failure.
 SGLang does not proxy GPT-5.1 and does not alter the seven-step RAG flow.
-The composition module then calls `create_app(services)`. `backend.main:app` remains an
-importable providerless bootstrap for development and returns `503` from
-provider-dependent endpoints. Production runs the deployment module with
-Uvicorn; no provider credentials are inferred from this repository.
+That future composition module calls `create_app(services)`.
+`backend.main:app` remains an importable providerless bootstrap for development
+and returns `503` from provider-dependent endpoints; it does not verify or
+provide shared ONNX clients. No provider credentials are inferred from this
+repository.

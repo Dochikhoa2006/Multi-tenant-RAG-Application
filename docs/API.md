@@ -105,15 +105,16 @@ concrete GPT-5.1 adapter. It starts without loading local model artifacts;
 provider-dependent endpoints return safe `503` responses until a runtime is
 injected.
 
-Production supplies a deployment-owned ASGI composition module. That module
-constructs the concrete `LLMClient`, one shared `ONNXEmbeddingClient`, one
-shared `ONNXCrossEncoderReranker`, one shared `WeaviateManager` and
-`InMemoryTaskQueue`,
-wraps the existing provider LLM in `RoleRoutingLLMClient` with one shared
-`SGLangGraniteQueryRewriter`, then creates `RAGRuntime`, `AppServices`, and finally
-`create_app(services)`. Launch that module with `uvicorn deployment_app:app`.
-The provider adapters and their credentials remain deployment dependencies and
-are deliberately outside Stage 5.
+No production ASGI composition module currently exists in this repository.
+Deployment must supply one that constructs the concrete `LLMClient`, exactly
+one shared `ONNXEmbeddingClient`, exactly one shared
+`ONNXCrossEncoderReranker`, one shared `WeaviateManager` and
+`InMemoryTaskQueue`, wraps the provider LLM in `RoleRoutingLLMClient` with one
+shared `SGLangGraniteQueryRewriter`, then creates `RAGRuntime`, `AppServices`,
+and `create_app(services)`. Until that module is supplied, production provider
+wiring—including shared ONNX client reuse—cannot be verified. The provider
+adapters and credentials remain deployment dependencies outside Stage 5;
+`backend.main:app` is intentionally providerless.
 
 Provision the merged checkpoint and its SHA-256 manifest in the Modal model
 Volume before deploying SGLang. The directory must contain `config.json`,

@@ -104,8 +104,12 @@ The embedding checkpoint is pinned to revision
 `e7f32e3c00f91d699e8c43b53106206bcc72bb22`; the reranker source is pinned to
 revision `953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e`. Both tokenizer and ONNX
 artifacts are provisioned before deployment and verified through a SHA-256
-manifest. Runtime downloads and remote model code are disabled. Production
-requires `CUDAExecutionProvider` and does not fall back to CPU or a paid API.
+manifest. Runtime downloads and remote model code are disabled.
+`CUDAExecutionProvider` is the production default. A deployment may explicitly
+select another ONNX Runtime provider that is installed and can execute the FP16
+artifact. Only the selected provider is registered, runtime fallback is
+disabled, and there is no automatic CPU or paid-API fallback. CUDA `device_id`
+settings apply only when CUDA is selected.
 
 | Environment variable | Default |
 |---|---|

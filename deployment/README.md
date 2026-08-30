@@ -48,30 +48,50 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 RUN_ONNX_CUDA_TESTS=1 \
   pytest tests/test_onnx_integration.py
 ```
 
-Create one `ONNXEmbeddingClient` and one `ONNXCrossEncoderReranker` in the ASGI
-composition root and inject both into the existing `RAGRuntime`; the wizard
-embedder adapter reuses that same embedding client. Production requires
-`CUDAExecutionProvider` and permits no CPU or remote inference fallback.
+The configured ONNX execution provider must be installed and able to execute
+the provisioned FP16 graph. `CUDAExecutionProvider` is the production default;
+another provider may be selected explicitly with the corresponding
+`ONNX_*_EXECUTION_PROVIDER` setting. Each client registers only that provider,
+passes `device_id` only to CUDA, and disables ONNX Runtime fallback. There is no
+automatic CPU or remote-inference fallback.
 
-## One-time vector maintenance migration
+Production must construct exactly one `ONNXEmbeddingClient` and one
+`ONNXCrossEncoderReranker` in its ASGI composition root, inject both into the
+existing `RAGRuntime`, and reuse that embedding client through the wizard
+adapter. This repository does not currently contain that production ASGI
+composition module, so the shared-client wiring cannot yet be verified and is
+a deployment blocker. `backend.main:app` remains providerless.
 
-The new 768-dimensional vectors are incompatible with the former index. Stop
-the API, drain its task queue, take and verify a Weaviate backup, then run:
+## Disposable empty-state vector-profile migration
+
+The new 768-dimensional vectors are incompatible with the former index, but
+this prototype cannot safely migrate a populated application. Session,
+transcript/title, document, paragraph, and chunk-ownership mappings are
+process-local and are lost when FastAPI stops. Weaviate object export alone
+cannot restore that state.
+
+The maintenance command is therefore limited to explicitly disposable state
+where every canonical Conversation, Knowledge Facts, and Policy collection is
+empty. Stop the API, drain its task queue, confirm that all process-local state
+may be discarded, take and verify a Weaviate backup, then run:
 
 ```bash
-python scripts/migrate_onnx_vectors.py export /secure/vector-migration
+python scripts/migrate_onnx_vectors.py export /secure/vector-migration \
+  --confirm-disposable-process-state
 python scripts/migrate_onnx_vectors.py rebuild \
-  /secure/vector-migration --confirm-maintenance
+  /secure/vector-migration --confirm-maintenance \
+  --confirm-disposable-process-state
 python scripts/migrate_onnx_vectors.py verify /secure/vector-migration
 ```
 
-The export contains exact UUIDs/properties/raw text but never old vectors. It is
-permission-restricted and checksummed. Rebuild recreates only canonical
-Conversation, Knowledge Facts, and Policy collections, re-embeds `raw_text`,
-verifies every 768-dimensional normalized vector and property, and marks all
-collections ready only after every rebuild verifies. Keep the API stopped if a
-collection remains `rebuilding`; rerunning `rebuild` resumes from the verified
-export and never reuses an old vector.
+Export validates complete canonical triplets and zero objects before writing a
+permission-restricted manifest; it exports no records or vectors and does not
+load an ONNX model. Rebuild repeats the zero-count check immediately before
+mutation, recreates the empty schemas under their canonical names, and marks
+them ready only after schema and zero-count verification. Any populated
+collection, old populated manifest, or newly inserted object fails before
+mutation. Keep the API stopped if a collection remains `rebuilding`; rerunning
+`rebuild` safely completes an interrupted empty rebuild.
 
 ## Provision the checkpoint
 

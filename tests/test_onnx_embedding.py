@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -204,6 +205,39 @@ def test_embedding_accepts_explicit_cpu_without_cuda_options_or_fallback(
     client.embed("text", model=EMBEDDING_MODEL)
 
     assert calls[0]["providers"] == ["CPUExecutionProvider"]
+    assert session.disable_fallback_calls == 1
+
+
+def test_embedding_disables_session_cpu_and_runtime_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _artifacts(tmp_path)
+    session = FakeEmbeddingSession()
+    captured: dict[str, object] = {}
+
+    class FakeSessionOptions:
+        def __init__(self) -> None:
+            self.entries: dict[str, str] = {}
+
+        def add_session_config_entry(self, name: str, value: str) -> None:
+            self.entries[name] = value
+
+    def session_factory(path: str, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return session
+
+    fake_runtime = SimpleNamespace(
+        SessionOptions=FakeSessionOptions,
+        InferenceSession=session_factory,
+        get_available_providers=lambda: ["CUDAExecutionProvider"],
+    )
+    monkeypatch.setitem(sys.modules, "onnxruntime", fake_runtime)
+
+    ONNXEmbeddingClient(_config(tmp_path), tokenizer=FakeTokenizer())
+
+    options = captured["sess_options"]
+    assert isinstance(options, FakeSessionOptions)
+    assert options.entries == {"session.disable_cpu_ep_fallback": "1"}
     assert session.disable_fallback_calls == 1
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -7,7 +8,7 @@ import pytest
 from weaviate.classes.config import DataType
 
 from backend.config import get_collection_name
-from backend.model_config import EMBEDDING_MODEL
+from backend.model_config import EMBEDDING_MODEL, EMBEDDING_VECTOR_PROFILE
 from backend.weaviate_client.client import WeaviateManager, _collection_description
 from scripts.migrate_onnx_vectors import (
     VectorMigrationError,
@@ -18,7 +19,7 @@ from scripts.migrate_onnx_vectors import (
 
 
 USER_ID = "usr_migration"
-DOCUMENT_ID = "91000000-0000-0000-0000-000000000001"
+COLLECTION_TYPES = ("conversations", "knowledge_facts", "policy")
 
 
 def _property(
@@ -74,39 +75,27 @@ class FakeConfig:
         self.updates.append(description)
 
 
-class FakeData:
+class FakeAggregate:
     def __init__(self, collection: "FakeCollection") -> None:
         self.collection = collection
 
-    def insert_many(self, objects: list[object]) -> SimpleNamespace:
-        for item in objects:
-            self.collection.items.append(
-                SimpleNamespace(
-                    uuid=item.uuid,
-                    properties=dict(item.properties),
-                    vector=list(item.vector),
-                )
-            )
-        return SimpleNamespace(has_errors=False)
+    def over_all(self, *, total_count: bool) -> SimpleNamespace:
+        assert total_count is True
+        return SimpleNamespace(total_count=len(self.collection.items))
 
 
 class FakeCollection:
     def __init__(
         self,
         name: str,
-        items: list[SimpleNamespace] | None = None,
+        items: list[object] | None = None,
         *,
         description: str = "legacy",
     ) -> None:
         self.name = name
         self.items = list(items or [])
         self.config = FakeConfig(_config(name, description))
-        self.data = FakeData(self)
-        self.iterator_calls: list[dict[str, object]] = []
-
-    def iterator(self, **kwargs: object) -> list[SimpleNamespace]:
-        self.iterator_calls.append(dict(kwargs))
-        return list(self.items)
+        self.aggregate = FakeAggregate(self)
 
 
 class FakeCollections:
@@ -114,6 +103,7 @@ class FakeCollections:
         self.values = values
         self.deleted: list[str] = []
         self.created: list[str] = []
+        self.fail_create_name_once: str | None = None
 
     def list_all(self, *, simple: bool) -> list[str]:
         assert simple is True
@@ -132,6 +122,9 @@ class FakeCollections:
     def create(self, *, name: str, description: str, **kwargs: object) -> FakeCollection:
         assert kwargs["properties"]
         assert kwargs["vector_config"] is not None
+        if self.fail_create_name_once == name:
+            self.fail_create_name_once = None
+            raise RuntimeError("injected collection creation failure")
         collection = FakeCollection(name, description=description)
         self.values[name] = collection
         self.created.append(name)
@@ -149,33 +142,14 @@ class FakeClient:
         return None
 
 
-def _record(collection_type: str, index: int) -> SimpleNamespace:
-    object_id = f"92000000-0000-0000-0000-{index:012d}"
-    if collection_type == "conversations":
-        properties = {
-            "user_id": USER_ID,
-            "conversation_id": object_id,
-            "raw_text": "Question and answer",
-        }
-    else:
-        properties = {
-            "user_id": USER_ID,
-            "document_id": DOCUMENT_ID,
-            "paragraph_id": 1,
-            "chunk_id": object_id,
-            "raw_text": f"{collection_type} chunk",
-        }
-    return SimpleNamespace(uuid=object_id, properties=properties, vector=[0.5, 0.5])
-
-
-def _manager() -> tuple[WeaviateManager, FakeCollections]:
+def _manager(
+    *, populated_collection_type: str | None = None
+) -> tuple[WeaviateManager, FakeCollections]:
     values: dict[str, FakeCollection] = {}
-    for index, collection_type in enumerate(
-        ("conversations", "knowledge_facts", "policy"), start=1
-    ):
+    for collection_type in COLLECTION_TYPES:
         name = get_collection_name(USER_ID, collection_type)
-        values[name] = FakeCollection(name, [_record(collection_type, index)])
-    # A noncanonical collection must never be exported or mutated.
+        items = [object()] if collection_type == populated_collection_type else []
+        values[name] = FakeCollection(name, items)
     values["Unrelated"] = FakeCollection("Unrelated")
     collections = FakeCollections(values)
     manager = WeaviateManager(FakeClient(collections))
@@ -183,114 +157,174 @@ def _manager() -> tuple[WeaviateManager, FakeCollections]:
     return manager, collections
 
 
-class UnitEmbedder:
-    def __init__(self, *, fail_after: int | None = None) -> None:
-        self.calls: list[list[str]] = []
-        self.fail_after = fail_after
-
-    def embed_many(self, texts: list[str], *, model: str) -> list[list[float]]:
-        assert model == EMBEDDING_MODEL
-        self.calls.append(list(texts))
-        if self.fail_after is not None and len(self.calls) > self.fail_after:
-            raise RuntimeError("injected embedding failure")
-        return [[1.0] + [0.0] * 767 for _ in texts]
+def _export(manager: WeaviateManager, directory: Path) -> Path:
+    return export_collections(
+        manager,
+        directory,
+        confirm_disposable_process_state=True,
+    )
 
 
-def test_export_and_rebuild_all_canonical_collections_losslessly(tmp_path: Path) -> None:
+def _rebuild(manager: WeaviateManager, directory: Path) -> None:
+    rebuild_collections(
+        manager,
+        directory,
+        confirm_disposable_process_state=True,
+    )
+
+
+def test_export_requires_explicit_disposable_state_confirmation(tmp_path: Path) -> None:
     manager, collections = _manager()
-    source_collections = {
-        name: collection
-        for name, collection in collections.values.items()
-        if name != "Unrelated"
+
+    with pytest.raises(VectorMigrationError, match="explicit confirmation"):
+        export_collections(manager, tmp_path)
+
+    assert not (tmp_path / "vector-migration-manifest.json").exists()
+    assert collections.deleted == []
+    assert all(not collection.config.updates for collection in collections.values.values())
+
+
+@pytest.mark.parametrize("collection_type", COLLECTION_TYPES)
+def test_populated_collection_blocks_export_before_manifest_or_mutation(
+    tmp_path: Path, collection_type: str
+) -> None:
+    manager, collections = _manager(populated_collection_type=collection_type)
+
+    with pytest.raises(VectorMigrationError, match="populated state is unsupported"):
+        _export(manager, tmp_path)
+
+    assert not (tmp_path / "vector-migration-manifest.json").exists()
+    assert collections.deleted == []
+    assert all(not collection.config.updates for collection in collections.values.values())
+
+
+def test_empty_canonical_triplets_rebuild_and_verify(tmp_path: Path) -> None:
+    manager, collections = _manager()
+    canonical_names = {
+        get_collection_name(USER_ID, collection_type)
+        for collection_type in COLLECTION_TYPES
     }
 
-    manifest = export_collections(manager, tmp_path)
+    manifest_path = _export(manager, tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
-    assert manifest.is_file()
-    assert len(list(tmp_path.glob("*.jsonl"))) == 3
-    assert all(
-        collection.iterator_calls == [
+    assert manifest == {
+        "schema_version": "2.0",
+        "migration_scope": "disposable-empty-prototype-state",
+        "mapping_state_preserved": False,
+        "embedding_model": EMBEDDING_MODEL,
+        "vector_profile": EMBEDDING_VECTOR_PROFILE,
+        "collections": [
             {
-                "include_vector": False,
-                "return_properties": list(collection.items[0].properties),
+                "name": name,
+                "user_id": USER_ID,
+                "collection_type": collection_type,
+                "count": 0,
             }
-        ]
-        for collection in source_collections.values()
-    )
-    embedder = UnitEmbedder()
-    rebuild_collections(manager, tmp_path, embedder)
+            for name, collection_type in sorted(
+                (get_collection_name(USER_ID, item), item)
+                for item in COLLECTION_TYPES
+            )
+        ],
+    }
+    assert list(tmp_path.glob("*.jsonl")) == []
+
+    _rebuild(manager, tmp_path)
     verify_collections(manager, tmp_path)
 
-    canonical_names = set(source_collections)
     assert set(collections.deleted) == canonical_names
     assert set(collections.created) == canonical_names
     assert "Unrelated" in collections.values
     assert all(
         collections.values[name].config.value.description == _collection_description()
-        for name in canonical_names
-    )
-    assert all(
-        len(collections.values[name].items[0].vector) == 768
-        and collections.values[name].items[0].vector[0] == 1.0
-        for name in canonical_names
-    )
-    assert all(
-        any(call["include_vector"] is True for call in collections.values[name].iterator_calls)
+        and not collections.values[name].items
         for name in canonical_names
     )
 
 
-def test_rebuild_preflight_failure_deletes_nothing(tmp_path: Path) -> None:
+def test_objects_added_after_export_block_rebuild_before_mutation(tmp_path: Path) -> None:
     manager, collections = _manager()
-    export_collections(manager, tmp_path)
-    embedder = UnitEmbedder(fail_after=0)
+    _export(manager, tmp_path)
+    name = get_collection_name(USER_ID, "knowledge_facts")
+    collections.values[name].items.append(object())
 
-    with pytest.raises(RuntimeError, match="injected embedding failure"):
-        rebuild_collections(manager, tmp_path, embedder)
+    with pytest.raises(VectorMigrationError, match="populated state is unsupported"):
+        _rebuild(manager, tmp_path)
 
     assert collections.deleted == []
     assert collections.created == []
-    assert all(
-        collection.config.updates == []
-        for name, collection in collections.values.items()
-        if name != "Unrelated"
+    assert all(not collection.config.updates for collection in collections.values.values())
+
+
+def test_old_populated_manifest_is_rejected_before_mutation(tmp_path: Path) -> None:
+    manager, collections = _manager()
+    (tmp_path / "vector-migration-manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "embedding_model": EMBEDDING_MODEL,
+                "vector_profile": EMBEDDING_VECTOR_PROFILE,
+                "collections": [{"count": 1}],
+            }
+        ),
+        encoding="utf-8",
     )
 
+    with pytest.raises(VectorMigrationError, match="not an empty-state manifest"):
+        _rebuild(manager, tmp_path)
 
-def test_partial_rebuild_never_marks_any_collection_ready(tmp_path: Path) -> None:
+    assert collections.deleted == []
+    assert collections.created == []
+
+
+def test_partial_empty_rebuild_stays_rebuilding_and_retries(tmp_path: Path) -> None:
     manager, collections = _manager()
-    export_collections(manager, tmp_path)
-    # First call is the preflight, second rebuilds one collection, third fails.
-    embedder = UnitEmbedder(fail_after=2)
+    _export(manager, tmp_path)
+    failure_name = get_collection_name(USER_ID, "knowledge_facts")
+    collections.fail_create_name_once = failure_name
 
-    with pytest.raises(RuntimeError, match="injected embedding failure"):
-        rebuild_collections(manager, tmp_path, embedder)
+    with pytest.raises(RuntimeError, match="injected collection creation failure"):
+        _rebuild(manager, tmp_path)
 
-    canonical = [
-        collection
-        for name, collection in collections.values.items()
-        if name != "Unrelated"
-    ]
-    assert canonical
+    canonical_names = {
+        get_collection_name(USER_ID, collection_type)
+        for collection_type in COLLECTION_TYPES
+    }
     assert all(
         collection.config.value.description == _collection_description("rebuilding")
-        for collection in canonical
+        for name, collection in collections.values.items()
+        if name in canonical_names
+    )
+    assert all(
+        collection.config.value.description != _collection_description()
+        for name, collection in collections.values.items()
+        if name in canonical_names
     )
 
-    # A maintenance retry starts solely from the checksummed raw export,
-    # recreates incomplete collections, and reaches one consistent new profile.
-    rebuild_collections(manager, tmp_path, UnitEmbedder())
+    _rebuild(manager, tmp_path)
     verify_collections(manager, tmp_path)
     assert all(
-        collection.config.value.description == _collection_description()
-        for name, collection in collections.values.items()
-        if name != "Unrelated"
+        collections.values[name].config.value.description == _collection_description()
+        for name in canonical_names
     )
 
 
-def test_export_requires_complete_three_collection_user_set(tmp_path: Path) -> None:
+def test_export_rejects_incomplete_canonical_triplet(tmp_path: Path) -> None:
     manager, collections = _manager()
-    collections.delete(get_collection_name(USER_ID, "policy"))
+    del collections.values[get_collection_name(USER_ID, "policy")]
 
     with pytest.raises(VectorMigrationError, match="exactly the three"):
-        export_collections(manager, tmp_path)
+        _export(manager, tmp_path)
+
+
+def test_rebuild_requires_disposable_confirmation_even_with_manifest(
+    tmp_path: Path,
+) -> None:
+    manager, collections = _manager()
+    _export(manager, tmp_path)
+
+    with pytest.raises(VectorMigrationError, match="explicit confirmation"):
+        rebuild_collections(manager, tmp_path)
+
+    assert collections.deleted == []
+    assert collections.created == []
