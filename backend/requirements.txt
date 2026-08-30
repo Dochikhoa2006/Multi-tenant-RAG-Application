@@ -7,3 +7,7 @@ fastapi
 uvicorn
 python-multipart
 httpx
+transformers==5.16.1
+torch==2.13.0
+accelerate==1.14.0
+safetensors==0.8.0

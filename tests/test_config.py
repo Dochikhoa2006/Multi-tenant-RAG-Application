@@ -153,13 +153,19 @@ def test_model_and_processing_configuration_is_environment_overridable() -> None
         """
 from backend.model_config import (
     CHUNKING,
+    GRANITE_QUERY_REWRITE,
     HYBRID_SEARCH,
     PRIMARY_GENERATOR,
+    QUERY_REWRITE_ENGINE,
+    QUERY_REWRITER,
+    SESSION_TITLE_GENERATOR,
+    SGLANG_QUERY_REWRITE,
     TEXT_PROCESSING,
 )
 
 assert PRIMARY_GENERATOR.model == 'generator-override'
 assert PRIMARY_GENERATOR.max_output_tokens == 900
+assert SESSION_TITLE_GENERATOR.model == 'title-override'
 assert HYBRID_SEARCH.components == ('dense',)
 assert HYBRID_SEARCH.alpha == 0.4
 assert CHUNKING.paragraph_threshold == 0.6
@@ -176,10 +182,26 @@ assert TEXT_PROCESSING.normalize_embeddings is False
 assert TEXT_PROCESSING.show_progress_bar is True
 assert TEXT_PROCESSING.sentence_model_cache_size == 2
 assert TEXT_PROCESSING.tokenizer_cache_size == 3
+assert QUERY_REWRITER.model == 'granite-override'
+assert QUERY_REWRITE_ENGINE == 'transformers'
+assert GRANITE_QUERY_REWRITE.model_path == 'local/granite'
+assert GRANITE_QUERY_REWRITE.device == 'cuda'
+assert GRANITE_QUERY_REWRITE.max_input_tokens == 1024
+assert GRANITE_QUERY_REWRITE.max_new_tokens == 64
+assert GRANITE_QUERY_REWRITE.response_prefill == '{"rewritten_question":"'
+assert GRANITE_QUERY_REWRITE.warmup is False
+assert SGLANG_QUERY_REWRITE.base_url == 'https://sglang.example/v1'
+assert SGLANG_QUERY_REWRITE.served_model == 'served-granite'
+assert SGLANG_QUERY_REWRITE.connect_timeout_seconds == 0.5
+assert SGLANG_QUERY_REWRITE.read_timeout_seconds == 3.0
+assert SGLANG_QUERY_REWRITE.max_connections == 12
+assert SGLANG_QUERY_REWRITE.constrained_output is False
+assert 'top-secret' not in repr(SGLANG_QUERY_REWRITE)
 """,
         overrides={
             "PRIMARY_GENERATOR_MODEL": "generator-override",
             "PRIMARY_GENERATOR_MAX_OUTPUT_TOKENS": "900",
+            "SESSION_TITLE_MODEL": "title-override",
             "HYBRID_COMPONENTS": "dense",
             "HYBRID_ALPHA": "0.4",
             "PARAGRAPH_SIMILARITY_THRESHOLD": "0.6",
@@ -196,7 +218,46 @@ assert TEXT_PROCESSING.tokenizer_cache_size == 3
             "SENTENCE_EMBEDDING_PROGRESS_BAR": "true",
             "SENTENCE_MODEL_CACHE_SIZE": "2",
             "TOKENIZER_CACHE_SIZE": "3",
+            "QUERY_REWRITER_MODEL": "granite-override",
+            "QUERY_REWRITE_ENGINE": "transformers",
+            "GRANITE_QUERY_REWRITE_MODEL_PATH": "local/granite",
+            "GRANITE_QUERY_REWRITE_DEVICE": "cuda",
+            "GRANITE_QUERY_REWRITE_MAX_INPUT_TOKENS": "1024",
+            "GRANITE_QUERY_REWRITE_MAX_NEW_TOKENS": "64",
+            "GRANITE_QUERY_REWRITE_WARMUP": "false",
+            "SGLANG_QUERY_REWRITE_BASE_URL": "https://sglang.example/v1/",
+            "SGLANG_QUERY_REWRITE_API_KEY": "top-secret",
+            "SGLANG_QUERY_REWRITE_MODEL": "served-granite",
+            "SGLANG_QUERY_REWRITE_CONNECT_TIMEOUT_SECONDS": "0.5",
+            "SGLANG_QUERY_REWRITE_READ_TIMEOUT_SECONDS": "3",
+            "SGLANG_QUERY_REWRITE_MAX_CONNECTIONS": "12",
+            "SGLANG_QUERY_REWRITE_CONSTRAINED_OUTPUT": "false",
         },
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_session_title_model_defaults_to_primary_generator_model() -> None:
+    environment = os.environ.copy()
+    environment.pop("SESSION_TITLE_MODEL", None)
+    environment["PRIMARY_GENERATOR_MODEL"] = "shared-generator"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from backend.model_config import PRIMARY_GENERATOR, "
+                "SESSION_TITLE_GENERATOR; "
+                "assert PRIMARY_GENERATOR.model == 'shared-generator'; "
+                "assert SESSION_TITLE_GENERATOR.model == PRIMARY_GENERATOR.model"
+            ),
+        ],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
     )
 
     assert result.returncode == 0, result.stderr
@@ -214,3 +275,31 @@ def test_invalid_environment_configuration_fails_fast() -> None:
 
     assert result.returncode != 0
     assert "min <= target <= max" in result.stderr
+
+
+def test_invalid_granite_response_prefill_fails_fast() -> None:
+    result = _run_python(
+        "import backend.model_config",
+        overrides={"GRANITE_QUERY_REWRITE_RESPONSE_PREFILL": "not-json"},
+    )
+
+    assert result.returncode != 0
+    assert "rewritten_question JSON string" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"QUERY_REWRITE_ENGINE": "automatic"},
+        {"SGLANG_QUERY_REWRITE_BASE_URL": "not-a-url"},
+        {"SGLANG_QUERY_REWRITE_CONNECT_TIMEOUT_SECONDS": "0"},
+        {"SGLANG_QUERY_REWRITE_MAX_CONNECTIONS": "0"},
+        {"SGLANG_QUERY_REWRITE_CONTINUATION_REGEX": "("},
+        {"GRANITE_QUERY_REWRITE_DEVICE": "mps"},
+    ],
+)
+def test_invalid_sglang_or_cuda_configuration_fails_fast(
+    overrides: dict[str, str],
+) -> None:
+    result = _run_python("import backend.model_config", overrides=overrides)
+    assert result.returncode != 0

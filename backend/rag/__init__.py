@@ -9,6 +9,7 @@ from backend.rag.embedder import (
 from backend.rag.generator import generate_answer_stream
 from backend.rag.pipeline import UserRetrievalCollections, run_rag_pipeline
 from backend.rag.query_rewriter import rewrite_query
+from backend.rag.query_rewrite_contract import ConversationPair, QueryRewritePrompt
 from backend.rag.retrieval import retrieve
 from backend.rag.runtime import (
     BackgroundTaskQueue,
@@ -31,11 +32,13 @@ __all__ = [
     "BackgroundWorkFactory",
     "ConversationCollectionFactory",
     "ConversationCollectionWriter",
+    "ConversationPair",
     "CrossEncoderReranker",
     "EmbeddingClient",
     "LLMClient",
     "RAGRuntime",
     "RerankResult",
+    "QueryRewritePrompt",
     "Tokenizer",
     "TimingObserver",
     "UserRetrievalCollections",

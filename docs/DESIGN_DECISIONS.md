@@ -61,6 +61,30 @@ Even though chunks are organized under paragraphs and documents, retrieval treat
 
 Past conversations contain valuable context about the user's preparation focus, knowledge gaps, and conversation patterns. By feeding relevant past conversations to a rewriting model, the system produces a query that captures implicit intent — leading to more targeted knowledge and policy retrieval.
 
+### Why a Local Merged Granite Query Rewriter?
+
+Only Model A is local. Its checkpoint is IBM Granite 4.1-3B with IBM's standard
+query-rewrite LoRA permanently merged (not aLoRA), under Apache-2.0. The adapter
+uses IBM's trained alternating-dialogue contract and JSON output rather than a
+generic system prompt. Assistant-response prefilling removes the fixed JSON
+scaffold from generated output and reduces query-rewrite latency. Answer
+generation and title generation both use GPT-5.1 by default.
+
+The 6.3 GiB checkpoint is a deployment artifact outside Git. Production serves
+it entirely offline in FP16 through SGLang 0.5.18 on a Modal NVIDIA CUDA worker.
+SGLang owns CUDA graphs, continuous batching, overlap scheduling, RadixAttention,
+prefix caching, and XGrammar-constrained continuation. The application no longer
+serializes rewrites with a local inference lock. Missing weights, checkpoint hash
+mismatches, incompatible chat templates, or SGLang failures are request failures:
+there is no download, CPU, MPS, remote-model, or original-query fallback.
+
+GPT-5.1 remains a direct provider call for answers and titles. It is deliberately
+not sent through the SGLang Model Gateway because SGLang cannot host the
+proprietary model and proxying would add a latency hop. `QUERY_REWRITE_ENGINE`
+supports an explicit redeploy-only Transformers/CUDA rollback; it is never an
+automatic per-request fallback. IBM reports and evaluates Granite rewriting for
+English; other languages remain outside the supported contract.
+
 ### Why Server-Sent Events for Streaming?
 
 SSE provides a lightweight, HTTP-native streaming mechanism that is simpler to implement than WebSockets for unidirectional server-to-client data flow. Since the LLM generates tokens sequentially and the client only needs to receive them, SSE is the ideal transport.

@@ -107,7 +107,16 @@ endpoints return safe `503` responses until a runtime is injected.
 Production supplies a deployment-owned ASGI composition module. That module
 constructs the concrete implementations of `LLMClient`, `EmbeddingClient`, and
 `CrossEncoderReranker`, one shared `WeaviateManager` and `InMemoryTaskQueue`,
-then creates `RAGRuntime`, `AppServices`, and finally
+wraps the existing provider LLM in `RoleRoutingLLMClient` with one shared
+`SGLangGraniteQueryRewriter`, then creates `RAGRuntime`, `AppServices`, and finally
 `create_app(services)`. Launch that module with `uvicorn deployment_app:app`.
 The provider adapters and their credentials remain deployment dependencies and
 are deliberately outside Stage 5.
+
+Provision the merged checkpoint and its SHA-256 manifest in the Modal model
+Volume before deploying SGLang. The directory must contain `config.json`,
+`model.safetensors.index.json`, both Safetensors shards, tokenizer, and chat
+template. Runtime downloads and remote code are disabled. The FastAPI deployment
+uses a pooled authenticated SGLang connection in the same Modal region while
+GPT-5.1 remains direct. Importing `backend.main:app` does not contact SGLang or
+load model weights. See `deployment/README.md` for provisioning and rollout.

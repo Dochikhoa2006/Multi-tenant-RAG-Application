@@ -2,6 +2,10 @@
 
 Full-stack RAG application for Generative AI Engineer FAANG interview coaching. Backed by Weaviate vector database with three isolated collections (Conversation, Knowledge Facts, Policy) per user.
 
+Production query rewriting uses the merged Granite 4.1-3B checkpoint through an
+always-warm SGLang/Modal CUDA service. GPT-5.1 answer and title calls remain
+direct provider requests. See [deployment/README.md](./deployment/README.md).
+
 ## Documentation
 
 | Document | What It Covers |

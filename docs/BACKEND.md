@@ -420,7 +420,14 @@ The frontend uses an optimistic UI pattern — every button action immediately u
 Provider adapters are injected at the application composition root rather than
 implemented by Stage 5. A deployment-owned ASGI module constructs one shared
 manager and queue, the concrete provider clients, `RAGRuntime`, and
-`AppServices`, then calls `create_app(services)`. `backend.main:app` remains an
+`AppServices`. Its provider LLM is wrapped by `RoleRoutingLLMClient`, which sends
+only the configured query-rewrite role to the configured Granite adapter and
+delegates title completion and answer
+streaming. Production uses `SGLangGraniteQueryRewriter`, which calls the
+always-warm Modal CUDA service. The explicit `transformers` engine is a
+redeploy-only CUDA rollback and is never selected automatically after failure.
+SGLang does not proxy GPT-5.1 and does not alter the seven-step RAG flow.
+The composition module then calls `create_app(services)`. `backend.main:app` remains an
 importable providerless bootstrap for development and returns `503` from
 provider-dependent endpoints. Production runs the deployment module with
 Uvicorn; no provider credentials are inferred from this repository.
