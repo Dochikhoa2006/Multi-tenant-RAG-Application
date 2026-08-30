@@ -12,7 +12,7 @@ All backend logic for the Smart RAG Interview Preparation System. Covers Weaviat
 
 2. **Flat Chunk Equality.** Although metadata carries a parent–child hierarchy (document → paragraph → chunk), all chunk embeddings within a collection are treated as equals during retrieval. A chunk from Document A, Paragraph 2 competes on identical footing with a chunk from Document B, Paragraph 7. The hierarchy exists solely for lifecycle management (e.g., deleting a wizard removes all its descendant chunks).
 
-3. **Per-User Named Collections.** Each user gets three physically separate Weaviate collections. The logical namespaces remain `{user_id}_conversations`, `{user_id}_knowledge_facts`, and `{user_id}_policy`; their physical Weaviate names use the collision-free encoding below. Retrieval queries target only the current user's collections — there is no retrieve-then-filter pattern where overwhelming data from other users could dominate top-k results before filtering. One user's collections are invisible to and unreachable by another user.
+3. **Per-User Named Collections.** Each user gets three physically separate Weaviate collections. A collection's logical identity is the pair of its exact `user_id` and canonical collection type (`conversations`, `knowledge_facts`, or `policy`); it is not a physical string name. Physical Weaviate names use the collision-free encoding below. Retrieval queries target only the current user's collections — there is no retrieve-then-filter pattern where overwhelming data from other users could dominate top-k results before filtering. One user's collections are invisible to and unreachable by another user.
 
 ### 1.2 Collection Schemas (Weaviate — Chunk-Level Only)
 
@@ -280,6 +280,19 @@ Step 8:  CONFIRM SAVE
          compares against this new version.
 ```
 
+**Prototype reliability contract:** Before Step 3, orchestration snapshots all
+affected chunk records, including their native vectors. Each deletion validates
+verbose results and a scoped dry-run postcondition; Step 4 cannot begin until
+every targeted scope is confirmed empty. Step 5 batches embeddings when the
+injected provider supports `embed_many` and validates the complete vector batch
+before Step 7 starts.
+
+If processing or Step 7/8 fails, orchestration removes every chunk UUID attempted
+in Step 7a, restores completed Step 7b paragraph changes, restores the Step 3
+snapshots, and restores both process-local maps. A compensated failure is safe
+for explicit retry. Incomplete compensation raises a dedicated recovery error
+with affected IDs and is never reported as an ordinary save failure.
+
 ### 4.5 Delete Wizard (`wizard delete` function)
 
 **Trigger:** User clicks the "Delete" button on a wizard card.
@@ -294,6 +307,14 @@ The collection-layer `delete_many()` call is only a low-level,
 non-transactional deletion primitive. It does not by itself satisfy the
 application-level atomic wizard-delete requirement. Later wizard orchestration
 must own verification, compensation, and when the mapping/UI state is removed.
+
+Stage 3 implements that ownership for the serialized single-process prototype:
+it snapshots the document and both maps, verifies that deletion leaves no
+matching chunks, commits map removal only afterward, and restores the snapshot
+if either phase fails. This provides live-process all-or-none behavior, but it
+is not a storage transaction. A process crash between mutation and compensation
+can still leave partial state. Production requires persistent mappings and a
+transaction-capable operation log or equivalent recovery design.
 
 ---
 
@@ -310,6 +331,10 @@ After a Q&A exchange is fully rendered in the chat UI:
 ---
 
 ## 6. Text Processing Pipeline
+
+Stage 1 has no required external services or network calls during deterministic
+unit tests. Tests inject deterministic encoders and tokenizers; production
+runtime dependencies and configured model loading remain explicit.
 
 ### 6.1 Semantic Paragraph Splitting
 

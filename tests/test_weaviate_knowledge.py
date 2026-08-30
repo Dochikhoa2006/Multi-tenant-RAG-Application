@@ -9,7 +9,12 @@ import pytest
 from backend.config import get_collection_name
 from backend.weaviate_client.client import WeaviateManager
 from backend.weaviate_client.knowledge import KnowledgeCollection
-from backend.weaviate_client.models import PartialParagraphUpdateError
+from backend.weaviate_client.models import (
+    ChunkRecord,
+    IncompleteDeletionError,
+    PartialParagraphUpdateError,
+    WeaviateResponseError,
+)
 from backend.weaviate_client.policy import PolicyCollection
 
 
@@ -17,6 +22,7 @@ USER_ID = "usr_abc123"
 DOCUMENT_ID = "10000000-0000-0000-0000-000000000001"
 CHUNK_ID = "20000000-0000-0000-0000-000000000001"
 SECOND_CHUNK_ID = "20000000-0000-0000-0000-000000000002"
+THIRD_CHUNK_ID = "20000000-0000-0000-0000-000000000003"
 
 
 def _manager_and_collection() -> tuple[WeaviateManager, MagicMock, MagicMock]:
@@ -27,6 +33,39 @@ def _manager_and_collection() -> tuple[WeaviateManager, MagicMock, MagicMock]:
     manager.connect()
     client.connect.reset_mock()
     return manager, client, collection
+
+
+def _delete_result(
+    ids: tuple[str, ...] = (), *, failed_ids: tuple[str, ...] = ()
+) -> SimpleNamespace:
+    failed = set(failed_ids)
+    return SimpleNamespace(
+        matches=len(ids),
+        successful=len(ids) - len(failed),
+        failed=len(failed),
+        objects=[
+            SimpleNamespace(uuid=UUID(item), successful=item not in failed)
+            for item in ids
+        ],
+    )
+
+
+def _dry_run_result(ids: tuple[str, ...] = ()) -> SimpleNamespace:
+    return SimpleNamespace(
+        matches=len(ids),
+        successful=0,
+        failed=0,
+        objects=[
+            SimpleNamespace(uuid=UUID(item), successful=False) for item in ids
+        ],
+    )
+
+
+def _successful_delete(collection: MagicMock, ids: tuple[str, ...] = ()) -> None:
+    collection.data.delete_many.side_effect = [
+        _delete_result(ids),
+        _dry_run_result(),
+    ]
 
 
 def test_insert_chunk_uses_chunk_id_as_uuid() -> None:
@@ -61,22 +100,24 @@ def test_insert_chunk_uses_chunk_id_as_uuid() -> None:
 
 def test_delete_by_document_uses_document_filter() -> None:
     manager, _, collection = _manager_and_collection()
+    _successful_delete(collection)
     knowledge = KnowledgeCollection(manager, USER_ID)
 
     knowledge.delete_by_document(DOCUMENT_ID)
 
-    where = collection.data.delete_many.call_args.kwargs["where"]
+    where = collection.data.delete_many.call_args_list[0].kwargs["where"]
     assert where.target == "document_id"
     assert where.value == DOCUMENT_ID
 
 
 def test_delete_by_paragraphs_is_scoped_to_document() -> None:
     manager, _, collection = _manager_and_collection()
+    _successful_delete(collection)
     knowledge = KnowledgeCollection(manager, USER_ID)
 
     knowledge.delete_by_paragraphs(DOCUMENT_ID, [2, 3, 2])
 
-    where = collection.data.delete_many.call_args.kwargs["where"]
+    where = collection.data.delete_many.call_args_list[0].kwargs["where"]
     assert len(where.filters) == 2
     document_filter, paragraph_filter = where.filters
     assert document_filter.target == "document_id"
@@ -201,6 +242,146 @@ def test_chunk_delete_failure_is_not_swallowed() -> None:
         knowledge.delete_by_document(DOCUMENT_ID)
 
 
+def test_delete_requires_verbose_success_and_empty_postcondition() -> None:
+    manager, _, collection = _manager_and_collection()
+    collection.data.delete_many.side_effect = [
+        _delete_result((CHUNK_ID,)),
+        _dry_run_result((CHUNK_ID,)),
+    ]
+    knowledge = KnowledgeCollection(manager, USER_ID)
+
+    with pytest.raises(IncompleteDeletionError) as error:
+        knowledge.delete_by_document(DOCUMENT_ID)
+
+    assert error.value.report.remaining_ids == (CHUNK_ID,)
+
+
+def test_delete_rejects_malformed_verbose_response() -> None:
+    manager, _, collection = _manager_and_collection()
+    collection.data.delete_many.return_value = SimpleNamespace(
+        matches=1, successful=1, failed=0, objects=[]
+    )
+    knowledge = KnowledgeCollection(manager, USER_ID)
+
+    with pytest.raises(WeaviateResponseError, match="one object per match"):
+        knowledge.delete_by_document(DOCUMENT_ID)
+
+
+def test_actual_delete_and_real_shape_empty_dry_run_are_verified() -> None:
+    ids = (CHUNK_ID, SECOND_CHUNK_ID, THIRD_CHUNK_ID)
+    manager, _, collection = _manager_and_collection()
+    collection.data.delete_many.side_effect = [
+        _delete_result(ids),
+        _dry_run_result(),
+    ]
+    knowledge = KnowledgeCollection(manager, USER_ID)
+
+    report = knowledge.delete_by_document(DOCUMENT_ID)
+
+    assert report.confirmed
+    assert report.matched == 3
+    assert report.successful == 3
+    assert report.deleted_ids == ids
+
+
+def test_real_shape_dry_run_reports_all_remaining_ids() -> None:
+    ids = (CHUNK_ID, SECOND_CHUNK_ID, THIRD_CHUNK_ID)
+    manager, _, collection = _manager_and_collection()
+    collection.data.delete_many.side_effect = [
+        _delete_result(),
+        _dry_run_result(ids),
+    ]
+    knowledge = KnowledgeCollection(manager, USER_ID)
+
+    with pytest.raises(IncompleteDeletionError) as error:
+        knowledge.delete_by_document(DOCUMENT_ID)
+
+    assert error.value.report.remaining_ids == ids
+
+
+def _snapshot_object(chunk_id: str = CHUNK_ID, paragraph_id: int = 2) -> SimpleNamespace:
+    return SimpleNamespace(
+        uuid=UUID(chunk_id),
+        properties={
+            "user_id": USER_ID,
+            "document_id": DOCUMENT_ID,
+            "paragraph_id": paragraph_id,
+            "chunk_id": chunk_id,
+            "raw_text": "exact text",
+        },
+        vector=[0.2, 0.8],
+    )
+
+
+def test_snapshot_by_paragraphs_returns_complete_recoverable_records() -> None:
+    manager, _, collection = _manager_and_collection()
+    collection.data.delete_many.return_value = _dry_run_result((CHUNK_ID,))
+    collection.query.fetch_objects_by_ids.return_value = SimpleNamespace(
+        objects=[_snapshot_object()]
+    )
+    knowledge = KnowledgeCollection(manager, USER_ID)
+
+    records = knowledge.snapshot_by_paragraphs(DOCUMENT_ID, [2])
+
+    assert records == (
+        ChunkRecord(
+            CHUNK_ID, USER_ID, DOCUMENT_ID, 2, CHUNK_ID, "exact text", (0.2, 0.8)
+        ),
+    )
+    assert collection.data.delete_many.call_args.kwargs["dry_run"] is True
+    assert collection.query.fetch_objects_by_ids.call_args.kwargs["include_vector"] is True
+
+
+def test_snapshot_discovery_accepts_real_shape_three_object_dry_run() -> None:
+    ids = (CHUNK_ID, SECOND_CHUNK_ID, THIRD_CHUNK_ID)
+    manager, _, collection = _manager_and_collection()
+    collection.data.delete_many.return_value = _dry_run_result(ids)
+    collection.query.fetch_objects_by_ids.return_value = SimpleNamespace(
+        objects=[_snapshot_object(chunk_id=item) for item in ids]
+    )
+    knowledge = KnowledgeCollection(manager, USER_ID)
+
+    records = knowledge.snapshot_by_paragraphs(DOCUMENT_ID, [2])
+
+    assert tuple(record.chunk_id for record in records) == ids
+
+
+def test_restore_chunks_inserts_missing_records_then_verifies_exact_state() -> None:
+    manager, _, collection = _manager_and_collection()
+    record = ChunkRecord(
+        CHUNK_ID, USER_ID, DOCUMENT_ID, 2, CHUNK_ID, "exact text", (0.2, 0.8)
+    )
+    collection.query.fetch_objects_by_ids.side_effect = [
+        SimpleNamespace(objects=[]),
+        SimpleNamespace(objects=[_snapshot_object()]),
+    ]
+    collection.data.insert.return_value = UUID(CHUNK_ID)
+    knowledge = KnowledgeCollection(manager, USER_ID)
+
+    restored = knowledge.restore_chunks((record,))
+
+    assert restored == (CHUNK_ID,)
+    collection.data.insert.assert_called_once()
+
+
+def test_delete_chunks_and_paragraph_verification_use_exact_chunk_ids() -> None:
+    manager, _, collection = _manager_and_collection()
+    _successful_delete(collection, (CHUNK_ID,))
+    knowledge = KnowledgeCollection(manager, USER_ID)
+
+    report = knowledge.delete_chunks([CHUNK_ID])
+
+    assert report.confirmed
+    assert report.deleted_ids == (CHUNK_ID,)
+
+    collection.query.fetch_objects_by_ids.return_value = SimpleNamespace(
+        objects=[_snapshot_object(paragraph_id=2)]
+    )
+    knowledge.verify_paragraph_ids({CHUNK_ID: 2})
+    with pytest.raises(WeaviateResponseError, match="verification failed"):
+        knowledge.verify_paragraph_ids({CHUNK_ID: 3})
+
+
 @pytest.mark.parametrize("paragraph_id", [0, -1, True, 1.5, "1"])
 def test_chunk_paragraph_validation_prevents_insert(paragraph_id: object) -> None:
     manager, _, collection = _manager_and_collection()
@@ -302,6 +483,12 @@ def test_every_chunk_operation_uses_only_its_bound_collection(
 ) -> None:
     client = MagicMock()
     collection = MagicMock()
+    collection.data.delete_many.side_effect = [
+        _delete_result(),
+        _delete_result(),
+        _delete_result(),
+        _delete_result(),
+    ]
     collection.data.insert.return_value = UUID(CHUNK_ID)
     collection.query.hybrid.return_value = SimpleNamespace(
         objects=[

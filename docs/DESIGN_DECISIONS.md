@@ -31,6 +31,20 @@ shared across independent backend workers. Before production deployment, a
 durable design consistent with Weaviate as the source of truth must be approved;
 that change may require revisiting the current three-collection data model.
 
+### Stage 3 Mutation Recovery Boundary
+
+Wizard saves and deletes use verified postconditions and compensating writes.
+Complete native-vector snapshots are taken before destructive changes; an
+operation reports an ordinary failure only after the former storage and map
+state has been restored. This satisfies atomic wizard deletion while mutations
+are serialized and the single backend process remains alive.
+
+This is deliberately not crash-atomic. Weaviate batch deletion and process-local
+maps do not share a transaction, so termination during mutation or compensation
+can leave partial state. Durable deployment is blocked on persistent mappings
+and a recoverable operation log (or another approved transaction design). It is
+not a blocker for continuing the single-process prototype stages.
+
 ### Why Cascade-Delete Sessions?
 
 When a user deletes a chat session, all conversation embeddings belonging to that session are permanently removed from Weaviate. This ensures the conversation collection stays clean and relevant — stale or unwanted practice sessions don't pollute future retrieval results.

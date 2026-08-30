@@ -34,6 +34,12 @@ class DocumentMap:
         key = required_uuid(document_id, "document_id")
         return "".join(self._documents[key].values())
 
+    def get_paragraph_data(self, document_id: str) -> dict[int, str]:
+        """Return an ordered defensive copy of a document's saved paragraphs."""
+
+        key = required_uuid(document_id, "document_id")
+        return dict(self._documents[key])
+
     def update_paragraphs(
         self,
         document_id: str,
@@ -42,25 +48,46 @@ class DocumentMap:
         key = required_uuid(document_id, "document_id")
         if key not in self._documents:
             raise KeyError(key)
+        self._documents[key] = self._validated_replacement(new_paragraph_data)
+
+    def validate_update(
+        self,
+        document_id: str,
+        new_paragraph_data: Mapping[int, str],
+    ) -> None:
+        key = required_uuid(document_id, "document_id")
+        if key not in self._documents:
+            raise KeyError(key)
+        self._validated_replacement(new_paragraph_data)
+
+    def restore_document(
+        self,
+        document_id: str,
+        paragraph_data: Mapping[int, str],
+    ) -> None:
+        """Restore a validated snapshot, including a previously deleted document."""
+
+        key = required_uuid(document_id, "document_id")
+        self._documents[key] = self._validated_replacement(paragraph_data)
+
+    def delete_document(self, document_id: str) -> None:
+        key = required_uuid(document_id, "document_id")
+        del self._documents[key]
+
+    @staticmethod
+    def _validated_replacement(
+        new_paragraph_data: Mapping[int, str],
+    ) -> dict[int, str]:
         if not isinstance(new_paragraph_data, Mapping):
             raise TypeError("new_paragraph_data must be a mapping")
-
         validated: dict[int, str] = {}
         for paragraph_id, text in new_paragraph_data.items():
             paragraph = positive_paragraph_id(paragraph_id)
             if not isinstance(text, str):
                 raise TypeError("paragraph text must be a string")
             validated[paragraph] = text
-
-        if validated:
-            expected_ids = set(range(1, len(validated) + 1))
-            if set(validated) != expected_ids:
-                raise ValueError("paragraph IDs must be sequential from 1 through N")
-            replacement = dict(sorted(validated.items()))
-        else:
-            replacement = {1: ""}
-        self._documents[key] = replacement
-
-    def delete_document(self, document_id: str) -> None:
-        key = required_uuid(document_id, "document_id")
-        del self._documents[key]
+        if not validated:
+            return {1: ""}
+        if set(validated) != set(range(1, len(validated) + 1)):
+            raise ValueError("paragraph IDs must be sequential from 1 through N")
+        return dict(sorted(validated.items()))

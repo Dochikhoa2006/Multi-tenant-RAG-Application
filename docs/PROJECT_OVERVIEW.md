@@ -16,7 +16,7 @@ Users maintain two structured knowledge stores — **Knowledge Facts** (technica
 | Term | Definition |
 |---|---|
 | **User** | An authenticated individual identified by a unique `user_id`. Each user owns an isolated data environment. |
-| **Collection** | One of three physically separate Weaviate collections per user: **Conversation**, **Knowledge Facts**, or **Policy**. Logical namespaces use `{user_id}_{collection_type}`; physical Weaviate names use reversible Base32 user-ID encoding as specified in `BACKEND.md`. |
+| **Collection** | One of three physically separate Weaviate collections per user: **Conversation**, **Knowledge Facts**, or **Policy**. Its logical identity is the pair of the exact `user_id` and canonical collection type. Its physical Weaviate name uses reversible Base32 user-ID encoding as specified in `BACKEND.md`. |
 | **Wizard** | A user-facing content board mapped one-to-one to a **Document ID**. Users view, edit, upload into, and delete wizards through the UI. |
 | **Document ID** | The internal identifier for a wizard. Each wizard is exactly one document. |
 | **Paragraph ID** | A segment boundary produced by **Semantic Paragraph Splitting** within a document. Paragraphs are numbered sequentially from top to bottom of the wizard text. |

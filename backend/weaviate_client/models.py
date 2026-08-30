@@ -40,6 +40,46 @@ class PartialParagraphUpdateError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class ChunkRecord:
+    """A complete recoverable knowledge/policy chunk snapshot."""
+
+    object_id: str
+    user_id: str
+    document_id: str
+    paragraph_id: int
+    chunk_id: str
+    raw_text: str
+    vector: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class DeletionReport:
+    """Verified outcome of one scoped multi-object deletion."""
+
+    matched: int
+    successful: int
+    failed: int
+    deleted_ids: tuple[str, ...]
+    remaining_ids: tuple[str, ...]
+
+    @property
+    def confirmed(self) -> bool:
+        return self.failed == 0 and not self.remaining_ids
+
+
+class IncompleteDeletionError(RuntimeError):
+    """Raised when a scoped deletion cannot prove an empty postcondition."""
+
+    def __init__(self, scope: str, report: DeletionReport) -> None:
+        self.scope = scope
+        self.report = report
+        super().__init__(
+            f"incomplete deletion for {scope}: {report.failed} failed, "
+            f"{len(report.remaining_ids)} remaining"
+        )
+
+
+@dataclass(frozen=True)
 class SearchResult:
     """One normalized first-stage hybrid-search result."""
 

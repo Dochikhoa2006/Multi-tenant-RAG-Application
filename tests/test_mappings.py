@@ -93,6 +93,10 @@ def test_document_create_update_order_and_exact_text() -> None:
     assert documents.get_paragraphs(DOCUMENT_ID) == [1, 2, 3]
     assert documents.get_full_text(DOCUMENT_ID) == " first second\n\nthird\n"
 
+    paragraph_data = documents.get_paragraph_data(DOCUMENT_ID)
+    paragraph_data[1] = "external mutation"
+    assert documents.get_paragraph_data(DOCUMENT_ID)[1] == " first "
+
 
 def test_document_update_validates_atomically_and_empty_resets() -> None:
     documents = DocumentMap(USER_ID, "policy")
@@ -195,6 +199,35 @@ def test_chunk_has_only_one_paragraph_owner_and_replacements_are_atomic() -> Non
         CHUNK_ID,
         THIRD_CHUNK_ID,
     ]
+
+
+def test_document_level_paragraph_replacement_is_atomic_and_defensive() -> None:
+    paragraphs = ParagraphMap(USER_ID, "knowledge_facts")
+    paragraphs.replace_document(
+        DOCUMENT_ID,
+        {1: [CHUNK_ID], 2: [SECOND_CHUNK_ID]},
+    )
+
+    returned = paragraphs.get_document_chunks(DOCUMENT_ID)
+    returned[1].append(THIRD_CHUNK_ID)
+    assert paragraphs.get_document_chunks(DOCUMENT_ID) == {
+        1: [CHUNK_ID],
+        2: [SECOND_CHUNK_ID],
+    }
+
+    with pytest.raises(ValueError, match="sequential"):
+        paragraphs.replace_document(DOCUMENT_ID, {1: [], 3: [THIRD_CHUNK_ID]})
+    assert paragraphs.get_document_chunks(DOCUMENT_ID) == {
+        1: [CHUNK_ID],
+        2: [SECOND_CHUNK_ID],
+    }
+
+    paragraphs.replace_document(DOCUMENT_ID, {1: [SECOND_CHUNK_ID, CHUNK_ID]})
+    assert paragraphs.get_document_chunks(DOCUMENT_ID) == {
+        1: [SECOND_CHUNK_ID, CHUNK_ID]
+    }
+    paragraphs.delete_document(DOCUMENT_ID)
+    assert paragraphs.get_document_chunks(DOCUMENT_ID) == {}
 
 
 def test_document_and_paragraph_namespaces_are_isolated() -> None:
