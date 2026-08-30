@@ -40,6 +40,11 @@ class DocumentMap:
         key = required_uuid(document_id, "document_id")
         return dict(self._documents[key])
 
+    def list_documents(self) -> list[str]:
+        """Return document IDs in creation order as a defensive copy."""
+
+        return list(self._documents)
+
     def update_paragraphs(
         self,
         document_id: str,

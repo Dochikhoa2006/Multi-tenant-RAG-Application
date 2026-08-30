@@ -7,6 +7,7 @@ from collections.abc import AsyncGenerator, Mapping, Sequence
 from functools import partial
 import inspect
 import math
+from time import perf_counter
 from typing import Any
 
 import tiktoken
@@ -14,7 +15,7 @@ import tiktoken
 from backend.model_config import PRIMARY_GENERATOR, TEXT_PROCESSING, TOKEN_BUDGETS
 from backend.prompts import ANSWER_GENERATION_PROMPT
 from backend.rag.retrieval import _budget_results
-from backend.rag.runtime import RAGRuntime, Tokenizer, resolve_runtime
+from backend.rag.runtime import RAGRuntime, TimingObserver, Tokenizer, resolve_runtime
 
 
 def _required_text(value: object, name: str) -> str:
@@ -155,18 +156,26 @@ async def generate_answer_stream(
     policy_guidelines: Sequence[Mapping[str, Any]],
     *,
     runtime: RAGRuntime | None = None,
+    timing_observer: TimingObserver | None = None,
 ) -> AsyncGenerator[str, None]:
     query = _required_text(rewritten_query, "rewritten_query")
     active_runtime = resolve_runtime(runtime)
     tokenizer = active_runtime.tokenizer or tiktoken.get_encoding(
         TEXT_PROCESSING.tokenizer_encoding
     )
-    prompt = _build_budgeted_prompt(
+    prompt_started = perf_counter()
+    prompt = await asyncio.to_thread(
+        _build_budgeted_prompt,
         query,
         knowledge_facts,
         policy_guidelines,
         tokenizer,
     )
+    if timing_observer is not None:
+        timing_observer(
+            "prompt_construction",
+            (perf_counter() - prompt_started) * 1000.0,
+        )
     stream = await asyncio.to_thread(
         partial(
             active_runtime.llm.stream,

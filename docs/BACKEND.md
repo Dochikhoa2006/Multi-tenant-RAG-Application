@@ -210,6 +210,10 @@ Step 7:  After the full answer is delivered to the UI,
 
 > **Important:** Files are not stored. The system copies their text content into the wizard's editable region and discards the original files.
 
+If every decoded upload is empty, the API rejects the request without changing
+the editor state. Existing unsaved modified paragraph IDs are preserved, and
+the final saved paragraph is added only when content is actually appended.
+
 ### 4.3 Cancel (`discard local state` function)
 
 **Trigger:** User clicks "Cancel" while editing a wizard.
@@ -379,24 +383,44 @@ The frontend uses an optimistic UI pattern — every button action immediately u
 
 ### 7.1 Design
 
-- Each mutating API request returns an immediate success response (e.g., the newly generated `document_id`) without waiting for Weaviate operations to complete.
-- The actual work (Weaviate writes, deletes, re-embedding) is dispatched to a **per-user FIFO task queue** processed in the background.
+- Storage mutations and re-embedding requests return an accepted task and are dispatched to a **per-user FIFO task queue** processed in the background.
+- Wizard creation is the deliberate prototype exception: Stage 3 synchronously creates only an empty process-local DocumentMap/ParagraphMap entry and performs no embedding or Weaviate work. The API calls that implementation directly and returns the generated `document_id`.
 - Per-user queues ensure that operations on the same user's data are serialized (no race conditions between a save and a delete on the same wizard), while operations across different users run in parallel.
+- Chat streams hold a process-local session lease. Session deletion returns a
+  conflict while a lease is active, then reserves the session against new
+  streams while its verified delete is queued. This makes conversation
+  embedding/title work accepted by the completed stream precede deletion in the
+  same per-user FIFO.
+- Completed task records are retained up to the configurable
+  `TASK_MAX_COMPLETED_RECORDS` cap; eviction never removes queued or running
+  work.
 
 ### 7.2 Queued Operations
 
 | Operation | What the API Returns Immediately | What the Queue Processes |
 |---|---|---|
-| **Create Wizard** | New `document_id` | Create Weaviate collection entries (if needed), initialize document and paragraph mappings. |
+| **Create Wizard** | New `document_id` and empty wizard | Nothing; process-local mapping initialization completed synchronously. |
 | **Delete Wizard** | Confirmation | Delete all Weaviate chunk records for the `document_id`, remove document and paragraph mappings. |
 | **Save Wizard** | Confirmation | Execute the full 8-step re-embed pipeline (Section 4.4). |
-| **Delete Session** | Confirmation | Look up all `conversation_id`s in the session, delete their Weaviate records, remove session mapping. |
+| **Delete Session** | Tracked task | Look up all `conversation_id`s, perform a verbose delete and dry-run empty check, then remove the session mapping only after confirmation. Partial failure retains the mapping for explicit retry. |
 | **Embed Conversation** | N/A (triggered internally after SSE completes) | Concatenate Q+A, generate embedding, insert into Conversation Collection. |
 | **Generate Session Title** | N/A (triggered internally after SSE completes) | Call LLM with session conversations, update session title in mapping. |
 
 ### 7.3 Error Handling
 
-- If a queued task fails, log the error with full context (user_id, operation type, affected IDs).
+- If a queued task fails, log the full internal error with task ID, user ID, operation type, and affected IDs.
 - Expose a task status endpoint so the frontend can check whether a background operation succeeded or failed.
 - On failure, the frontend displays a non-blocking toast notification with a retry option.
-- Failed tasks do **not** automatically retry — the user must explicitly trigger a retry.
+- Failed tasks do **not** automatically retry — the user must resubmit the
+  original operation; there is no generic task-ID retry endpoint.
+- Task-status responses expose only stable safe error codes/messages, never raw provider or storage exceptions.
+
+### 7.4 Production Composition
+
+Provider adapters are injected at the application composition root rather than
+implemented by Stage 5. A deployment-owned ASGI module constructs one shared
+manager and queue, the concrete provider clients, `RAGRuntime`, and
+`AppServices`, then calls `create_app(services)`. `backend.main:app` remains an
+importable providerless bootstrap for development and returns `503` from
+provider-dependent endpoints. Production runs the deployment module with
+Uvicorn; no provider credentials are inferred from this repository.

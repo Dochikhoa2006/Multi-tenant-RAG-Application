@@ -35,7 +35,9 @@ def _conversation_list(value: object) -> str:
     return "\n\n".join(rendered)
 
 
-def _validated_title(value: object) -> str:
+def validate_session_title(value: object) -> str:
+    """Validate and normalize the public 3--6 word session-title contract."""
+
     if not isinstance(value, str):
         raise TypeError("session title response must be a string")
     if "\n" in value or "\r" in value:
@@ -63,7 +65,7 @@ async def generate_session_title(
             model=SESSION_TITLE_GENERATOR.model,
         )
     )
-    return _validated_title(response)
+    return validate_session_title(response)
 
 
-__all__ = ["generate_session_title"]
+__all__ = ["generate_session_title", "validate_session_title"]

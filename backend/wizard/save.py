@@ -66,8 +66,10 @@ def _validated_modified_ids(
     modified_paragraph_ids: object,
     existing_ids: set[int],
 ) -> set[int]:
+    if modified_paragraph_ids is None:
+        return set()
     if not isinstance(modified_paragraph_ids, list):
-        raise TypeError("modified_paragraph_ids must be a list")
+        raise TypeError("modified_paragraph_ids must be a list or None")
     validated: set[int] = set()
     for raw_paragraph_id in modified_paragraph_ids:
         paragraph_id = positive_paragraph_id(raw_paragraph_id)
@@ -348,7 +350,7 @@ def save_wizard(
     document_id: str,
     collection_type: str,
     current_text: str,
-    modified_paragraph_ids: list[int],
+    modified_paragraph_ids: list[int] | None = None,
     *,
     runtime: WizardRuntime | None = None,
 ) -> None:

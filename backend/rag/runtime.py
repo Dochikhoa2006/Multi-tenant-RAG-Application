@@ -77,6 +77,7 @@ class ConversationCollectionWriter(Protocol):
 
 
 ConversationCollectionFactory = Callable[[str], ConversationCollectionWriter]
+TimingObserver = Callable[[str, float], None]
 
 
 BackgroundWorkFactory = Callable[[], Awaitable[None]]

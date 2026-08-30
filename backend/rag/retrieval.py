@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 import math
+from time import perf_counter
 from typing import Any
 
 import tiktoken
@@ -17,7 +18,13 @@ from backend.model_config import (
     TOKEN_BUDGETS,
     RetrievalConfig,
 )
-from backend.rag.runtime import RAGRuntime, RerankResult, Tokenizer, resolve_runtime
+from backend.rag.runtime import (
+    RAGRuntime,
+    RerankResult,
+    TimingObserver,
+    Tokenizer,
+    resolve_runtime,
+)
 from backend.weaviate_client.models import SearchResult
 
 
@@ -31,6 +38,16 @@ _CONTEXT_BUDGETS = {
     "policy": TOKEN_BUDGETS.policy_tokens,
 }
 _CONTEXT_SEPARATOR = "\n\n"
+_HYBRID_TIMING_PHASES = {
+    "conversations": "conversation_hybrid_search",
+    "knowledge_facts": "knowledge_hybrid_search",
+    "policy": "policy_hybrid_search",
+}
+_RERANK_TIMING_PHASES = {
+    "conversations": "conversation_mmr_rerank",
+    "knowledge_facts": "knowledge_cross_encoder_rerank",
+    "policy": "policy_cross_encoder_rerank",
+}
 
 
 def _required_text(value: object, name: str) -> str:
@@ -217,6 +234,7 @@ def retrieve(
     collection_type: str,
     *,
     runtime: RAGRuntime | None = None,
+    timing_observer: TimingObserver | None = None,
 ) -> list[dict[str, Any]]:
     """Retrieve configured candidates and apply the collection's Stage 2 strategy."""
 
@@ -228,9 +246,13 @@ def retrieve(
     if not callable(hybrid_search):
         raise TypeError("collection_client must provide hybrid_search()")
     config = _COLLECTION_CONFIGS[collection_type]
-    candidates = _normalized_candidates(
-        hybrid_search(query, list(vector), config.candidate_count)
-    )
+    search_started = perf_counter()
+    raw_candidates = hybrid_search(query, list(vector), config.candidate_count)
+    search_elapsed = (perf_counter() - search_started) * 1000.0
+    if timing_observer is not None:
+        timing_observer(_HYBRID_TIMING_PHASES[collection_type], search_elapsed)
+    candidates = _normalized_candidates(raw_candidates)
+    rerank_started = perf_counter()
     if collection_type == "conversations":
         reranked = _mmr(
             candidates,
@@ -244,6 +266,11 @@ def retrieve(
             reranked,
             _CONTEXT_BUDGETS[collection_type],
             tokenizer=active_runtime.tokenizer,
+        )
+    if timing_observer is not None:
+        timing_observer(
+            _RERANK_TIMING_PHASES[collection_type],
+            (perf_counter() - rerank_started) * 1000.0,
         )
     return reranked
 

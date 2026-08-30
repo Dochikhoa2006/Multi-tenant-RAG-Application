@@ -35,7 +35,12 @@ def test_operational_config_is_overridable_but_collection_names_are_invariant(
     code = """
 import sys
 from backend.config import (
+    CORS_ALLOWED_ORIGINS,
     COLLECTION_TYPES,
+    TASK_MAX_COMPLETED_RECORDS,
+    UPLOAD_MAX_FILE_BYTES,
+    UPLOAD_MAX_TOTAL_BYTES,
+    UPLOAD_READ_CHUNK_BYTES,
     WEAVIATE_GRPC_PORT,
     WEAVIATE_GRPC_SECURE,
     WEAVIATE_URL,
@@ -47,6 +52,11 @@ assert COLLECTION_TYPES == frozenset({'conversations', 'knowledge_facts', 'polic
 assert WEAVIATE_URL == 'https://weaviate.example.test:8443'
 assert WEAVIATE_GRPC_PORT == 50443
 assert WEAVIATE_GRPC_SECURE is False
+assert CORS_ALLOWED_ORIGINS == ('https://one.example', 'https://two.example')
+assert TASK_MAX_COMPLETED_RECORDS == 77
+assert UPLOAD_MAX_FILE_BYTES == 1000
+assert UPLOAD_MAX_TOTAL_BYTES == 2000
+assert UPLOAD_READ_CHUNK_BYTES == 250
 assert get_collection_name('user.name', 'conversations') == 'RagUser_OVZWK4RONZQW2ZI_Conversations'
 assert get_collection_name('usr_abc123', 'conversations') == 'RagUser_OVZXEX3BMJRTCMRT_Conversations'
 assert get_collection_name('客户/email@example.com', 'policy') == (
@@ -74,6 +84,11 @@ assert read_text_files(sys.argv[1:]) == 'first||second'
             "SUPPORTED_FILE_EXTENSIONS": ".data",
             "TEXT_FILE_ENCODING": "utf-16",
             "TEXT_FILE_JOIN_SEPARATOR": "||",
+            "CORS_ALLOWED_ORIGINS": "https://one.example,https://two.example",
+            "TASK_MAX_COMPLETED_RECORDS": "77",
+            "UPLOAD_MAX_FILE_BYTES": "1000",
+            "UPLOAD_MAX_TOTAL_BYTES": "2000",
+            "UPLOAD_READ_CHUNK_BYTES": "250",
         },
         capture_output=True,
         text=True,
@@ -81,6 +96,26 @@ assert read_text_files(sys.argv[1:]) == 'first||second'
     )
 
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"UPLOAD_MAX_FILE_BYTES": "11", "UPLOAD_MAX_TOTAL_BYTES": "10"},
+        {
+            "UPLOAD_MAX_FILE_BYTES": "10",
+            "UPLOAD_MAX_TOTAL_BYTES": "20",
+            "UPLOAD_READ_CHUNK_BYTES": "11",
+        },
+        {"CORS_ALLOWED_ORIGINS": "*,https://example.test"},
+        {"TASK_MAX_COMPLETED_RECORDS": "0"},
+    ],
+)
+def test_upload_and_cors_configuration_rejects_invalid_combinations(
+    overrides: dict[str, str],
+) -> None:
+    result = _run_python("import backend.config", overrides=overrides)
+    assert result.returncode != 0
 
 
 def test_physical_collection_names_are_graphql_safe_and_collision_free() -> None:

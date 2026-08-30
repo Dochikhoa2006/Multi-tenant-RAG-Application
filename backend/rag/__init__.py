@@ -20,10 +20,11 @@ from backend.rag.runtime import (
     LLMClient,
     RAGRuntime,
     RerankResult,
+    TimingObserver,
     Tokenizer,
     configure_default_runtime,
 )
-from backend.rag.session_title import generate_session_title
+from backend.rag.session_title import generate_session_title, validate_session_title
 
 __all__ = [
     "BackgroundTaskQueue",
@@ -36,6 +37,7 @@ __all__ = [
     "RAGRuntime",
     "RerankResult",
     "Tokenizer",
+    "TimingObserver",
     "UserRetrievalCollections",
     "configure_default_runtime",
     "embed_chunks",
@@ -44,6 +46,7 @@ __all__ = [
     "embed_text",
     "generate_answer_stream",
     "generate_session_title",
+    "validate_session_title",
     "retrieve",
     "rewrite_query",
     "run_rag_pipeline",

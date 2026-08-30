@@ -322,6 +322,26 @@ def test_single_modified_paragraph_runs_all_steps_and_commits() -> None:
     ).get_document_chunks(DOCUMENT_ID) == {1: [new_chunk_id]}
 
 
+def test_modified_paragraph_hints_are_optional_and_diff_remains_authoritative() -> None:
+    new_chunk_id = _uuid(111)
+    runtime, collection, _ = _runtime(new_chunk_ids=[new_chunk_id])
+    old_chunk_id = _uuid(11, prefix=8)
+    _seed_document(runtime, {1: "old text"}, {1: [old_chunk_id]})
+
+    save_wizard(
+        USER_ID,
+        DOCUMENT_ID,
+        "knowledge_facts",
+        "derived new text",
+        runtime=runtime,
+    )
+
+    assert collection.deleted_unions == [(1,)]
+    assert runtime.document_map(
+        USER_ID, "knowledge_facts"
+    ).get_full_text(DOCUMENT_ID) == "derived new text"
+
+
 def test_consecutive_modified_paragraphs_form_one_union_and_renumber_tail() -> None:
     current_union = "new-a|new-b|"
     new_ids = [_uuid(101), _uuid(102)]

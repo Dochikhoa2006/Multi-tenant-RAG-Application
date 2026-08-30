@@ -7,6 +7,7 @@ from collections.abc import AsyncGenerator, Awaitable
 from dataclasses import dataclass
 from functools import partial
 import inspect
+from time import perf_counter
 from typing import Any
 
 from backend.mappings._common import required_uuid, validated_user_id
@@ -14,7 +15,7 @@ from backend.rag.embedder import embed_conversation, embed_text
 from backend.rag.generator import generate_answer_stream
 from backend.rag.query_rewriter import rewrite_query
 from backend.rag.retrieval import retrieve
-from backend.rag.runtime import RAGRuntime, resolve_runtime
+from backend.rag.runtime import RAGRuntime, TimingObserver, resolve_runtime
 
 
 def _required_text(value: object, name: str) -> str:
@@ -78,6 +79,21 @@ async def _sync_call(function: object, /, *args: object, **kwargs: object) -> An
     return await asyncio.to_thread(partial(function, *args, **kwargs))
 
 
+async def _timed_sync_call(
+    phase: str,
+    observer: TimingObserver | None,
+    function: object,
+    /,
+    *args: object,
+    **kwargs: object,
+) -> Any:
+    started = perf_counter()
+    result = await _sync_call(function, *args, **kwargs)
+    if observer is not None:
+        observer(phase, (perf_counter() - started) * 1000.0)
+    return result
+
+
 async def run_rag_pipeline(
     user_id: str,
     conversation_id: str,
@@ -85,6 +101,7 @@ async def run_rag_pipeline(
     collections: UserRetrievalCollections,
     *,
     runtime: RAGRuntime | None = None,
+    timing_observer: TimingObserver | None = None,
 ) -> AsyncGenerator[str, None]:
     """Stream an answer and enqueue complete Q+A persistence on success only."""
 
@@ -100,7 +117,13 @@ async def run_rag_pipeline(
     if queue is None:
         raise RuntimeError("RAG pipeline requires an observable background queue")
 
-    original_vector = await _sync_call(embed_text, query, runtime=active_runtime)
+    original_vector = await _timed_sync_call(
+        "original_query_embedding",
+        timing_observer,
+        embed_text,
+        query,
+        runtime=active_runtime,
+    )
     conversations = await _sync_call(
         retrieve,
         collections.conversations,
@@ -108,14 +131,19 @@ async def run_rag_pipeline(
         original_vector,
         "conversations",
         runtime=active_runtime,
+        timing_observer=timing_observer,
     )
-    rewritten_query = await _sync_call(
+    rewritten_query = await _timed_sync_call(
+        "query_rewrite",
+        timing_observer,
         rewrite_query,
         query,
         conversations,
         runtime=active_runtime,
     )
-    rewritten_vector = await _sync_call(
+    rewritten_vector = await _timed_sync_call(
+        "rewritten_query_embedding",
+        timing_observer,
         embed_text,
         rewritten_query,
         runtime=active_runtime,
@@ -128,6 +156,7 @@ async def run_rag_pipeline(
         rewritten_vector,
         "knowledge_facts",
         runtime=active_runtime,
+        timing_observer=timing_observer,
     )
     policy_task = _sync_call(
         retrieve,
@@ -136,18 +165,29 @@ async def run_rag_pipeline(
         rewritten_vector,
         "policy",
         runtime=active_runtime,
+        timing_observer=timing_observer,
     )
     knowledge, policy = await asyncio.gather(knowledge_task, policy_task)
 
     answer_chunks: list[str] = []
+    generation_started: float | None = None
     async for chunk in generate_answer_stream(
         rewritten_query,
         knowledge,
         policy,
         runtime=active_runtime,
+        timing_observer=timing_observer,
     ):
+        if generation_started is None:
+            generation_started = perf_counter()
         answer_chunks.append(chunk)
         yield chunk
+
+    if timing_observer is not None and generation_started is not None:
+        timing_observer(
+            "generation",
+            (perf_counter() - generation_started) * 1000.0,
+        )
 
     answer = "".join(answer_chunks)
     if not answer.strip():

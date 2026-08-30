@@ -2,6 +2,10 @@
 
 This document defines all model selections, hyperparameter configurations, token budgets, and prompt definitions for the Smart RAG Interview Preparation System.
 
+Stage 5 retains at most `TASK_MAX_COMPLETED_RECORDS` completed in-memory task
+records (default `10000`). This operational setting does not affect queued or
+running work and is not a durable task store.
+
 ---
 
 ## 1. System Configuration Hierarchy
@@ -141,3 +145,38 @@ Context
 #### P3: Session Title Generator
 - **Role**: Background task using `GPT-5 mini` reading all completed conversations within the active session.
 - **Output**: A concise 3–6 word title describing the session theme for the sidebar.
+
+---
+
+## 3. Authoritative Stage 5 Chat Timing Telemetry
+
+Successful `/api/chat/query` streams emit one `telemetry` SSE event after all
+answer tokens and before the final `done` event. The event data uses this exact
+versioned JSON shape. This is the authoritative Stage 5 telemetry contract:
+
+```json
+{
+  "schema_version": "1.0",
+  "request_id": "uuid",
+  "timings_ms": {
+    "original_query_embedding": 0.0,
+    "conversation_hybrid_search": 0.0,
+    "conversation_mmr_rerank": 0.0,
+    "query_rewrite": 0.0,
+    "rewritten_query_embedding": 0.0,
+    "knowledge_hybrid_search": 0.0,
+    "knowledge_cross_encoder_rerank": 0.0,
+    "policy_hybrid_search": 0.0,
+    "policy_cross_encoder_rerank": 0.0,
+    "prompt_construction": 0.0,
+    "ttft": 0.0,
+    "generation": 0.0,
+    "total_request": 0.0
+  }
+}
+```
+
+All values are non-negative milliseconds rounded to three decimal places.
+`ttft` measures request start through the first answer token. `generation`
+measures the first token through successful stream completion. Failed or
+cancelled streams emit neither telemetry nor a `done` event.

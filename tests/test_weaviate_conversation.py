@@ -17,8 +17,14 @@ from backend.config import (
 from backend.model_config import HYBRID_SEARCH
 from backend.weaviate_client.client import WeaviateManager
 from backend.weaviate_client.conversation import ConversationCollection
-from backend.weaviate_client.models import IncompatibleCollectionSchemaError, SearchResult
-from backend.weaviate_client.models import UserIsolationError, WeaviateResponseError
+from backend.weaviate_client.models import (
+    DeletionReport,
+    IncompatibleCollectionSchemaError,
+    IncompleteDeletionError,
+    SearchResult,
+    UserIsolationError,
+    WeaviateResponseError,
+)
 
 
 USER_ID = "usr_abc123"
@@ -99,6 +105,33 @@ def _manager_and_collection() -> tuple[WeaviateManager, MagicMock, MagicMock]:
     manager.connect()
     client.connect.reset_mock()
     return manager, client, collection
+
+
+def _delete_result(
+    object_ids: list[str],
+    statuses: list[bool],
+    *,
+    successful: int,
+    failed: int,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        matches=len(object_ids),
+        successful=successful,
+        failed=failed,
+        objects=[
+            SimpleNamespace(uuid=UUID(object_id), successful=item_status)
+            for object_id, item_status in zip(object_ids, statuses, strict=True)
+        ],
+    )
+
+
+def _dry_run_result(object_ids: list[str]) -> SimpleNamespace:
+    return SimpleNamespace(
+        matches=len(object_ids),
+        successful=0,
+        failed=0,
+        objects=[SimpleNamespace(uuid=UUID(object_id)) for object_id in object_ids],
+    )
 
 
 def test_manager_connection_lifecycle_is_idempotent() -> None:
@@ -410,6 +443,109 @@ def test_empty_batch_is_a_noop() -> None:
 
     client.collections.use.assert_not_called()
     collection.data.delete_many.assert_not_called()
+
+
+def test_verified_batch_delete_requires_empty_dry_run_postcondition() -> None:
+    manager, _, collection = _manager_and_collection()
+    collection.data.delete_many.side_effect = [
+        _delete_result(
+            [CONVERSATION_ID, SECOND_CONVERSATION_ID],
+            [True, True],
+            successful=2,
+            failed=0,
+        ),
+        _dry_run_result([]),
+    ]
+    conversations = ConversationCollection(manager, USER_ID)
+
+    report = conversations.delete_batch_verified(
+        [CONVERSATION_ID, SECOND_CONVERSATION_ID]
+    )
+
+    assert report == DeletionReport(
+        matched=2,
+        successful=2,
+        failed=0,
+        deleted_ids=(CONVERSATION_ID, SECOND_CONVERSATION_ID),
+        remaining_ids=(),
+    )
+    first, second = collection.data.delete_many.call_args_list
+    assert first.kwargs["verbose"] is True
+    assert "dry_run" not in first.kwargs
+    assert second.kwargs["verbose"] is True
+    assert second.kwargs["dry_run"] is True
+
+
+def test_partial_verified_batch_delete_is_retryable() -> None:
+    manager, _, collection = _manager_and_collection()
+    collection.data.delete_many.side_effect = [
+        _delete_result(
+            [CONVERSATION_ID, SECOND_CONVERSATION_ID],
+            [True, False],
+            successful=1,
+            failed=1,
+        ),
+        _dry_run_result([SECOND_CONVERSATION_ID]),
+        _delete_result(
+            [SECOND_CONVERSATION_ID],
+            [True],
+            successful=1,
+            failed=0,
+        ),
+        _dry_run_result([]),
+    ]
+    conversations = ConversationCollection(manager, USER_ID)
+
+    with pytest.raises(IncompleteDeletionError) as error:
+        conversations.delete_batch_verified(
+            [CONVERSATION_ID, SECOND_CONVERSATION_ID]
+        )
+    assert error.value.report.remaining_ids == (SECOND_CONVERSATION_ID,)
+
+    retry = conversations.delete_batch_verified(
+        [CONVERSATION_ID, SECOND_CONVERSATION_ID]
+    )
+    assert retry.confirmed
+    assert retry.deleted_ids == (SECOND_CONVERSATION_ID,)
+
+
+def test_verified_batch_delete_rejects_malformed_or_cross_scope_results() -> None:
+    manager, _, collection = _manager_and_collection()
+    conversations = ConversationCollection(manager, USER_ID)
+    collection.data.delete_many.side_effect = [
+        _delete_result(
+            [CONVERSATION_ID],
+            [True],
+            successful=1,
+            failed=0,
+        ),
+        SimpleNamespace(matches=1, successful=0, failed=0, objects=[]),
+    ]
+    with pytest.raises(WeaviateResponseError, match="one object per match"):
+        conversations.delete_batch_verified([CONVERSATION_ID])
+
+    outside_id = "00000000-0000-0000-0000-000000000099"
+    collection.data.delete_many.side_effect = [
+        _delete_result([outside_id], [True], successful=1, failed=0),
+        _dry_run_result([]),
+    ]
+    with pytest.raises(WeaviateResponseError, match="scope"):
+        conversations.delete_batch_verified([CONVERSATION_ID])
+
+
+def test_verified_batch_delete_accepts_already_absent_ids_and_empty_input() -> None:
+    manager, client, collection = _manager_and_collection()
+    collection.data.delete_many.side_effect = [
+        _delete_result([], [], successful=0, failed=0),
+        _dry_run_result([]),
+    ]
+    conversations = ConversationCollection(manager, USER_ID)
+
+    assert conversations.delete_batch_verified([CONVERSATION_ID]).confirmed
+    assert conversations.delete_batch_verified([]) == DeletionReport(
+        0, 0, 0, (), ()
+    )
+    assert collection.data.delete_many.call_count == 2
 
 
 def test_hybrid_search_returns_typed_results_and_expected_query() -> None:

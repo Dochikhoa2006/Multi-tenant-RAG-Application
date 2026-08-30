@@ -33,6 +33,18 @@ def _supported_extensions() -> frozenset[str]:
     return frozenset(extensions)
 
 
+def _cors_allowed_origins() -> tuple[str, ...]:
+    raw_value = _required_string("CORS_ALLOWED_ORIGINS", "*")
+    origins = tuple(
+        dict.fromkeys(item.strip() for item in raw_value.split(",") if item.strip())
+    )
+    if not origins:
+        raise ValueError("CORS_ALLOWED_ORIGINS must contain at least one origin")
+    if "*" in origins and origins != ("*",):
+        raise ValueError("CORS_ALLOWED_ORIGINS cannot combine '*' with other origins")
+    return origins
+
+
 def _raw_string(name: str, default: str) -> str:
     return os.getenv(name, default)
 
@@ -64,6 +76,15 @@ WEAVIATE_GRPC_SECURE = _boolean(
     WEAVIATE_URL.lower().startswith("https://"),
 )
 SUPPORTED_FILE_EXTENSIONS = _supported_extensions()
+CORS_ALLOWED_ORIGINS = _cors_allowed_origins()
+UPLOAD_MAX_FILE_BYTES = _positive_int("UPLOAD_MAX_FILE_BYTES", 10_485_760)
+UPLOAD_MAX_TOTAL_BYTES = _positive_int("UPLOAD_MAX_TOTAL_BYTES", 26_214_400)
+UPLOAD_READ_CHUNK_BYTES = _positive_int("UPLOAD_READ_CHUNK_BYTES", 65_536)
+TASK_MAX_COMPLETED_RECORDS = _positive_int("TASK_MAX_COMPLETED_RECORDS", 10_000)
+if UPLOAD_MAX_FILE_BYTES > UPLOAD_MAX_TOTAL_BYTES:
+    raise ValueError("UPLOAD_MAX_FILE_BYTES must not exceed UPLOAD_MAX_TOTAL_BYTES")
+if UPLOAD_READ_CHUNK_BYTES > UPLOAD_MAX_FILE_BYTES:
+    raise ValueError("UPLOAD_READ_CHUNK_BYTES must not exceed UPLOAD_MAX_FILE_BYTES")
 # These names are architecture invariants, not deployment settings. Retrieval
 # and lifecycle code relies on the three stores remaining physically distinct.
 COLLECTION_TYPES = frozenset({"conversations", "knowledge_facts", "policy"})

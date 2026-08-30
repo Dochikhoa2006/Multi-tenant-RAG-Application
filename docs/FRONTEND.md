@@ -88,17 +88,21 @@ The frontend is a single-page application with three primary modes accessible vi
 
 | Operation | Immediate UI Response | Background Queue Work |
 |---|---|---|
-| **Create Wizard** | New wizard card appears instantly in the gallery with fade-in animation. | Backend generates `document_id`, initializes empty paragraph in Weaviate and mappings. |
+| **Create Wizard** | New wizard card appears after the synchronous `201` response. | Backend generates `document_id` and initializes empty process-local document/paragraph mappings; no Weaviate or embedding work occurs. |
 | **Delete Wizard** | Wizard card is removed from the gallery immediately. | Backend deletes all Weaviate chunk records and mapping entries for that `document_id`. |
 | **Save Wizard** | Editor shows "Saved" state, Save button disables, baseline text updates to current. | Backend runs the full 8-step re-embed pipeline (delete old chunks → re-split → re-chunk → re-embed → renumber → insert). |
-| **Upload File** | Uploaded text appears appended in the editor textarea instantly. Save button enables. | No backend work at this point — backend processes only when Save is clicked. |
-| **Delete Session** | Session is removed from the sidebar immediately. | Backend cascade-deletes all conversation embeddings for that session from Weaviate. |
+| **Upload File** | Nonempty uploaded text appears appended in the editor textarea and Save enables. Empty uploads show an error and leave the editor unchanged. | No backend work at this point — backend processes only when Save is clicked. |
+| **Delete Session** | Show deletion as pending after `202`; retain the session when the API returns `409` for an active stream. | Backend reserves the session, cascade-deletes its conversation embeddings, and removes it only after verified success. |
 | **New Chat** | Fresh empty chat panel appears, new session added to sidebar. | Backend creates session mapping record. |
 | **Send Message** | User message bubble appears instantly. AI response streams in via SSE. | After streaming completes, the Q&A pair is embedded into the Conversation Collection in the background. |
 
 **Error Handling:**
 - If a background queue task fails, the UI displays a **non-blocking toast notification** describing the failure.
-- The toast offers a **Retry** action.
+- The toast offers a **Retry** action that resubmits the original operation;
+  task IDs do not have a generic retry endpoint.
 - The UI does **not** automatically roll back — the user is informed and decides how to proceed.
 - Failed tasks are logged for debugging.
-
+- Error responses contain a stable public code, safe message, and request ID.
+  Provider credentials, storage details, and raw exception messages are never
+  shown. Support/debug tooling correlates the request or task ID with internal
+  logs.
