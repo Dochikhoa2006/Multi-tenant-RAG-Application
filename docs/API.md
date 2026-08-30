@@ -101,12 +101,14 @@ Development CORS defaults to `*`. Production deployments set the comma-separated
 ## 6. Production Runtime Composition
 
 `backend.main:app` is the provider-neutral bootstrap and intentionally has no
-OpenAI or Cohere adapter. It starts without provider SDKs; provider-dependent
-endpoints return safe `503` responses until a runtime is injected.
+concrete GPT-5.1 adapter. It starts without loading local model artifacts;
+provider-dependent endpoints return safe `503` responses until a runtime is
+injected.
 
 Production supplies a deployment-owned ASGI composition module. That module
-constructs the concrete implementations of `LLMClient`, `EmbeddingClient`, and
-`CrossEncoderReranker`, one shared `WeaviateManager` and `InMemoryTaskQueue`,
+constructs the concrete `LLMClient`, one shared `ONNXEmbeddingClient`, one
+shared `ONNXCrossEncoderReranker`, one shared `WeaviateManager` and
+`InMemoryTaskQueue`,
 wraps the existing provider LLM in `RoleRoutingLLMClient` with one shared
 `SGLangGraniteQueryRewriter`, then creates `RAGRuntime`, `AppServices`, and finally
 `create_app(services)`. Launch that module with `uvicorn deployment_app:app`.

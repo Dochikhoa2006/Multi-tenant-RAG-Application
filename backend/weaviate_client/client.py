@@ -16,10 +16,21 @@ from backend.config import (
     WEAVIATE_URL,
     get_collection_name,
 )
+from backend.model_config import EMBEDDING_VECTOR_PROFILE
 from backend.weaviate_client.models import IncompatibleCollectionSchemaError
 
 
 _COLLECTION_ORDER = ("conversations", "knowledge_facts", "policy")
+_VECTOR_PROFILE_PREFIX = "rag-vector-profile"
+
+
+def _collection_description(state: str = "ready") -> str:
+    if state not in {"ready", "rebuilding"}:
+        raise ValueError("collection vector state must be ready or rebuilding")
+    return (
+        f"{_VECTOR_PROFILE_PREFIX}={EMBEDDING_VECTOR_PROFILE};"
+        f"state={state}"
+    )
 
 
 @dataclass(frozen=True)
@@ -137,6 +148,11 @@ def _validate_existing_collection(
     configured_name = _field(config, "name")
     if configured_name != collection_name:
         _schema_error(collection_name, "the returned schema has a mismatched name")
+    if _field(config, "description") != _collection_description():
+        _schema_error(
+            collection_name,
+            "the embedding vector profile is missing, stale, or rebuilding",
+        )
     references = _field(config, "references")
     if references not in (None, []):
         _schema_error(collection_name, "cross-references are not permitted")
@@ -251,6 +267,7 @@ class WeaviateManager:
             )
             collections.create(
                 name=name,
+                description=_collection_description(),
                 properties=properties,
                 vector_config=Configure.Vectors.self_provided(),
             )

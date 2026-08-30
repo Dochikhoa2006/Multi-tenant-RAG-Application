@@ -1,0 +1,6 @@
+# Isolated provisioning environment only; never installed in the API runtime.
+optimum==2.3.0
+optimum-onnx==0.1.0
+transformers==4.57.3
+torch==2.9.1
+onnx==1.19.1

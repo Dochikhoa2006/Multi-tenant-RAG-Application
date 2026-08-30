@@ -24,6 +24,14 @@ def _env_int(name: str, default: int) -> int:
     return value
 
 
+def _env_nonnegative_int(name: str, default: int) -> int:
+    raw_value = os.getenv(name)
+    value = default if raw_value is None else int(raw_value)
+    if value < 0:
+        raise ValueError(f"{name} must be zero or greater")
+    return value
+
+
 def _env_float(name: str, default: float) -> float:
     raw_value = os.getenv(name)
     value = default if raw_value is None else float(raw_value)
@@ -260,6 +268,40 @@ class SGLangQueryRewriteConfig:
             raise ValueError("SGLang continuation_regex must be valid") from exc
 
 
+@dataclass(frozen=True)
+class ONNXModelConfig:
+    """Local-only ONNX tokenizer and inference-session settings."""
+
+    model_path: str
+    revision: str
+    onnx_filename: str
+    manifest_filename: str
+    max_tokens: int
+    batch_size: int
+    execution_provider: str
+    device_id: int
+    output_name: str
+    disable_cpu_fallback: bool
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("model_path", self.model_path),
+            ("revision", self.revision),
+            ("onnx_filename", self.onnx_filename),
+            ("manifest_filename", self.manifest_filename),
+            ("execution_provider", self.execution_provider),
+            ("output_name", self.output_name),
+        ):
+            if not value.strip():
+                raise ValueError(f"ONNX {name} must not be empty")
+        if min(self.max_tokens, self.batch_size) <= 0:
+            raise ValueError("ONNX token and batch limits must be greater than zero")
+        if self.device_id < 0:
+            raise ValueError("ONNX device_id must be zero or greater")
+        if not self.disable_cpu_fallback:
+            raise ValueError("local retrieval ONNX inference cannot enable CPU fallback")
+
+
 PRIMARY_GENERATOR = LLMConfig(
     model=_env_string("PRIMARY_GENERATOR_MODEL", "GPT-5.1"),
     reasoning=_env_string("PRIMARY_GENERATOR_REASONING", "low"),
@@ -275,11 +317,64 @@ SESSION_TITLE_GENERATOR = LLMConfig(
     model=_env_string("SESSION_TITLE_MODEL", PRIMARY_GENERATOR.model),
 )
 
-EMBEDDING_MODEL = _env_string("EMBEDDING_MODEL", "text-embedding-3-small")
-RERANKER_MODEL = _env_string("RERANKER_MODEL", "Cohere rerank-v4.0-fast")
+EMBEDDING_MODEL = _env_string(
+    "EMBEDDING_MODEL",
+    "Alibaba-NLP/gte-modernbert-base",
+)
+RERANKER_MODEL = _env_string("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+EMBEDDING_MODEL_REVISION = "e7f32e3c00f91d699e8c43b53106206bcc72bb22"
+RERANKER_MODEL_REVISION = "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"
+EMBEDDING_VECTOR_PROFILE = "gte-modernbert-base-e7f32e3-fp16-cls-l2-768-v1"
 SEGMENTATION_EMBEDDING_MODEL = _env_string(
     "SEGMENTATION_EMBEDDING_MODEL",
     "all-MiniLM-L6-v2",
+)
+
+ONNX_EMBEDDING = ONNXModelConfig(
+    model_path=_env_string(
+        "ONNX_EMBEDDING_MODEL_PATH",
+        "models/gte-modernbert-base",
+    ),
+    revision=EMBEDDING_MODEL_REVISION,
+    onnx_filename=_env_string(
+        "ONNX_EMBEDDING_FILENAME",
+        "onnx/model_fp16.onnx",
+    ),
+    manifest_filename=_env_string(
+        "ONNX_EMBEDDING_MANIFEST_FILENAME",
+        "onnx-manifest.json",
+    ),
+    max_tokens=_env_int("ONNX_EMBEDDING_MAX_TOKENS", 8192),
+    batch_size=_env_int("ONNX_EMBEDDING_BATCH_SIZE", 32),
+    execution_provider=_env_string(
+        "ONNX_EMBEDDING_EXECUTION_PROVIDER",
+        "CUDAExecutionProvider",
+    ),
+    device_id=_env_nonnegative_int("ONNX_EMBEDDING_CUDA_DEVICE_ID", 0),
+    output_name=_env_string("ONNX_EMBEDDING_OUTPUT_NAME", "last_hidden_state"),
+    disable_cpu_fallback=_env_bool("ONNX_EMBEDDING_DISABLE_CPU_FALLBACK", True),
+)
+
+ONNX_RERANKER = ONNXModelConfig(
+    model_path=_env_string(
+        "ONNX_RERANKER_MODEL_PATH",
+        "models/bge-reranker-v2-m3-onnx",
+    ),
+    revision=RERANKER_MODEL_REVISION,
+    onnx_filename=_env_string("ONNX_RERANKER_FILENAME", "model_fp16.onnx"),
+    manifest_filename=_env_string(
+        "ONNX_RERANKER_MANIFEST_FILENAME",
+        "onnx-manifest.json",
+    ),
+    max_tokens=_env_int("ONNX_RERANKER_MAX_TOKENS", 512),
+    batch_size=_env_int("ONNX_RERANKER_BATCH_SIZE", 16),
+    execution_provider=_env_string(
+        "ONNX_RERANKER_EXECUTION_PROVIDER",
+        "CUDAExecutionProvider",
+    ),
+    device_id=_env_nonnegative_int("ONNX_RERANKER_CUDA_DEVICE_ID", 0),
+    output_name=_env_string("ONNX_RERANKER_OUTPUT_NAME", "logits"),
+    disable_cpu_fallback=_env_bool("ONNX_RERANKER_DISABLE_CPU_FALLBACK", True),
 )
 
 GRANITE_QUERY_REWRITE = GraniteQueryRewriteConfig(

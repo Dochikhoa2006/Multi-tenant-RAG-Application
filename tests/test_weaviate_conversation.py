@@ -15,7 +15,7 @@ from backend.config import (
     get_collection_name,
 )
 from backend.model_config import CONVERSATION_SEARCH, HYBRID_SEARCH
-from backend.weaviate_client.client import WeaviateManager
+from backend.weaviate_client.client import WeaviateManager, _collection_description
 from backend.weaviate_client.conversation import ConversationCollection
 from backend.weaviate_client.models import (
     DeletionReport,
@@ -75,6 +75,7 @@ def _compatible_config(name: str) -> SimpleNamespace:
         ]
     return SimpleNamespace(
         name=name,
+        description=_collection_description(),
         properties=properties,
         references=[],
         vector_config={
@@ -272,6 +273,7 @@ def test_ensure_user_collections_creates_exact_schemas_once() -> None:
     ]
     for collection_name in COLLECTION_NAMES:
         assert calls[collection_name]["vector_config"].model_dump()["vectorizer"] == {}
+        assert calls[collection_name]["description"] == _collection_description()
     assert [item.name for item in calls[COLLECTION_NAMES[2]]["properties"]] == [
         item.name for item in chunk_properties
     ]
@@ -311,6 +313,8 @@ def test_collection_creation_is_idempotent_for_every_existing_subset(
         "provider_vectorizer",
         "vector_source_property",
         "mismatched_name",
+        "stale_vector_profile",
+        "rebuilding_vector_profile",
     ],
 )
 def test_existing_incompatible_schema_fails_before_any_creation(
@@ -344,6 +348,10 @@ def test_existing_incompatible_schema_fails_before_any_creation(
         config.vector_config["default"].vectorizer.source_properties = ["raw_text"]
     elif incompatibility == "mismatched_name":
         config.name = COLLECTION_NAMES[0]
+    elif incompatibility == "stale_vector_profile":
+        config.description = "rag-vector-profile=legacy;state=ready"
+    elif incompatibility == "rebuilding_vector_profile":
+        config.description = _collection_description("rebuilding")
 
     client.collections.exists.side_effect = lambda name: name == existing_name
     client.collections.use.return_value.config.get.return_value = config

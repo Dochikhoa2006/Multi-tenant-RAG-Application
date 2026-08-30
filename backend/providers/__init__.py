@@ -14,12 +14,26 @@ from backend.providers.sglang_query_rewriter import (
     SGLangTransport,
 )
 from backend.providers.query_rewriter_factory import create_query_rewriter
+from backend.providers.onnx_embedding import (
+    EMBEDDING_DIMENSION,
+    ONNXEmbeddingClient,
+    ONNXEmbeddingError,
+)
+from backend.providers.onnx_reranker import (
+    ONNXCrossEncoderReranker,
+    ONNXRerankerError,
+)
 
 __all__ = [
     "GraniteCheckpointError",
     "GraniteInferenceError",
     "GraniteQueryRewriter",
     "GraniteRewriteDiagnostics",
+    "EMBEDDING_DIMENSION",
+    "ONNXCrossEncoderReranker",
+    "ONNXEmbeddingClient",
+    "ONNXEmbeddingError",
+    "ONNXRerankerError",
     "QueryRewriteCompletionClient",
     "RoleRoutingLLMClient",
     "SGLangGraniteQueryRewriter",

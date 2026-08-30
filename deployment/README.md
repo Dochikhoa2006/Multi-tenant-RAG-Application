@@ -4,6 +4,75 @@ The production query-rewrite path is a dedicated SGLang 0.5.18 CUDA service.
 GPT-5.1 answer streaming and title completion remain direct provider calls from
 the existing `RoleRoutingLLMClient`; they are not proxied through SGLang.
 
+## Provision local ONNX retrieval models
+
+Provision these artifacts in a separate, network-enabled build environment.
+The API runtime itself remains offline. Model directories are ignored by Git.
+
+```bash
+python -m venv .onnx-export-venv
+source .onnx-export-venv/bin/activate
+python -m pip install -r deployment/requirements-onnx-export.txt
+
+hf download Alibaba-NLP/gte-modernbert-base \
+  --revision e7f32e3c00f91d699e8c43b53106206bcc72bb22 \
+  --include config.json tokenizer.json tokenizer_config.json onnx/model_fp16.onnx \
+  --local-dir models/gte-modernbert-base
+
+optimum-cli export onnx \
+  --model BAAI/bge-reranker-v2-m3 \
+  --revision 953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e \
+  --task text-classification \
+  --device cuda \
+  --dtype fp16 \
+  models/bge-reranker-v2-m3-onnx
+mv models/bge-reranker-v2-m3-onnx/model.onnx \
+  models/bge-reranker-v2-m3-onnx/model_fp16.onnx
+
+python scripts/create_onnx_manifest.py \
+  models/gte-modernbert-base \
+  Alibaba-NLP/gte-modernbert-base \
+  e7f32e3c00f91d699e8c43b53106206bcc72bb22
+python scripts/create_onnx_manifest.py \
+  models/bge-reranker-v2-m3-onnx \
+  BAAI/bge-reranker-v2-m3 \
+  953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e
+```
+
+Before deployment, run the opt-in offline CUDA smoke test. It checks the GTE
+768-dimensional normalized output and BGE pair-ranking contract without any
+network access:
+
+```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 RUN_ONNX_CUDA_TESTS=1 \
+  pytest tests/test_onnx_integration.py
+```
+
+Create one `ONNXEmbeddingClient` and one `ONNXCrossEncoderReranker` in the ASGI
+composition root and inject both into the existing `RAGRuntime`; the wizard
+embedder adapter reuses that same embedding client. Production requires
+`CUDAExecutionProvider` and permits no CPU or remote inference fallback.
+
+## One-time vector maintenance migration
+
+The new 768-dimensional vectors are incompatible with the former index. Stop
+the API, drain its task queue, take and verify a Weaviate backup, then run:
+
+```bash
+python scripts/migrate_onnx_vectors.py export /secure/vector-migration
+python scripts/migrate_onnx_vectors.py rebuild \
+  /secure/vector-migration --confirm-maintenance
+python scripts/migrate_onnx_vectors.py verify /secure/vector-migration
+```
+
+The export contains exact UUIDs/properties/raw text but never old vectors. It is
+permission-restricted and checksummed. Rebuild recreates only canonical
+Conversation, Knowledge Facts, and Policy collections, re-embeds `raw_text`,
+verifies every 768-dimensional normalized vector and property, and marks all
+collections ready only after every rebuild verifies. Keep the API stopped if a
+collection remains `rebuilding`; rerunning `rebuild` resumes from the verified
+export and never reuses an old vector.
+
 ## Provision the checkpoint
 
 Install the Modal CLI separately from backend runtime dependencies:

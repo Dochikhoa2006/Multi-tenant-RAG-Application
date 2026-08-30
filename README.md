@@ -4,7 +4,9 @@ Full-stack RAG application for Generative AI Engineer FAANG interview coaching. 
 
 Production query rewriting uses the merged Granite 4.1-3B checkpoint through an
 always-warm SGLang/Modal CUDA service. GPT-5.1 answer and title calls remain
-direct provider requests. See [deployment/README.md](./deployment/README.md).
+direct provider requests. Dense embeddings and Knowledge/Policy reranking run
+locally through reusable ONNX Runtime CUDA/FP16 sessions. See
+[deployment/README.md](./deployment/README.md).
 
 ## Documentation
 

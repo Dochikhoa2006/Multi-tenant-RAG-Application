@@ -1,7 +1,11 @@
 # Provisioned local model weights are external deployment artifacts (about 6.3 GiB).
 /merged-granite-4.1-3b-query-rewrite/
+/qwen3-4b-awq/
+/models/gte-modernbert-base/
+/models/bge-reranker-v2-m3-onnx/
 
 # Local interpreter and editor artifacts.
 __pycache__/
 *.py[cod]
 .DS_Store
+qwen3-4b-awq/

@@ -57,6 +57,22 @@ Large text blocks produce low-resolution embeddings that dilute important detail
 
 Even though chunks are organized under paragraphs and documents, retrieval treats all chunks as equals. This prevents the system from biasing results toward certain documents and ensures that the best matching content surfaces regardless of its structural location.
 
+### Why Local ONNX Embedding and Reranking?
+
+Dense embedding uses `Alibaba-NLP/gte-modernbert-base` and Knowledge/Policy
+cross-encoder scoring uses `BAAI/bge-reranker-v2-m3`. Both execute through one
+reused ONNX Runtime CUDA/FP16 session with batched inputs. Embeddings are
+CLS-pooled, converted to float32, L2-normalized, and fixed at 768 dimensions;
+the reranker returns descending raw logits with original result indices.
+Runtime model downloads, remote code, CPU fallback, and paid embedding or
+reranking calls are deliberately prohibited.
+
+The embedding-space change requires an exclusive maintenance rebuild. All
+canonical records are first exported from `raw_text` with UUIDs and properties,
+checksummed, then each collection is recreated and verified before its vector
+profile changes from `rebuilding` to `ready`. The application refuses stale or
+partially rebuilt profiles, so incompatible vector dimensions cannot mix.
+
 ### Why Rewrite the Query Using Conversation History?
 
 Past conversations contain valuable context about the user's preparation focus, knowledge gaps, and conversation patterns. By feeding relevant past conversations to a rewriting model, the system produces a query that captures implicit intent — leading to more targeted knowledge and policy retrieval.

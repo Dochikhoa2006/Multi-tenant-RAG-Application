@@ -48,6 +48,12 @@ Each record is one chunk within a paragraph within a wizard document.
 
 Identical schema to Knowledge Facts Collection. Stored and queried in a completely separate collection namespace.
 
+The displayed `vector` is Weaviate's native self-provided vector, not a normal
+property. Every compatible collection description must contain vector profile
+`gte-modernbert-base-e7f32e3-fp16-cls-l2-768-v1` with state `ready`.
+Collections with an absent/older profile or state `rebuilding` fail fast and
+are never searched or mutated by the application.
+
 #### Collection Naming Convention
 
 Weaviate collection names must begin with an uppercase character and contain
@@ -128,19 +134,19 @@ All three collections follow the same two-stage retrieval procedure. Only the re
               └────────────────────────┘
 ```
 
-**Stage 1 — Hybrid Search:** Weaviate executes a combined dense vector similarity search (`text-embedding-3-small`) and sparse BM25 keyword search, fused via `relativeScoreFusion` with `alpha = 0.70` (70% dense, 30% BM25).
+**Stage 1 — Hybrid Search:** Weaviate executes a combined dense vector similarity search (`Alibaba-NLP/gte-modernbert-base`, local ONNX Runtime) and sparse BM25 keyword search, fused via `relativeScoreFusion` with `alpha = 0.70` (70% dense, 30% BM25).
 
 **Stage 2 — Reranking:**
 - **Conversation Collection:** Weaviate applies native hybrid Maximal Marginal Relevance (MMR) after fusion, using a candidate window of `20`, a final limit of `5`, and `balance = 0.70` (equivalent to $\lambda = 0.70`). This requires `weaviate-client >= 4.23.0` and Weaviate Database `>= 1.38.6`.
-- **Knowledge Facts & Policy Collections:** Apply a cross-encoder reranker (`Cohere rerank-v4.0-fast`) for higher precision on factual/policy content where accuracy matters more than diversity.
+- **Knowledge Facts & Policy Collections:** Apply the local ONNX cross-encoder `BAAI/bge-reranker-v2-m3` for higher precision on factual/policy content where accuracy matters more than diversity.
 
 **Top-K Configuration:**
 
 | Collection | Hybrid Candidate (Stage 1) | Reranking Strategy | Stage 2 Final (Top-K) |
 |---|---|---|---|
 | Conversation | `20` | MMR ($\lambda = 0.70$) | `5` |
-| Knowledge Facts | `30` | Cross-Encoder (`Cohere rerank-v4.0-fast`) | `8` |
-| Policy | `20` | Cross-Encoder (`Cohere rerank-v4.0-fast`) | `5` |
+| Knowledge Facts | `30` | Cross-Encoder (`BAAI/bge-reranker-v2-m3`) | `8` |
+| Policy | `20` | Cross-Encoder (`BAAI/bge-reranker-v2-m3`) | `5` |
 
 *(See [CONFIG_SPECS.md](./CONFIG_SPECS.md) for full configuration details.)*
 
@@ -373,7 +379,14 @@ This produces semantically meaningful paragraph divisions that respect topic shi
 
 **Output:** A dense vector embedding stored in Weaviate.
 
-**Model:** `text-embedding-3-small` (OpenAI API). The same model must be used for both indexing and query-time embedding to ensure compatible vector spaces. (See [CONFIG_SPECS.md](./CONFIG_SPECS.md)).
+**Model:** `Alibaba-NLP/gte-modernbert-base`, executed locally through ONNX Runtime CUDA/FP16. Embeddings use CLS pooling, float32 post-processing, L2 normalization, and exactly 768 dimensions. The same model/profile must be used for indexing and query-time embedding. Ready collections are tagged with `gte-modernbert-base-e7f32e3-fp16-cls-l2-768-v1`; old, missing, or rebuilding profiles are rejected. (See [CONFIG_SPECS.md](./CONFIG_SPECS.md)).
+
+Changing embedding spaces requires an exclusive maintenance rebuild with
+`scripts/migrate_onnx_vectors.py`: export exact UUIDs/properties/`raw_text`
+without old vectors, rebuild all three canonical collections using only new
+embeddings, verify object counts/properties/vector shape and normalization, and
+only then mark the collections `ready`. See `deployment/README.md` for the
+backup, export, rebuild, verification, and resume sequence.
 
 ---
 

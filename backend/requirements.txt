@@ -11,3 +11,5 @@ transformers==5.16.1
 torch==2.13.0
 accelerate==1.14.0
 safetensors==0.8.0
+onnxruntime-gpu[cuda,cudnn]==1.29.0 ; sys_platform == "linux" and platform_machine == "x86_64"
+onnxruntime==1.29.0 ; sys_platform != "linux" or platform_machine != "x86_64"

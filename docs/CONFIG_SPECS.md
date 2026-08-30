@@ -17,10 +17,10 @@ LLM
 └── Title: GPT-5.1
 
 Embedding
-└── text-embedding-3-small
+└── Alibaba-NLP/gte-modernbert-base (local ONNX Runtime CUDA/FP16)
 
 Reranker
-└── Cohere rerank-v4.0-fast
+└── BAAI/bge-reranker-v2-m3 (local ONNX Runtime CUDA/FP16)
 
 Hybrid
 ├── Dense + BM25
@@ -78,15 +78,15 @@ Context
 | **Primary Generator (Answer)** | `GPT-5.1` | OpenAI API | Answer synthesis using retrieved Knowledge Facts and Policy guidelines. |
 | **Query Rewriter (Model A)** | `merged-granite-4.1-3b-query-rewrite` | SGLang 0.5.18 / Modal NVIDIA CUDA | IBM Granite 4.1-3B with the standard query-rewrite LoRA permanently merged. Produces a standalone query from structured dialogue history. |
 | **Session Title Generator** | `GPT-5.1` | OpenAI API | Asynchronous summarization of chat sessions for UI sidebar display. Defaults to the primary generator model while retaining an independent environment override. |
-| **Embedding Model** | `text-embedding-3-small` | OpenAI API | Vector embeddings for chunks (Knowledge, Policy) and full Q&A pairs (Conversation). |
-| **Reranker (Cross-Encoder)** | `rerank-v4.0-fast` | Cohere API | Second-stage cross-encoder reranking for Knowledge Facts and Policy results. |
+| **Embedding Model** | `Alibaba-NLP/gte-modernbert-base` | Local ONNX Runtime, CUDA/FP16 | 768-dimensional CLS-pooled, float32 L2-normalized vectors for chunks and full Q&A pairs. |
+| **Reranker (Cross-Encoder)** | `BAAI/bge-reranker-v2-m3` | Local ONNX Runtime, CUDA/FP16 | Batched query/document pair scoring for Knowledge Facts and Policy results. |
 
 ---
 
 ### 2.2 Vector Search & Retrieval Parameters
 
 #### Hybrid Search Configuration
-- **Components**: Dense Vector (`text-embedding-3-small`) + Sparse BM25
+- **Components**: Dense Vector (`Alibaba-NLP/gte-modernbert-base`) + Sparse BM25
 - **Fusion Method**: `relativeScoreFusion`
 - **Dense Weight (`alpha`)**: `0.70` (70% Vector Similarity, 30% BM25 Sparse Keyword Score)
 
@@ -95,8 +95,43 @@ Context
 | Collection | Stage 1 Candidate (Top-K) | Reranking Algorithm | Reranker / Strategy Config | Stage 2 Final (Top-K) |
 |---|---|---|---|---|
 | **Conversation** | `20` | **MMR** (Maximal Marginal Relevance) | $\lambda = 0.70$ (Balance between relevance & diversity) | `5` |
-| **Knowledge Facts** | `30` | **Cross-Encoder** | `Cohere rerank-v4.0-fast` | `8` |
-| **Policy** | `20` | **Cross-Encoder** | `Cohere rerank-v4.0-fast` | `5` |
+| **Knowledge Facts** | `30` | **Cross-Encoder** | local `BAAI/bge-reranker-v2-m3` | `8` |
+| **Policy** | `20` | **Cross-Encoder** | local `BAAI/bge-reranker-v2-m3` | `5` |
+
+#### Local ONNX configuration
+
+The embedding checkpoint is pinned to revision
+`e7f32e3c00f91d699e8c43b53106206bcc72bb22`; the reranker source is pinned to
+revision `953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e`. Both tokenizer and ONNX
+artifacts are provisioned before deployment and verified through a SHA-256
+manifest. Runtime downloads and remote model code are disabled. Production
+requires `CUDAExecutionProvider` and does not fall back to CPU or a paid API.
+
+| Environment variable | Default |
+|---|---|
+| `ONNX_EMBEDDING_MODEL_PATH` | `models/gte-modernbert-base` |
+| `ONNX_EMBEDDING_FILENAME` | `onnx/model_fp16.onnx` |
+| `ONNX_EMBEDDING_MANIFEST_FILENAME` | `onnx-manifest.json` |
+| `ONNX_EMBEDDING_MAX_TOKENS` | `8192` |
+| `ONNX_EMBEDDING_BATCH_SIZE` | `32` |
+| `ONNX_EMBEDDING_EXECUTION_PROVIDER` | `CUDAExecutionProvider` |
+| `ONNX_EMBEDDING_CUDA_DEVICE_ID` | `0` |
+| `ONNX_EMBEDDING_OUTPUT_NAME` | `last_hidden_state` |
+| `ONNX_EMBEDDING_DISABLE_CPU_FALLBACK` | `true` |
+| `ONNX_RERANKER_MODEL_PATH` | `models/bge-reranker-v2-m3-onnx` |
+| `ONNX_RERANKER_FILENAME` | `model_fp16.onnx` |
+| `ONNX_RERANKER_MANIFEST_FILENAME` | `onnx-manifest.json` |
+| `ONNX_RERANKER_MAX_TOKENS` | `512` |
+| `ONNX_RERANKER_BATCH_SIZE` | `16` |
+| `ONNX_RERANKER_EXECUTION_PROVIDER` | `CUDAExecutionProvider` |
+| `ONNX_RERANKER_CUDA_DEVICE_ID` | `0` |
+| `ONNX_RERANKER_OUTPUT_NAME` | `logits` |
+| `ONNX_RERANKER_DISABLE_CPU_FALLBACK` | `true` |
+
+Every ready Weaviate collection carries vector profile
+`gte-modernbert-base-e7f32e3-fp16-cls-l2-768-v1`. A missing, stale, or
+`rebuilding` profile fails schema validation. This prevents 1,536-dimensional
+legacy vectors from being queried or mixed with the new 768-dimensional index.
 
 ---
 

@@ -155,6 +155,8 @@ from backend.model_config import (
     CHUNKING,
     GRANITE_QUERY_REWRITE,
     HYBRID_SEARCH,
+    ONNX_EMBEDDING,
+    ONNX_RERANKER,
     PRIMARY_GENERATOR,
     QUERY_REWRITE_ENGINE,
     QUERY_REWRITER,
@@ -196,6 +198,18 @@ assert SGLANG_QUERY_REWRITE.connect_timeout_seconds == 0.5
 assert SGLANG_QUERY_REWRITE.read_timeout_seconds == 3.0
 assert SGLANG_QUERY_REWRITE.max_connections == 12
 assert SGLANG_QUERY_REWRITE.constrained_output is False
+assert ONNX_EMBEDDING.model_path == 'local/gte'
+assert ONNX_EMBEDDING.onnx_filename == 'custom/embedding.onnx'
+assert ONNX_EMBEDDING.max_tokens == 4096
+assert ONNX_EMBEDDING.batch_size == 8
+assert ONNX_EMBEDDING.device_id == 2
+assert ONNX_EMBEDDING.execution_provider == 'CPUExecutionProvider'
+assert ONNX_RERANKER.model_path == 'local/bge'
+assert ONNX_RERANKER.onnx_filename == 'custom/reranker.onnx'
+assert ONNX_RERANKER.max_tokens == 256
+assert ONNX_RERANKER.batch_size == 4
+assert ONNX_RERANKER.device_id == 3
+assert ONNX_RERANKER.execution_provider == 'OpenVINOExecutionProvider'
 assert 'top-secret' not in repr(SGLANG_QUERY_REWRITE)
 """,
         overrides={
@@ -232,6 +246,18 @@ assert 'top-secret' not in repr(SGLANG_QUERY_REWRITE)
             "SGLANG_QUERY_REWRITE_READ_TIMEOUT_SECONDS": "3",
             "SGLANG_QUERY_REWRITE_MAX_CONNECTIONS": "12",
             "SGLANG_QUERY_REWRITE_CONSTRAINED_OUTPUT": "false",
+            "ONNX_EMBEDDING_MODEL_PATH": "local/gte",
+            "ONNX_EMBEDDING_FILENAME": "custom/embedding.onnx",
+            "ONNX_EMBEDDING_MAX_TOKENS": "4096",
+            "ONNX_EMBEDDING_BATCH_SIZE": "8",
+            "ONNX_EMBEDDING_CUDA_DEVICE_ID": "2",
+            "ONNX_EMBEDDING_EXECUTION_PROVIDER": "CPUExecutionProvider",
+            "ONNX_RERANKER_MODEL_PATH": "local/bge",
+            "ONNX_RERANKER_FILENAME": "custom/reranker.onnx",
+            "ONNX_RERANKER_MAX_TOKENS": "256",
+            "ONNX_RERANKER_BATCH_SIZE": "4",
+            "ONNX_RERANKER_CUDA_DEVICE_ID": "3",
+            "ONNX_RERANKER_EXECUTION_PROVIDER": "OpenVINOExecutionProvider",
         },
     )
 
@@ -296,6 +322,7 @@ def test_invalid_granite_response_prefill_fails_fast() -> None:
         {"SGLANG_QUERY_REWRITE_MAX_CONNECTIONS": "0"},
         {"SGLANG_QUERY_REWRITE_CONTINUATION_REGEX": "("},
         {"GRANITE_QUERY_REWRITE_DEVICE": "mps"},
+        {"ONNX_RERANKER_DISABLE_CPU_FALLBACK": "false"},
     ],
 )
 def test_invalid_sglang_or_cuda_configuration_fails_fast(
