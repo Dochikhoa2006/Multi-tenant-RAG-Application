@@ -1,7 +1,7 @@
 sentence-transformers
 numpy
 tiktoken
-weaviate-client>=4.16.4,<5
+weaviate-client>=4.23.0,<5
 pytest
 fastapi
 uvicorn

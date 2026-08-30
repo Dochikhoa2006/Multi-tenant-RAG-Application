@@ -81,7 +81,6 @@ def _normalized_candidates(results: object) -> list[dict[str, Any]]:
     if not isinstance(results, list):
         raise TypeError("hybrid_search must return a list")
     normalized: list[dict[str, Any]] = []
-    dimensions: set[int] = set()
     for result in results:
         if not isinstance(result, SearchResult):
             raise TypeError("hybrid_search results must be SearchResult values")
@@ -90,8 +89,6 @@ def _normalized_candidates(results: object) -> list[dict[str, Any]]:
             raise TypeError("search result properties must be a mapping")
         copied_properties = dict(properties)
         raw_text = _required_text(copied_properties.get("raw_text"), "raw_text")
-        vector = _vector(result.vector, "result vector")
-        dimensions.add(len(vector))
         score = float(result.score)
         if not math.isfinite(score):
             raise ValueError("hybrid score must be finite")
@@ -100,56 +97,11 @@ def _normalized_candidates(results: object) -> list[dict[str, Any]]:
                 "object_id": result.object_id,
                 "properties": copied_properties,
                 "raw_text": raw_text,
-                "vector": vector,
                 "hybrid_score": score,
                 "rerank_score": score,
             }
         )
-    if len(dimensions) > 1:
-        raise ValueError("candidate vectors must have consistent dimensions")
     return normalized
-
-
-def _cosine(left: tuple[float, ...], right: tuple[float, ...]) -> float:
-    left_norm = math.sqrt(sum(value * value for value in left))
-    right_norm = math.sqrt(sum(value * value for value in right))
-    if left_norm == 0.0 or right_norm == 0.0:
-        return 0.0
-    return sum(a * b for a, b in zip(left, right, strict=True)) / (
-        left_norm * right_norm
-    )
-
-
-def _mmr(
-    candidates: list[dict[str, Any]],
-    *,
-    final_count: int,
-    lambda_value: float,
-) -> list[dict[str, Any]]:
-    selected: list[int] = []
-    remaining = list(range(len(candidates)))
-    while remaining and len(selected) < final_count:
-        scored: list[tuple[float, float, int]] = []
-        for index in remaining:
-            relevance = candidates[index]["hybrid_score"]
-            redundancy = max(
-                (
-                    _cosine(
-                        candidates[index]["vector"],
-                        candidates[selected_index]["vector"],
-                    )
-                    for selected_index in selected
-                ),
-                default=0.0,
-            )
-            mmr_score = lambda_value * relevance - (1.0 - lambda_value) * redundancy
-            scored.append((mmr_score, relevance, -index))
-        best = max(scored)
-        chosen = -best[2]
-        selected.append(chosen)
-        remaining.remove(chosen)
-        candidates[chosen]["rerank_score"] = best[0]
-    return [candidates[index] for index in selected]
 
 
 def _cross_encoder(
@@ -252,14 +204,14 @@ def retrieve(
     if timing_observer is not None:
         timing_observer(_HYBRID_TIMING_PHASES[collection_type], search_elapsed)
     candidates = _normalized_candidates(raw_candidates)
-    rerank_started = perf_counter()
     if collection_type == "conversations":
-        reranked = _mmr(
-            candidates,
-            final_count=config.final_count,
-            lambda_value=config.mmr_lambda if config.mmr_lambda is not None else 0.0,
-        )
+        if len(candidates) > config.final_count:
+            raise ValueError("native conversation MMR returned too many results")
+        reranked = candidates
+        if timing_observer is not None:
+            timing_observer(_RERANK_TIMING_PHASES[collection_type], 0.0)
     else:
+        rerank_started = perf_counter()
         active_runtime = resolve_runtime(runtime)
         reranked = _cross_encoder(candidates, query, config, active_runtime)
         reranked = _budget_results(
@@ -267,11 +219,11 @@ def retrieve(
             _CONTEXT_BUDGETS[collection_type],
             tokenizer=active_runtime.tokenizer,
         )
-    if timing_observer is not None:
-        timing_observer(
-            _RERANK_TIMING_PHASES[collection_type],
-            (perf_counter() - rerank_started) * 1000.0,
-        )
+        if timing_observer is not None:
+            timing_observer(
+                _RERANK_TIMING_PHASES[collection_type],
+                (perf_counter() - rerank_started) * 1000.0,
+            )
     return reranked
 
 

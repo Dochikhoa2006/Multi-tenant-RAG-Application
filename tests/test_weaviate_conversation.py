@@ -14,7 +14,7 @@ from backend.config import (
     WEAVIATE_URL,
     get_collection_name,
 )
-from backend.model_config import HYBRID_SEARCH
+from backend.model_config import CONVERSATION_SEARCH, HYBRID_SEARCH
 from backend.weaviate_client.client import WeaviateManager
 from backend.weaviate_client.conversation import ConversationCollection
 from backend.weaviate_client.models import (
@@ -559,7 +559,6 @@ def test_hybrid_search_returns_typed_results_and_expected_query() -> None:
                     "conversation_id": CONVERSATION_ID,
                     "raw_text": "Question\nAnswer",
                 },
-                vector={"default": [0.25, 0.75]},
                 metadata=SimpleNamespace(score=0.91),
             )
         ]
@@ -576,7 +575,6 @@ def test_hybrid_search_returns_typed_results_and_expected_query() -> None:
                 "conversation_id": CONVERSATION_ID,
                 "raw_text": "Question\nAnswer",
             },
-            vector=(0.25, 0.75),
             score=0.91,
         )
     ]
@@ -588,7 +586,12 @@ def test_hybrid_search_returns_typed_results_and_expected_query() -> None:
     assert kwargs["query_properties"] == ["raw_text"]
     assert kwargs["fusion_type"] is HybridFusion.RELATIVE_SCORE
     assert kwargs["limit"] == 20
-    assert kwargs["include_vector"] is True
+    assert kwargs["include_vector"] is False
+    assert kwargs["diversity_selection"].limit == 5
+    assert kwargs["diversity_selection"].balance == 0.70
+    assert CONVERSATION_SEARCH.candidate_count == 20
+    assert CONVERSATION_SEARCH.final_count == 5
+    assert CONVERSATION_SEARCH.mmr_lambda == 0.70
     assert kwargs["return_metadata"].score is True
 
 
@@ -668,6 +671,19 @@ def test_search_top_k_validation_prevents_query(top_k: object) -> None:
     collection.query.hybrid.assert_not_called()
 
 
+def test_native_mmr_final_limit_does_not_exceed_direct_candidate_limit() -> None:
+    manager, _, collection = _manager_and_collection()
+    collection.query.hybrid.return_value = SimpleNamespace(objects=[])
+    conversations = ConversationCollection(manager, USER_ID)
+
+    assert conversations.hybrid_search("query", [0.1], 3) == []
+
+    kwargs = collection.query.hybrid.call_args.kwargs
+    assert kwargs["limit"] == 3
+    assert kwargs["diversity_selection"].limit == 3
+    assert kwargs["diversity_selection"].balance == 0.70
+
+
 @pytest.mark.parametrize(
     ("query_text", "query_vector"),
     [
@@ -690,11 +706,7 @@ def test_search_query_validation_prevents_sdk_call(
     collection.query.hybrid.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    "bad_vector",
-    [None, [], [float("nan")], [float("inf")], [[0.1]], {}, {"a": [0.1], "b": [0.2]}],
-)
-def test_malformed_response_vectors_are_rejected(bad_vector: object) -> None:
+def test_search_ignores_unrequested_response_vector_data() -> None:
     manager, _, collection = _manager_and_collection()
     collection.query.hybrid.return_value = SimpleNamespace(
         objects=[
@@ -705,15 +717,17 @@ def test_malformed_response_vectors_are_rejected(bad_vector: object) -> None:
                     "conversation_id": CONVERSATION_ID,
                     "raw_text": "content",
                 },
-                vector=bad_vector,
+                vector={"unexpected": [float("nan")]},
                 metadata=SimpleNamespace(score=0.8),
             )
         ]
     )
     conversations = ConversationCollection(manager, USER_ID)
 
-    with pytest.raises(WeaviateResponseError, match="vector"):
-        conversations.hybrid_search("query", [0.1], 20)
+    results = conversations.hybrid_search("query", [0.1], 20)
+
+    assert results[0].vector is None
+    assert collection.query.hybrid.call_args.kwargs["include_vector"] is False
 
 
 @pytest.mark.parametrize("bad_score", [None, float("nan"), float("inf"), "bad"])

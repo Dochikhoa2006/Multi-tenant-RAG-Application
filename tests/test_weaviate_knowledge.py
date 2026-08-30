@@ -224,7 +224,11 @@ def test_knowledge_hybrid_search_keeps_collection_result_order() -> None:
     results = knowledge.hybrid_search("query", [0.5, 0.5], 30)
 
     assert [item.object_id for item in results] == [CHUNK_ID, SECOND_CHUNK_ID]
-    assert collection.query.hybrid.call_args.kwargs["return_properties"] == [
+    assert all(item.vector is None for item in results)
+    kwargs = collection.query.hybrid.call_args.kwargs
+    assert kwargs["include_vector"] is False
+    assert "diversity_selection" not in kwargs
+    assert kwargs["return_properties"] == [
         "user_id",
         "document_id",
         "paragraph_id",

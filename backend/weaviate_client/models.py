@@ -85,5 +85,5 @@ class SearchResult:
 
     object_id: str
     properties: Mapping[str, Any]
-    vector: tuple[float, ...]
     score: float
+    vector: tuple[float, ...] | None = None

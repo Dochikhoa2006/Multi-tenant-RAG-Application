@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 from uuid import UUID
 
-from weaviate.classes.query import HybridFusion, MetadataQuery
+from weaviate.classes.query import Diversity, HybridFusion, MetadataQuery
 
 from backend.config import get_collection_name
 from backend.model_config import HYBRID_SEARCH
@@ -83,19 +83,21 @@ def _fusion_type() -> HybridFusion:
 
 
 def _result_vector(value: object) -> tuple[float, ...]:
+    """Validate a native vector for snapshot/recovery operations."""
+
     if value is None:
-        raise WeaviateResponseError("hybrid result is missing its native vector")
+        raise WeaviateResponseError("snapshot result is missing its native vector")
     selected = value
     if isinstance(value, Mapping):
         if len(value) != 1:
             raise WeaviateResponseError(
-                "hybrid result contains zero or multiple native vectors"
+                "snapshot result contains zero or multiple native vectors"
             )
         selected = next(iter(value.values()))
     try:
-        return tuple(_vector_values(selected, "result vector"))
+        return tuple(_vector_values(selected, "snapshot vector"))
     except (TypeError, ValueError) as exc:
-        raise WeaviateResponseError("hybrid result contains a malformed vector") from exc
+        raise WeaviateResponseError("snapshot result contains a malformed vector") from exc
 
 
 def _result_score(value: object) -> float:
@@ -141,21 +143,31 @@ class _CollectionBase:
         query_text: str,
         query_vector: Sequence[float],
         top_k: int,
+        *,
+        diversity_limit: int | None = None,
+        diversity_balance: float | None = None,
     ) -> list[SearchResult]:
         query = _required_text(query_text, "query_text")
         vector = _vector_values(query_vector, "query_vector")
         limit = _positive_top_k(top_k)
-        response = self._collection.query.hybrid(
-            query=query,
-            vector=vector,
-            alpha=HYBRID_SEARCH.alpha,
-            query_properties=["raw_text"],
-            fusion_type=_fusion_type(),
-            limit=limit,
-            include_vector=True,
-            return_metadata=MetadataQuery(score=True),
-            return_properties=list(self.return_properties),
-        )
+        query_options: dict[str, Any] = {
+            "query": query,
+            "vector": vector,
+            "alpha": HYBRID_SEARCH.alpha,
+            "query_properties": ["raw_text"],
+            "fusion_type": _fusion_type(),
+            "limit": limit,
+            "include_vector": False,
+            "return_metadata": MetadataQuery(score=True),
+            "return_properties": list(self.return_properties),
+        }
+        if diversity_limit is not None:
+            selected_limit = min(_positive_top_k(diversity_limit), limit)
+            query_options["diversity_selection"] = Diversity.mmr(
+                limit=selected_limit,
+                balance=diversity_balance,
+            )
+        response = self._collection.query.hybrid(**query_options)
         results: list[SearchResult] = []
         for item in response.objects:
             raw_properties = getattr(item, "properties", None)
@@ -183,7 +195,6 @@ class _CollectionBase:
                 SearchResult(
                     object_id=object_id,
                     properties=properties,
-                    vector=_result_vector(getattr(item, "vector", None)),
                     score=_result_score(score),
                 )
             )

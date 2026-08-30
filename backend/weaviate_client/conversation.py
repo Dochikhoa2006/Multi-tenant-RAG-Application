@@ -6,6 +6,7 @@ from collections.abc import Sequence
 
 from weaviate.classes.query import Filter
 
+from backend.model_config import CONVERSATION_SEARCH
 from backend.weaviate_client._chunk_collection import (
     _actual_delete_response,
     _dry_run_delete_response,
@@ -135,4 +136,10 @@ class ConversationCollection(_CollectionBase):
         query_vector: Sequence[float],
         top_k: int,
     ) -> list[SearchResult]:
-        return self._hybrid_search(query_text, query_vector, top_k)
+        return self._hybrid_search(
+            query_text,
+            query_vector,
+            top_k,
+            diversity_limit=CONVERSATION_SEARCH.final_count,
+            diversity_balance=CONVERSATION_SEARCH.mmr_lambda,
+        )

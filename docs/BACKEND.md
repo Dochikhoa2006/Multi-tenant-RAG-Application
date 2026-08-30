@@ -131,7 +131,7 @@ All three collections follow the same two-stage retrieval procedure. Only the re
 **Stage 1 — Hybrid Search:** Weaviate executes a combined dense vector similarity search (`text-embedding-3-small`) and sparse BM25 keyword search, fused via `relativeScoreFusion` with `alpha = 0.70` (70% dense, 30% BM25).
 
 **Stage 2 — Reranking:**
-- **Conversation Collection:** Apply Maximal Marginal Relevance (MMR) with $\lambda = 0.70$ to promote diversity among retrieved past conversations and reduce redundancy.
+- **Conversation Collection:** Weaviate applies native hybrid Maximal Marginal Relevance (MMR) after fusion, using a candidate window of `20`, a final limit of `5`, and `balance = 0.70` (equivalent to $\lambda = 0.70`). This requires `weaviate-client >= 4.23.0` and Weaviate Database `>= 1.38.6`.
 - **Knowledge Facts & Policy Collections:** Apply a cross-encoder reranker (`Cohere rerank-v4.0-fast`) for higher precision on factual/policy content where accuracy matters more than diversity.
 
 **Top-K Configuration:**
