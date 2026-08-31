@@ -152,6 +152,21 @@ def test_embed_delegates_to_shared_batch_session(tmp_path: Path) -> None:
     assert len(session.calls) == 2
 
 
+def test_embedding_close_is_idempotent_and_releases_runtime(tmp_path: Path) -> None:
+    _artifacts(tmp_path)
+    client = ONNXEmbeddingClient(
+        _config(tmp_path),
+        tokenizer=FakeTokenizer(),
+        session=FakeEmbeddingSession(),
+    )
+
+    client.close()
+    client.close()
+
+    with pytest.raises(RuntimeError, match="closed"):
+        client.embed("text", model=EMBEDDING_MODEL)
+
+
 def test_embedding_constructs_tokenizer_and_session_once(tmp_path: Path) -> None:
     _artifacts(tmp_path)
     loads: list[tuple[str, dict[str, object]]] = []

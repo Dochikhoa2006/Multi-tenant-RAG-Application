@@ -132,6 +132,18 @@ settings apply only when CUDA is selected.
 | `ONNX_RERANKER_OUTPUT_NAME` | `logits` |
 | `ONNX_RERANKER_DISABLE_CPU_FALLBACK` | `true` |
 
+Stage 1 semantic segmentation retains `all-MiniLM-L6-v2`, but loads it only
+from an explicitly provisioned local directory. The loader passes
+`local_files_only=True` and an explicit device; it never resolves the model
+through the Hugging Face network at runtime. Segmentation defaults to CPU and is
+independent of the CUDA ONNX retrieval providers.
+
+| Environment variable | Default |
+|---|---|
+| `SEGMENTATION_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` |
+| `SEGMENTATION_MODEL_PATH` | `models/all-MiniLM-L6-v2` |
+| `SEGMENTATION_EMBEDDING_DEVICE` | `cpu` |
+
 Every ready Weaviate collection carries vector profile
 `gte-modernbert-base-e7f32e3-fp16-cls-l2-768-v1`. A missing, stale, or
 `rebuilding` profile fails schema validation. This prevents 1,536-dimensional

@@ -409,6 +409,14 @@ SEGMENTATION_EMBEDDING_MODEL = _env_string(
     "SEGMENTATION_EMBEDDING_MODEL",
     "all-MiniLM-L6-v2",
 )
+SEGMENTATION_MODEL_PATH = _env_string(
+    "SEGMENTATION_MODEL_PATH",
+    "models/all-MiniLM-L6-v2",
+)
+SEGMENTATION_EMBEDDING_DEVICE = _env_string(
+    "SEGMENTATION_EMBEDDING_DEVICE",
+    "cpu",
+)
 
 ONNX_EMBEDDING = ONNXModelConfig(
     model_path=_env_string(

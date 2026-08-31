@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 import re
 from typing import Any, Protocol, Sequence
 
@@ -11,7 +12,9 @@ import numpy as np
 
 from backend.model_config import (
     CHUNKING,
+    SEGMENTATION_EMBEDDING_DEVICE,
     SEGMENTATION_EMBEDDING_MODEL,
+    SEGMENTATION_MODEL_PATH,
     TEXT_PROCESSING,
 )
 
@@ -135,13 +138,34 @@ def _validate_similarity_threshold(value: float) -> float:
 
 @lru_cache(maxsize=TEXT_PROCESSING.sentence_model_cache_size)
 def _get_sentence_transformer() -> SentenceEncoder:
+    configured_path = Path(SEGMENTATION_MODEL_PATH).expanduser()
+    model_path = (
+        configured_path.resolve()
+        if configured_path.is_absolute()
+        else (Path(__file__).resolve().parents[2] / configured_path).resolve()
+    )
+    if not model_path.is_dir():
+        raise RuntimeError(
+            "locally provisioned segmentation model directory does not exist: "
+            f"{model_path}"
+        )
     try:
         from sentence_transformers import SentenceTransformer
     except ImportError as exc:  # pragma: no cover - misconfigured installation
         raise RuntimeError(
             "sentence-transformers is required for semantic text processing"
         ) from exc
-    return SentenceTransformer(SEGMENTATION_EMBEDDING_MODEL)
+    try:
+        return SentenceTransformer(
+            str(model_path),
+            device=SEGMENTATION_EMBEDDING_DEVICE,
+            local_files_only=True,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "locally provisioned segmentation model is invalid: "
+            f"{SEGMENTATION_EMBEDDING_MODEL} at {model_path}"
+        ) from exc
 
 
 def _encode_sentences(

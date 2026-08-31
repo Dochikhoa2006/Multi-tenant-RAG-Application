@@ -10,6 +10,42 @@ run locally from FP16 graphs through reusable ONNX Runtime sessions (CUDA by
 default). See
 [deployment/README.md](./deployment/README.md).
 
+## Integrated Development Runtime
+
+Stage 7A provides the complete single-process composition at
+`backend.runtime_app:create_runtime_app`. It loads one shared ONNX embedding
+client, reranker, Granite client, Qwen client, Weaviate manager, and task queue.
+The Granite and Qwen SGLang servers remain external services.
+
+For a native start, provision the configured local model paths and external
+SGLang endpoints in `.env`, then run:
+
+```bash
+set -a
+source .env
+set +a
+uvicorn backend.runtime_app:create_runtime_app \
+  --factory --host 0.0.0.0 --port 8000 --workers 1
+```
+
+For the supported CUDA Docker runtime:
+
+```bash
+cp .env.example .env
+# Edit .env with absolute model paths, SGLang URLs, and credentials.
+docker compose up --build --wait
+```
+
+Open <http://localhost:8000/dev/e2e> for the minimal development-only browser
+harness, or <http://localhost:8000/health> for readiness. The fake console
+allows only one active manual chat request and is not the Stage 6 frontend. The Docker profile
+requires Linux/amd64, NVIDIA Container Toolkit, one compatible GPU, provisioned
+FP16 ONNX artifacts, the local Granite checkpoint/tokenizer, and a local copy of
+the Stage 1 segmentation model. Segmentation loads only from
+`SEGMENTATION_MODEL_PATH`, uses `SEGMENTATION_EMBEDDING_DEVICE=cpu` by default,
+and never downloads at runtime. Docker Compose starts Weaviate but deliberately
+does not bundle either SGLang worker.
+
 ## Documentation
 
 | Document | What It Covers |

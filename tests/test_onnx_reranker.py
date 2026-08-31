@@ -168,6 +168,21 @@ def test_reranker_reuses_loaded_tokenizer_and_session(tmp_path: Path) -> None:
     assert session.disable_fallback_calls == 1
 
 
+def test_reranker_close_is_idempotent_and_releases_runtime(tmp_path: Path) -> None:
+    _artifacts(tmp_path)
+    reranker = ONNXCrossEncoderReranker(
+        _config(tmp_path),
+        tokenizer=FakePairTokenizer(),
+        session=FakeRerankerSession([np.array([1.0], dtype=np.float32)]),
+    )
+
+    reranker.close()
+    reranker.close()
+
+    with pytest.raises(RuntimeError, match="closed"):
+        reranker.rerank("q", ["doc"], model=RERANKER_MODEL, top_n=1)
+
+
 def test_reranker_accepts_another_explicit_provider_without_cuda_options(
     tmp_path: Path,
 ) -> None:

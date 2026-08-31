@@ -25,6 +25,41 @@ def _run_python(code: str, *, overrides: dict[str, str]) -> subprocess.Completed
     )
 
 
+def test_segmentation_configuration_defaults_to_local_cpu() -> None:
+    environment = os.environ.copy()
+    for name in (
+        "SEGMENTATION_EMBEDDING_MODEL",
+        "SEGMENTATION_MODEL_PATH",
+        "SEGMENTATION_EMBEDDING_DEVICE",
+    ):
+        environment.pop(name, None)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+from backend.model_config import (
+    SEGMENTATION_EMBEDDING_DEVICE,
+    SEGMENTATION_EMBEDDING_MODEL,
+    SEGMENTATION_MODEL_PATH,
+)
+
+assert SEGMENTATION_EMBEDDING_MODEL == 'all-MiniLM-L6-v2'
+assert SEGMENTATION_MODEL_PATH == 'models/all-MiniLM-L6-v2'
+assert SEGMENTATION_EMBEDDING_DEVICE == 'cpu'
+""",
+        ],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_operational_config_is_overridable_but_collection_names_are_invariant(
     tmp_path: Path,
 ) -> None:
@@ -161,6 +196,9 @@ from backend.model_config import (
     QWEN_SGLANG,
     QUERY_REWRITE_ENGINE,
     QUERY_REWRITER,
+    SEGMENTATION_EMBEDDING_DEVICE,
+    SEGMENTATION_EMBEDDING_MODEL,
+    SEGMENTATION_MODEL_PATH,
     SESSION_TITLE_GENERATOR,
     SGLANG_QUERY_REWRITE,
     TEXT_PROCESSING,
@@ -198,6 +236,9 @@ assert TEXT_PROCESSING.normalize_embeddings is False
 assert TEXT_PROCESSING.show_progress_bar is True
 assert TEXT_PROCESSING.sentence_model_cache_size == 2
 assert TEXT_PROCESSING.tokenizer_cache_size == 3
+assert SEGMENTATION_EMBEDDING_MODEL == 'all-MiniLM-L6-v2'
+assert SEGMENTATION_MODEL_PATH == 'local/segmentation'
+assert SEGMENTATION_EMBEDDING_DEVICE == 'cuda:2'
 assert QUERY_REWRITER.model == 'granite-override'
 assert QUERY_REWRITE_ENGINE == 'transformers'
 assert GRANITE_QUERY_REWRITE.model_path == 'local/granite'
@@ -258,6 +299,8 @@ assert 'qwen-secret' not in repr(QWEN_SGLANG)
             "SENTENCE_EMBEDDING_PROGRESS_BAR": "true",
             "SENTENCE_MODEL_CACHE_SIZE": "2",
             "TOKENIZER_CACHE_SIZE": "3",
+            "SEGMENTATION_MODEL_PATH": "local/segmentation",
+            "SEGMENTATION_EMBEDDING_DEVICE": "cuda:2",
             "QUERY_REWRITER_MODEL": "granite-override",
             "QUERY_REWRITE_ENGINE": "transformers",
             "GRANITE_QUERY_REWRITE_MODEL_PATH": "local/granite",

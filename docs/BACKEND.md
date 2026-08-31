@@ -433,9 +433,8 @@ The frontend uses an optimistic UI pattern — every button action immediately u
 ### 7.4 Production Composition
 
 Provider adapters are injected at the application composition root rather than
-implemented by Stage 5. No production ASGI composition module currently exists
-in this repository. Deployment remains blocked until the deployment-owned
-module constructs one shared manager and queue, exactly one shared
+implemented by Stage 5. `backend.runtime_app:create_runtime_app` constructs one
+shared manager and queue, exactly one shared
 `ONNXEmbeddingClient`, exactly one shared `ONNXCrossEncoderReranker`, the
 concrete provider clients, `RAGRuntime`, and `AppServices`. Its provider LLM is
 one shared `SGLangQwenLLMClient` wrapped by `RoleRoutingLLMClient`, which sends
@@ -444,9 +443,14 @@ delegates title completion and answer streaming to the Qwen worker. Production
 uses `SGLangGraniteQueryRewriter` for the separate always-warm Granite Modal
 CUDA service. The explicit `transformers` engine is a
 redeploy-only CUDA rollback and is never selected automatically after failure.
-The two SGLang workers do not alter the seven-step RAG flow.
-That future composition module calls `create_app(services)`.
-`backend.main:app` remains an importable providerless bootstrap for development
-and returns `503` from provider-dependent endpoints; it does not verify or
-provide shared ONNX clients. No provider credentials are inferred from this
-repository.
+The two SGLang workers do not alter the seven-step RAG flow. The integrated
+factory calls `create_app(services)` and owns readiness validation and cleanup.
+`backend.main:app` remains an importable providerless bootstrap and returns
+`503` from provider-dependent endpoints. The integrated factory runs with one
+Uvicorn worker because mappings and queue state are process-local. Model paths,
+endpoints, and credentials remain explicit environment configuration.
+
+The integrated startup also warms the Stage 1 `all-MiniLM-L6-v2` segmentation
+encoder from `SEGMENTATION_MODEL_PATH` with `local_files_only=True` and the
+explicit `SEGMENTATION_EMBEDDING_DEVICE` (`cpu` by default). A missing or invalid
+local artifact prevents readiness; runtime model downloads are not permitted.

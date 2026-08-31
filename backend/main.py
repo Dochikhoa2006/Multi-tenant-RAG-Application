@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from contextlib import asynccontextmanager
+import inspect
+from typing import Any
 
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
@@ -19,17 +22,44 @@ from backend.config import CORS_ALLOWED_ORIGINS
 from backend.services import AppServices
 
 
-def create_app(services: AppServices | None = None) -> FastAPI:
+LifecycleHook = Callable[[], Any]
+
+
+async def _run_hook(hook: LifecycleHook | None) -> None:
+    if hook is None:
+        return
+    result = hook()
+    if inspect.isawaitable(result):
+        await result
+
+
+def create_app(
+    services: AppServices | None = None,
+    *,
+    startup_hook: LifecycleHook | None = None,
+    shutdown_hook: LifecycleHook | None = None,
+) -> FastAPI:
     application_services = services if services is not None else AppServices()
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
-        await asyncio.to_thread(application_services.manager.connect)
+        connected = False
         try:
+            await asyncio.to_thread(application_services.manager.connect)
+            connected = True
+            await _run_hook(startup_hook)
             yield
         finally:
-            await application_services.task_queue.close()
-            await asyncio.to_thread(application_services.manager.disconnect)
+            try:
+                await application_services.task_queue.close()
+            finally:
+                try:
+                    await _run_hook(shutdown_hook)
+                finally:
+                    if connected:
+                        await asyncio.to_thread(
+                            application_services.manager.disconnect
+                        )
 
     application = FastAPI(title="RAG Application API", lifespan=lifespan)
     application.state.services = application_services
@@ -96,4 +126,4 @@ def create_app(services: AppServices | None = None) -> FastAPI:
 app = create_app()
 
 
-__all__ = ["app", "create_app"]
+__all__ = ["LifecycleHook", "app", "create_app"]

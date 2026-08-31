@@ -98,28 +98,36 @@ wizard mapping, creates embeddings, writes Weaviate, or enqueues work.
 Development CORS defaults to `*`. Production deployments set the comma-separated
 `CORS_ALLOWED_ORIGINS` environment variable to the exact permitted origins.
 
-## 6. Production Runtime Composition
+## 6. Integrated Runtime Composition
 
 `backend.main:app` is the provider-neutral bootstrap and intentionally has no
 concrete Qwen or Granite adapter. It starts without loading local model artifacts;
 provider-dependent endpoints return safe `503` responses until a runtime is
 injected.
 
-No production ASGI composition module currently exists in this repository.
-Deployment must supply one that constructs the concrete `LLMClient`, exactly
-one shared `ONNXEmbeddingClient`, exactly one shared
+`backend.runtime_app:create_runtime_app` constructs the concrete `LLMClient`,
+exactly one shared `ONNXEmbeddingClient`, exactly one shared
 `ONNXCrossEncoderReranker`, one shared `WeaviateManager` and
 `InMemoryTaskQueue`, constructs one shared `SGLangQwenLLMClient`, and wraps it
 in `RoleRoutingLLMClient` with one shared `SGLangGraniteQueryRewriter`. It then
-creates `RAGRuntime`, `AppServices`, and `create_app(services)`. Until that module is supplied, production provider
-wiring—including shared ONNX client reuse—cannot be verified. The provider
-adapters and credentials remain deployment dependencies outside Stage 5;
+creates `RAGRuntime`, `AppServices`, and `create_app(services)`. Its lifespan
+owns validation, shared-client reuse, and cleanup. Provider endpoints, model
+artifacts, and credentials remain deployment dependencies;
 `backend.main:app` is intentionally providerless.
 
 Provision the merged checkpoint and its SHA-256 manifest in the Modal model
 Volume before deploying SGLang. The directory must contain `config.json`,
 `model.safetensors.index.json`, both Safetensors shards, tokenizer, and chat
 template. Runtime downloads and remote code are disabled. The FastAPI deployment
-uses pooled authenticated connections to the two SGLang workers in the same
-Modal region. Importing `backend.main:app` does not contact SGLang or load model
-weights. See `deployment/README.md` for provisioning and rollout.
+uses pooled authenticated connections to the two SGLang workers. Startup checks
+their `/v1/models` responses before marking `/health` ready. Importing
+`backend.main:app` does not contact SGLang or load model weights. Start the full
+runtime with `uvicorn backend.runtime_app:create_runtime_app --factory --workers
+1`; see `deployment/README.md` for provisioning and rollout.
+
+The integrated development runtime also exposes `GET /dev/e2e`. It is a minimal
+same-origin HTML harness that creates/selects sessions, calls the real
+`POST /api/chat/query`, consumes the real SSE response, and displays token,
+telemetry, error, and done events. It is not the Stage 6 frontend.
+The console serializes manual submissions and restores Submit only after a
+terminal SSE event or a transport/parsing failure.

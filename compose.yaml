@@ -1,0 +1,82 @@
+services:
+  weaviate:
+    image: cr.weaviate.io/semitechnologies/weaviate:1.39.0
+    restart: unless-stopped
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --scheme
+      - http
+    ports:
+      - "8080:8080"
+      - "50051:50051"
+    volumes:
+      - weaviate_data:/var/lib/weaviate
+    environment:
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: /var/lib/weaviate
+      QUERY_DEFAULTS_LIMIT: "30"
+      CLUSTER_HOSTNAME: node1
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8080/v1/.well-known/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  api:
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - path: ${RAG_ENV_FILE:-.env}
+        required: false
+    environment:
+      WEAVIATE_URL: http://weaviate:8080
+      WEAVIATE_GRPC_PORT: "50051"
+      WEAVIATE_GRPC_SECURE: "false"
+      ONNX_EMBEDDING_MODEL_PATH: /opt/models/gte-modernbert-base
+      ONNX_RERANKER_MODEL_PATH: /opt/models/bge-reranker-v2-m3-onnx
+      GRANITE_QUERY_REWRITE_MODEL_PATH: /opt/models/merged-granite-4.1-3b-query-rewrite
+      SEGMENTATION_EMBEDDING_MODEL: all-MiniLM-L6-v2
+      SEGMENTATION_MODEL_PATH: /opt/models/all-MiniLM-L6-v2
+      SEGMENTATION_EMBEDDING_DEVICE: cpu
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      TOKENIZERS_PARALLELISM: "false"
+    ports:
+      - "8000:8000"
+    volumes:
+      - type: bind
+        source: ${GTE_MODEL_HOST_PATH:?Set GTE_MODEL_HOST_PATH in .env}
+        target: /opt/models/gte-modernbert-base
+        read_only: true
+      - type: bind
+        source: ${BGE_RERANKER_HOST_PATH:?Set BGE_RERANKER_HOST_PATH in .env}
+        target: /opt/models/bge-reranker-v2-m3-onnx
+        read_only: true
+      - type: bind
+        source: ${GRANITE_MODEL_HOST_PATH:?Set GRANITE_MODEL_HOST_PATH in .env}
+        target: /opt/models/merged-granite-4.1-3b-query-rewrite
+        read_only: true
+      - type: bind
+        source: ${SEGMENTATION_MODEL_HOST_PATH:?Set SEGMENTATION_MODEL_HOST_PATH in .env}
+        target: /opt/models/all-MiniLM-L6-v2
+        read_only: true
+    depends_on:
+      weaviate:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  weaviate_data:

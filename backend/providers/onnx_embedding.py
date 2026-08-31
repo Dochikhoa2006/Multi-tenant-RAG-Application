@@ -185,6 +185,21 @@ class ONNXEmbeddingClient:
         self._tokenizer = tokenizer
         self._session = session
         self._inputs = tuple(inputs)
+        self._closed = False
+
+    def close(self) -> None:
+        """Release process-owned tokenizer and ONNX session references."""
+
+        if self._closed:
+            return
+        self._closed = True
+        self._tokenizer = None
+        self._session = None
+
+    def _resources(self) -> tuple[object, object]:
+        if self._closed or self._tokenizer is None or self._session is None:
+            raise RuntimeError("embedding client is closed")
+        return self._tokenizer, self._session
 
     def embed(self, text: str, *, model: str) -> Sequence[float]:
         return self.embed_many([_required_text(text, "text")], model=model)[0]
@@ -203,10 +218,12 @@ class ONNXEmbeddingClient:
         if not validated:
             return []
 
+        tokenizer, session = self._resources()
+
         embedded: list[list[float]] = []
         for start in range(0, len(validated), self._config.batch_size):
             batch = validated[start : start + self._config.batch_size]
-            encoded = self._tokenizer(
+            encoded = tokenizer(
                 batch,
                 padding=True,
                 truncation=True,
@@ -224,7 +241,7 @@ class ONNXEmbeddingClient:
                     encoded[name],
                     dtype=_input_dtype(getattr(input_meta, "type", None)),
                 )
-            raw_outputs = self._session.run([self._config.output_name], feed)
+            raw_outputs = session.run([self._config.output_name], feed)
             if not isinstance(raw_outputs, list) or len(raw_outputs) != 1:
                 raise ONNXEmbeddingError("embedding ONNX response is malformed")
             hidden_state = np.asarray(raw_outputs[0], dtype=np.float32)

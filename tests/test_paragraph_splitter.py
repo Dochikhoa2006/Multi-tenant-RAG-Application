@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+import backend.processing.paragraph_splitter as paragraph_splitter
 from backend.processing.paragraph_splitter import split_into_paragraphs
 
 
@@ -17,6 +20,74 @@ class SequenceEncoder:
         self.inputs = list(sentences)
         assert len(sentences) == len(self._vectors)
         return self._vectors
+
+
+def test_local_segmentation_model_uses_explicit_path_device_and_offline_mode(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+    encoder = SequenceEncoder([[1.0, 0.0]])
+
+    def sentence_transformer(path: str, **kwargs: object) -> SequenceEncoder:
+        calls.append((path, dict(kwargs)))
+        return encoder
+
+    monkeypatch.setattr(paragraph_splitter, "SEGMENTATION_MODEL_PATH", str(tmp_path))
+    monkeypatch.setattr(paragraph_splitter, "SEGMENTATION_EMBEDDING_DEVICE", "cpu")
+    monkeypatch.setitem(
+        sys.modules,
+        "sentence_transformers",
+        SimpleNamespace(SentenceTransformer=sentence_transformer),
+    )
+    paragraph_splitter._get_sentence_transformer.cache_clear()
+    try:
+        assert paragraph_splitter._get_sentence_transformer() is encoder
+        assert paragraph_splitter._get_sentence_transformer() is encoder
+    finally:
+        paragraph_splitter._get_sentence_transformer.cache_clear()
+
+    assert calls == [
+        (
+            str(tmp_path.resolve()),
+            {"device": "cpu", "local_files_only": True},
+        )
+    ]
+
+
+def test_missing_local_segmentation_model_fails_before_provider_resolution(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    missing = tmp_path / "missing"
+    monkeypatch.setattr(paragraph_splitter, "SEGMENTATION_MODEL_PATH", str(missing))
+    monkeypatch.delitem(sys.modules, "sentence_transformers", raising=False)
+    paragraph_splitter._get_sentence_transformer.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="directory does not exist"):
+            paragraph_splitter._get_sentence_transformer()
+    finally:
+        paragraph_splitter._get_sentence_transformer.cache_clear()
+
+
+def test_invalid_local_segmentation_artifact_fails_clearly(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail(*args: object, **kwargs: object) -> object:
+        raise ValueError("bad artifact")
+
+    monkeypatch.setattr(paragraph_splitter, "SEGMENTATION_MODEL_PATH", str(tmp_path))
+    monkeypatch.setitem(
+        sys.modules,
+        "sentence_transformers",
+        SimpleNamespace(SentenceTransformer=fail),
+    )
+    paragraph_splitter._get_sentence_transformer.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="model is invalid") as error:
+            paragraph_splitter._get_sentence_transformer()
+    finally:
+        paragraph_splitter._get_sentence_transformer.cache_clear()
+
+    assert isinstance(error.value.__cause__, ValueError)
 
 
 @pytest.mark.parametrize("text", ["", "   ", "\n\t\n"])

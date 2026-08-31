@@ -186,6 +186,21 @@ class ONNXCrossEncoderReranker:
         self._tokenizer = tokenizer
         self._session = session
         self._inputs = tuple(inputs)
+        self._closed = False
+
+    def close(self) -> None:
+        """Release process-owned tokenizer and ONNX session references."""
+
+        if self._closed:
+            return
+        self._closed = True
+        self._tokenizer = None
+        self._session = None
+
+    def _resources(self) -> tuple[object, object]:
+        if self._closed or self._tokenizer is None or self._session is None:
+            raise RuntimeError("reranker client is closed")
+        return self._tokenizer, self._session
 
     def rerank(
         self,
@@ -208,11 +223,13 @@ class ONNXCrossEncoderReranker:
         if not validated:
             return []
 
+        tokenizer, session = self._resources()
+
         scores: list[float] = []
         for start in range(0, len(validated), self._config.batch_size):
             batch = validated[start : start + self._config.batch_size]
             pairs = [(query_text, document) for document in batch]
-            encoded = self._tokenizer(
+            encoded = tokenizer(
                 pairs,
                 padding=True,
                 truncation=True,
@@ -230,7 +247,7 @@ class ONNXCrossEncoderReranker:
                     encoded[name],
                     dtype=_input_dtype(getattr(input_meta, "type", None)),
                 )
-            raw_outputs = self._session.run([self._config.output_name], feed)
+            raw_outputs = session.run([self._config.output_name], feed)
             if not isinstance(raw_outputs, list) or len(raw_outputs) != 1:
                 raise ONNXRerankerError("reranker ONNX response is malformed")
             logits = np.asarray(raw_outputs[0], dtype=np.float32)

@@ -3,6 +3,13 @@
 /qwen3-4b-awq/
 /models/gte-modernbert-base/
 /models/bge-reranker-v2-m3-onnx/
+/models/all-MiniLM-L6-v2/
+/all-MiniLM-L6-v2/
+
+# Local runtime configuration may contain SGLang credentials.
+.env
+.env.*
+!.env.example
 
 # Local interpreter and editor artifacts.
 __pycache__/

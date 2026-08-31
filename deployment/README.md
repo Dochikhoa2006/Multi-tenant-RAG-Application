@@ -55,12 +55,18 @@ another provider may be selected explicitly with the corresponding
 passes `device_id` only to CUDA, and disables ONNX Runtime fallback. There is no
 automatic CPU or remote-inference fallback.
 
+Stage 1 segmentation separately loads `all-MiniLM-L6-v2` from the required
+`SEGMENTATION_MODEL_PATH` with `local_files_only=True`. Its explicit
+`SEGMENTATION_EMBEDDING_DEVICE` defaults to `cpu`; no Hugging Face download is
+allowed during API startup. The Docker profile mounts the provisioned directory
+read-only at `/opt/models/all-MiniLM-L6-v2`.
+
 Production must construct exactly one `ONNXEmbeddingClient` and one
 `ONNXCrossEncoderReranker` in its ASGI composition root, inject both into the
 existing `RAGRuntime`, and reuse that embedding client through the wizard
-adapter. This repository does not currently contain that production ASGI
-composition module, so the shared-client wiring cannot yet be verified and is
-a deployment blocker. `backend.main:app` remains providerless.
+adapter. `backend.runtime_app:create_runtime_app` now owns that wiring and its
+lifespan. `backend.main:app` remains providerless and import-safe for tests that
+inject their own services.
 
 ## Disposable empty-state vector-profile migration
 
@@ -161,15 +167,31 @@ QWEN_SGLANG_API_KEY=the-qwen-secret
 QWEN_SGLANG_SERVED_MODEL=qwen3-4b-awq
 ```
 
-At the deployment composition root, construct exactly one pooled
-`SGLangQwenLLMClient`, call `create_query_rewriter()`, wrap the Qwen client with
-`RoleRoutingLLMClient`, and inject that router into the unchanged `RAGRuntime`.
-The router sends only query-rewrite completion to Granite; title completion and
-all answer streams go to Qwen. The composition owns closing the Qwen sync and
-async HTTP clients. Keep the FastAPI deployment at one process and one replica
-because its mappings and queue remain process-local. This repository still has
-no production ASGI composition module; deployment is blocked until that
-deployment-owned module supplies this wiring.
+`backend.runtime_app:create_runtime_app` constructs exactly one pooled
+`SGLangQwenLLMClient` and `SGLangGraniteQueryRewriter`, wraps them with
+`RoleRoutingLLMClient`, and injects that router into the unchanged `RAGRuntime`.
+Only query rewriting reaches Granite; title completion and answer streaming go
+to Qwen. Lifespan shutdown drains the task queue before closing both HTTP client
+pools and disconnecting Weaviate. Keep the FastAPI deployment at one process
+and one replica because its mappings and queue remain process-local.
+
+The API validates `/v1/models` on both external workers during startup and
+fails closed when either worker is unavailable or advertises the wrong model.
+Start it with:
+
+```bash
+uvicorn backend.runtime_app:create_runtime_app \
+  --factory --host 0.0.0.0 --port 8000 --workers 1
+```
+
+For Docker development, copy `.env.example` to `.env`, supply the four absolute
+model directories and both SGLang endpoints, then run `docker compose up
+--build --wait`. Compose starts only FastAPI and Weaviate; the SGLang workers
+retain their existing independent deployments.
+
+`GET /dev/e2e` is a fake development E2E console, not the Stage 6 frontend. It
+permits one active manual query, consumes the real SSE stream through `done` or
+`error`, and then restores its Submit control.
 
 The server keeps one GPU replica warm, targets four concurrent inputs, accepts
 at most eight running rewrites per replica, and may scale to four replicas.
