@@ -8,6 +8,7 @@ import pytest
 from weaviate.classes.config import DataType
 from weaviate.classes.query import HybridFusion
 
+import backend.weaviate_client.client as weaviate_client_module
 from backend.config import (
     WEAVIATE_GRPC_PORT,
     WEAVIATE_GRPC_SECURE,
@@ -214,6 +215,8 @@ def test_ensure_user_collections_creates_exact_schemas_once() -> None:
         COLLECTION_NAMES[1],
         COLLECTION_NAMES[2],
     }
+    assert client.collections.exists.call_count == 3
+    client.collections.use.assert_not_called()
     assert client.collections.create.call_count == 3
     calls = {
         call.kwargs["name"]: call.kwargs
@@ -297,6 +300,79 @@ def test_collection_creation_is_idempotent_for_every_existing_subset(
     assert [
         call.kwargs["name"] for call in client.collections.create.call_args_list
     ] == [name for name in COLLECTION_NAMES if name not in existing]
+
+
+def test_collection_validation_cache_is_independent_per_user() -> None:
+    client = MagicMock()
+    manager = WeaviateManager(client=client)
+    manager.connect()
+    client.collections.exists.return_value = False
+
+    second_user = "usr_other"
+    manager.ensure_user_collections(USER_ID)
+    manager.ensure_user_collections(second_user)
+
+    assert [call.args[0] for call in client.collections.exists.call_args_list] == [
+        *COLLECTION_NAMES,
+        *(
+            get_collection_name(second_user, collection_type)
+            for collection_type in ("conversations", "knowledge_facts", "policy")
+        ),
+    ]
+    assert client.collections.create.call_count == 6
+
+
+def test_failed_schema_validation_is_not_cached() -> None:
+    client = MagicMock()
+    manager = WeaviateManager(client=client)
+    manager.connect()
+    client.collections.exists.return_value = True
+    stale = _compatible_config(COLLECTION_NAMES[0])
+    stale.description = "rag-vector-profile=legacy;state=ready"
+    client.collections.use.return_value.config.get.return_value = stale
+
+    with pytest.raises(IncompatibleCollectionSchemaError):
+        manager.ensure_user_collections(USER_ID)
+
+    _configure_existing_schema_reads(client)
+    manager.ensure_user_collections(USER_ID)
+
+    assert client.collections.exists.call_count == 6
+
+
+def test_vector_profile_change_cannot_reuse_cached_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = MagicMock()
+    manager = WeaviateManager(client=client)
+    manager.connect()
+    client.collections.exists.return_value = True
+    _configure_existing_schema_reads(client)
+
+    manager.ensure_user_collections(USER_ID)
+    monkeypatch.setattr(
+        weaviate_client_module,
+        "EMBEDDING_VECTOR_PROFILE",
+        "replacement-vector-profile",
+    )
+    manager.ensure_user_collections(USER_ID)
+
+    assert client.collections.exists.call_count == 6
+    assert client.collections.use.call_count == 6
+
+
+def test_cached_validation_still_requires_connected_manager() -> None:
+    client = MagicMock()
+    manager = WeaviateManager(client=client)
+    manager.connect()
+    client.collections.exists.return_value = False
+    manager.ensure_user_collections(USER_ID)
+    manager.disconnect()
+
+    with pytest.raises(RuntimeError, match="connect"):
+        manager.ensure_user_collections(USER_ID)
+
+    assert client.collections.exists.call_count == 3
 
 
 @pytest.mark.parametrize(
@@ -402,6 +478,7 @@ def test_collection_create_failure_is_propagated_and_retry_fills_missing() -> No
 
     manager.ensure_user_collections(USER_ID)
     assert created == set(COLLECTION_NAMES)
+    assert client.collections.exists.call_count == 6
 
 
 def test_insert_uses_conversation_id_as_object_uuid_and_native_vector() -> None:

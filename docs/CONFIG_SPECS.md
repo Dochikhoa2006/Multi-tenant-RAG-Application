@@ -62,9 +62,9 @@ Generation
 └── SSE
 
 Context
-├── Knowledge ≤ 4000 tokens
-├── Policy ≤ 1500 tokens
-└── Total ≤ 6000 tokens
+├── Knowledge ≤ 2500 tokens
+├── Policy ≤ 750 tokens
+└── Total ≤ 3500 tokens
 ```
 
 ---
@@ -184,9 +184,9 @@ remote-provider or alternate-model fallback. P2 and P3 are each sent as one
 Qwen `user` message. All calls explicitly disable thinking.
 
 #### Token Budget Allocation
-- **Knowledge Facts Context Budget**: $\le 4,000\text{ tokens}$
-- **Policy Guidelines Context Budget**: $\le 1,500\text{ tokens}$
-- **Total Combined Prompt Context Ceiling**: $\le 6,000\text{ tokens}$
+- **Knowledge Facts Context Budget**: $\le 2,500\text{ tokens}$
+- **Policy Guidelines Context Budget**: $\le 750\text{ tokens}$
+- **Total Combined Prompt Context Ceiling**: $\le 3,500\text{ tokens}$
 
 ---
 
@@ -230,8 +230,8 @@ dropped from the tail when necessary; the current query is never truncated. The 
 - **Role**: Non-thinking `qwen3-4b-awq` synthesizing the final response through SGLang.
 - **Inputs**:
   - Official user query (rewritten query)
-  - Retrieved Knowledge Facts chunks (Top-8, within 4,000 tokens)
-  - Retrieved Policy guidelines chunks (Top-5, within 1,500 tokens)
+  - Retrieved Knowledge Facts chunks (Top-8, within 2,500 tokens)
+  - Retrieved Policy guidelines chunks (Top-5, within 750 tokens)
 - **Delivery**: Streamed token-by-token over SSE.
 
 #### P3: Session Title Generator

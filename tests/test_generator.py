@@ -159,11 +159,11 @@ def test_answer_prompt_exposes_documented_named_fields() -> None:
 
 def test_full_rendered_prompt_budget_drops_lower_scored_whole_tail() -> None:
     knowledge = [
-        {"raw_text": ("primary " * 3000).strip(), "rerank_score": 0.9},
-        {"raw_text": ("lower " * 900).strip(), "rerank_score": 0.1},
+        {"raw_text": ("primary " * 1800).strip(), "rerank_score": 0.9},
+        {"raw_text": ("lower " * 600).strip(), "rerank_score": 0.1},
     ]
     policy = [
-        {"raw_text": ("policy " * 1490).strip(), "rerank_score": 0.5},
+        {"raw_text": ("policy " * 740).strip(), "rerank_score": 0.5},
     ]
     llm = FakeLLM(["answer"])
 

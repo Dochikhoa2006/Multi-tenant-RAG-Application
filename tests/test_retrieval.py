@@ -210,8 +210,8 @@ def test_policy_context_budget_keeps_only_complete_reranked_results() -> None:
 
 def test_context_budget_drops_only_a_lowest_ranked_suffix() -> None:
     texts = [
-        ("first " * 900).strip(),
-        ("second " * 900).strip(),
+        ("first " * 450).strip(),
+        ("second " * 450).strip(),
         ("small " * 100).strip(),
     ]
     collection = FakeCollection(

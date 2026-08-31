@@ -203,6 +203,7 @@ class WeaviateManager:
     def __init__(self, client: Any | None = None) -> None:
         self._client = client
         self._connected = False
+        self._validated_collection_profiles: set[tuple[str, str]] = set()
 
     @property
     def client(self) -> Any:
@@ -243,10 +244,17 @@ class WeaviateManager:
         """Validate existing collections, then create any missing schemas."""
 
         collections = self.client.collections
-        collection_states: list[tuple[str, str, bool]] = []
-        for collection_type in _COLLECTION_ORDER:
-            name = get_collection_name(user_id, collection_type)
-            collection_states.append((collection_type, name, collections.exists(name)))
+        collection_names = [
+            (collection_type, get_collection_name(user_id, collection_type))
+            for collection_type in _COLLECTION_ORDER
+        ]
+        cache_key = (user_id, EMBEDDING_VECTOR_PROFILE)
+        if cache_key in self._validated_collection_profiles:
+            return
+        collection_states = [
+            (collection_type, name, collections.exists(name))
+            for collection_type, name in collection_names
+        ]
 
         for collection_type, name, exists in collection_states:
             if exists:
@@ -271,3 +279,4 @@ class WeaviateManager:
                 properties=properties,
                 vector_config=Configure.Vectors.self_provided(),
             )
+        self._validated_collection_profiles.add(cache_key)

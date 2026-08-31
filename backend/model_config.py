@@ -537,9 +537,9 @@ CHUNKING = ChunkingConfig(
 )
 
 TOKEN_BUDGETS = TokenBudgetConfig(
-    knowledge_tokens=_env_int("KNOWLEDGE_CONTEXT_TOKENS", 4000),
-    policy_tokens=_env_int("POLICY_CONTEXT_TOKENS", 1500),
-    total_context_tokens=_env_int("TOTAL_CONTEXT_TOKENS", 6000),
+    knowledge_tokens=_env_int("KNOWLEDGE_CONTEXT_TOKENS", 2500),
+    policy_tokens=_env_int("POLICY_CONTEXT_TOKENS", 750),
+    total_context_tokens=_env_int("TOTAL_CONTEXT_TOKENS", 3500),
 )
 
 TEXT_PROCESSING = TextProcessingConfig(
