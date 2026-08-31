@@ -437,13 +437,14 @@ implemented by Stage 5. No production ASGI composition module currently exists
 in this repository. Deployment remains blocked until the deployment-owned
 module constructs one shared manager and queue, exactly one shared
 `ONNXEmbeddingClient`, exactly one shared `ONNXCrossEncoderReranker`, the
-concrete provider clients, `RAGRuntime`, and `AppServices`. Its provider LLM is wrapped by `RoleRoutingLLMClient`, which sends
+concrete provider clients, `RAGRuntime`, and `AppServices`. Its provider LLM is
+one shared `SGLangQwenLLMClient` wrapped by `RoleRoutingLLMClient`, which sends
 only the configured query-rewrite role to the configured Granite adapter and
-delegates title completion and answer
-streaming. Production uses `SGLangGraniteQueryRewriter`, which calls the
-always-warm Modal CUDA service. The explicit `transformers` engine is a
+delegates title completion and answer streaming to the Qwen worker. Production
+uses `SGLangGraniteQueryRewriter` for the separate always-warm Granite Modal
+CUDA service. The explicit `transformers` engine is a
 redeploy-only CUDA rollback and is never selected automatically after failure.
-SGLang does not proxy GPT-5.1 and does not alter the seven-step RAG flow.
+The two SGLang workers do not alter the seven-step RAG flow.
 That future composition module calls `create_app(services)`.
 `backend.main:app` remains an importable providerless bootstrap for development
 and returns `503` from provider-dependent endpoints; it does not verify or

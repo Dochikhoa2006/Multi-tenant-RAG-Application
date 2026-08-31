@@ -11,6 +11,7 @@ import pytest
 
 from backend.model_config import (
     GRANITE_QUERY_REWRITE,
+    PRIMARY_GENERATOR,
     QUERY_REWRITER,
     SGLANG_QUERY_REWRITE,
 )
@@ -405,7 +406,7 @@ def test_role_router_delegates_gpt_and_routes_only_granite_to_sglang() -> None:
     assert router.complete(_prompt(), model=QUERY_REWRITER.model) == (
         "Standalone Rex question"
     )
-    assert router.complete("title", model="GPT-5.1") == "title"
+    assert router.complete("title", model=PRIMARY_GENERATOR.model) == "title"
     assert len(client.calls) == 1
     assert delegate.calls == ["title"]
 

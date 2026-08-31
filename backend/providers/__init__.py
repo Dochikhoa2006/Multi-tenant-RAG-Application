@@ -13,6 +13,12 @@ from backend.providers.sglang_query_rewriter import (
     SGLangQueryRewriteError,
     SGLangTransport,
 )
+from backend.providers.sglang_qwen_llm import (
+    QwenAsyncTransport,
+    QwenSyncTransport,
+    SGLangQwenError,
+    SGLangQwenLLMClient,
+)
 from backend.providers.query_rewriter_factory import create_query_rewriter
 from backend.providers.onnx_embedding import (
     EMBEDDING_DIMENSION,
@@ -36,7 +42,11 @@ __all__ = [
     "ONNXRerankerError",
     "QueryRewriteCompletionClient",
     "RoleRoutingLLMClient",
+    "QwenAsyncTransport",
+    "QwenSyncTransport",
     "SGLangGraniteQueryRewriter",
+    "SGLangQwenError",
+    "SGLangQwenLLMClient",
     "SGLangQueryRewriteError",
     "SGLangTransport",
     "create_query_rewriter",

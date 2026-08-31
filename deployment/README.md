@@ -1,8 +1,8 @@
 # Modal SGLang Deployment
 
-The production query-rewrite path is a dedicated SGLang 0.5.18 CUDA service.
-GPT-5.1 answer streaming and title completion remain direct provider calls from
-the existing `RoleRoutingLLMClient`; they are not proxied through SGLang.
+Production uses two dedicated SGLang 0.5.18 CUDA services. Granite handles only
+query rewriting. The separate `qwen3-4b-awq` worker handles non-thinking answer
+streaming and title completion through the existing `RoleRoutingLLMClient`.
 
 ## Provision local ONNX retrieval models
 
@@ -93,7 +93,7 @@ collection, old populated manifest, or newly inserted object fails before
 mutation. Keep the API stopped if a collection remains `rebuilding`; rerunning
 `rebuild` safely completes an interrupted empty rebuild.
 
-## Provision the checkpoint
+## Provision the Granite checkpoint
 
 Install the Modal CLI separately from backend runtime dependencies:
 
@@ -113,7 +113,26 @@ The service verifies the manifest and refuses to start when any required model
 or tokenizer file is missing or has changed. Runtime Hugging Face downloads and
 remote model code are disabled.
 
-## Deploy
+## Provision the Qwen checkpoint
+
+The local `qwen3-4b-awq` directory is an external deployment artifact and is
+ignored by Git. Create its manifest before uploading it to its dedicated Modal
+Volume:
+
+```bash
+python scripts/create_qwen_manifest.py qwen3-4b-awq
+modal volume create rag-qwen-models
+modal volume put rag-qwen-models qwen3-4b-awq /qwen3-4b-awq
+modal secret create rag-qwen-sglang-secrets \
+  QWEN_SGLANG_API_KEY="REPLACE_WITH_A_DIFFERENT_RANDOM_SECRET"
+```
+
+Startup verifies the manifest, `Qwen3ForCausalLM` architecture, FP16 metadata,
+AWQ GEMM 4-bit weights with group size 128, and the native thinking-aware chat
+template. The worker loads only the provisioned local files and never enables
+remote model code or downloads.
+
+## Deploy both workers
 
 Start with L40S in the same compute and routing region as the FastAPI deployment:
 
@@ -122,6 +141,11 @@ MODAL_SGLANG_GPU=L40S \
 MODAL_SGLANG_COMPUTE_REGION=us-east \
 MODAL_SGLANG_ROUTING_REGION=us-east \
 modal deploy deployment/modal_sglang.py
+
+QWEN_MODAL_SGLANG_GPU=L40S \
+QWEN_MODAL_SGLANG_COMPUTE_REGION=us-east \
+QWEN_MODAL_SGLANG_ROUTING_REGION=us-east \
+modal deploy deployment/modal_qwen_sglang.py
 ```
 
 Configure the API composition with:
@@ -131,16 +155,32 @@ QUERY_REWRITE_ENGINE=sglang
 SGLANG_QUERY_REWRITE_BASE_URL=https://YOUR-MODAL-SERVER/v1
 SGLANG_QUERY_REWRITE_API_KEY=the-same-secret
 SGLANG_QUERY_REWRITE_MODEL=merged-granite-4.1-3b-query-rewrite
+QWEN_MODEL_PATH=qwen3-4b-awq
+QWEN_SGLANG_BASE_URL=https://YOUR-QWEN-MODAL-SERVER/v1
+QWEN_SGLANG_API_KEY=the-qwen-secret
+QWEN_SGLANG_SERVED_MODEL=qwen3-4b-awq
 ```
 
-At the deployment composition root, call `create_query_rewriter()`, wrap the
-existing direct-provider LLM with `RoleRoutingLLMClient`, and inject that router
-into the unchanged `RAGRuntime`. Keep the FastAPI deployment at one process and
-one replica because its mappings and queue remain process-local.
+At the deployment composition root, construct exactly one pooled
+`SGLangQwenLLMClient`, call `create_query_rewriter()`, wrap the Qwen client with
+`RoleRoutingLLMClient`, and inject that router into the unchanged `RAGRuntime`.
+The router sends only query-rewrite completion to Granite; title completion and
+all answer streams go to Qwen. The composition owns closing the Qwen sync and
+async HTTP clients. Keep the FastAPI deployment at one process and one replica
+because its mappings and queue remain process-local. This repository still has
+no production ASGI composition module; deployment is blocked until that
+deployment-owned module supplies this wiring.
 
 The server keeps one GPU replica warm, targets four concurrent inputs, accepts
 at most eight running rewrites per replica, and may scale to four replicas.
 Override these settings only after running the workload benchmark.
+
+The Qwen worker separately keeps one L40S replica warm, accepts at most eight
+running generations per replica, and supports a native context length of
+32,768 tokens without YaRN. It starts with `--reasoning-parser qwen3`, relies on
+SGLang AWQ auto-detection, and warms one non-thinking title completion and one
+non-thinking answer stream before readiness. All application requests also send
+`chat_template_kwargs.enable_thinking=false`; reasoning output is rejected.
 
 ## Validate and select a GPU
 
@@ -148,6 +188,7 @@ Run normal offline tests first, then the opt-in Modal contract test and benchmar
 
 ```bash
 RUN_MODAL_SGLANG_TESTS=1 pytest tests/test_sglang_query_rewriter_integration.py
+RUN_QWEN_SGLANG_TESTS=1 pytest tests/test_sglang_qwen_integration.py
 python scripts/benchmark_sglang_query_rewriter.py \
   --concurrency 1,4,8 \
   --input-tokens 128,512,1024,2048 \

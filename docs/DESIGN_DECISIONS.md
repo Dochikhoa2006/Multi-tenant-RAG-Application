@@ -88,7 +88,8 @@ query-rewrite LoRA permanently merged (not aLoRA), under Apache-2.0. The adapter
 uses IBM's trained alternating-dialogue contract and JSON output rather than a
 generic system prompt. Assistant-response prefilling removes the fixed JSON
 scaffold from generated output and reduces query-rewrite latency. Answer
-generation and title generation both use GPT-5.1 by default.
+generation and title generation both use the separate non-thinking
+`qwen3-4b-awq` SGLang worker.
 
 The 6.3 GiB checkpoint is a deployment artifact outside Git. Production serves
 it entirely offline in FP16 through SGLang 0.5.18 on a Modal NVIDIA CUDA worker.
@@ -98,12 +99,13 @@ serializes rewrites with a local inference lock. Missing weights, checkpoint has
 mismatches, incompatible chat templates, or SGLang failures are request failures:
 there is no download, CPU, MPS, remote-model, or original-query fallback.
 
-GPT-5.1 remains a direct provider call for answers and titles. It is deliberately
-not sent through the SGLang Model Gateway because SGLang cannot host the
-proprietary model and proxying would add a latency hop. `QUERY_REWRITE_ENGINE`
-supports an explicit redeploy-only Transformers/CUDA rollback; it is never an
-automatic per-request fallback. IBM reports and evaluates Granite rewriting for
-English; other languages remain outside the supported contract.
+Answer and title calls are delegated to one pooled Qwen SGLang client. The Qwen
+worker is separate because one SGLang server process hosts one model; it loads
+the AWQ checkpoint once and explicitly disables thinking for every request.
+There is no alternate-model or remote-provider fallback. `QUERY_REWRITE_ENGINE`
+supports an explicit redeploy-only Transformers/CUDA rollback for Granite; it
+is never an automatic per-request fallback. IBM reports and evaluates Granite
+rewriting for English; other languages remain outside the supported contract.
 
 ### Why Server-Sent Events for Streaming?
 

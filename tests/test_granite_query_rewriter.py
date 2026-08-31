@@ -13,6 +13,7 @@ import pytest
 
 from backend.model_config import (
     GRANITE_QUERY_REWRITE,
+    PRIMARY_GENERATOR,
     QUERY_REWRITER,
     SESSION_TITLE_GENERATOR,
 )
@@ -308,7 +309,7 @@ def test_role_router_changes_only_query_rewriting() -> None:
         == "delegated"
     )
     async def consume() -> list[str]:
-        stream = router.stream("answer", model="GPT-5.1")
+        stream = router.stream("answer", model=PRIMARY_GENERATOR.model)
         return [token async for token in stream]  # type: ignore[union-attr]
 
     assert asyncio.run(consume()) == ["answer"]

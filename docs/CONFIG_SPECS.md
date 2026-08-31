@@ -12,9 +12,9 @@ running work and is not a durable task store.
 
 ```text
 LLM
-├── Answer: GPT-5.1
+├── Answer: qwen3-4b-awq (SGLang / Modal CUDA, non-thinking)
 ├── Rewrite: merged-granite-4.1-3b-query-rewrite (SGLang / Modal CUDA)
-└── Title: GPT-5.1
+└── Title: qwen3-4b-awq (SGLang / Modal CUDA, non-thinking)
 
 Embedding
 └── Alibaba-NLP/gte-modernbert-base (local ONNX Runtime CUDA/FP16)
@@ -56,8 +56,8 @@ Prompts
 └── P3 Session Title
 
 Generation
-├── GPT-5.1
-├── reasoning = low
+├── qwen3-4b-awq
+├── enable_thinking = false
 ├── max output = 1800
 └── SSE
 
@@ -75,9 +75,9 @@ Context
 
 | Role | Target Model | Provider / Engine | Purpose |
 |---|---|---|---|
-| **Primary Generator (Answer)** | `GPT-5.1` | OpenAI API | Answer synthesis using retrieved Knowledge Facts and Policy guidelines. |
+| **Primary Generator (Answer)** | `qwen3-4b-awq` | SGLang 0.5.18 / Modal NVIDIA CUDA | Non-thinking answer synthesis using retrieved Knowledge Facts and Policy guidelines. |
 | **Query Rewriter (Model A)** | `merged-granite-4.1-3b-query-rewrite` | SGLang 0.5.18 / Modal NVIDIA CUDA | IBM Granite 4.1-3B with the standard query-rewrite LoRA permanently merged. Produces a standalone query from structured dialogue history. |
-| **Session Title Generator** | `GPT-5.1` | OpenAI API | Asynchronous summarization of chat sessions for UI sidebar display. Defaults to the primary generator model while retaining an independent environment override. |
+| **Session Title Generator** | `qwen3-4b-awq` | SGLang 0.5.18 / Modal NVIDIA CUDA | Non-thinking asynchronous summarization of chat sessions for UI sidebar display. Uses the same served model identity as the primary generator. |
 | **Embedding Model** | `Alibaba-NLP/gte-modernbert-base` | Local ONNX Runtime, CUDA/FP16 | 768-dimensional CLS-pooled, float32 L2-normalized vectors for chunks and full Q&A pairs. |
 | **Reranker (Cross-Encoder)** | `BAAI/bge-reranker-v2-m3` | Local ONNX Runtime, CUDA/FP16 | Batched query/document pair scoring for Knowledge Facts and Policy results. |
 
@@ -154,10 +154,34 @@ legacy vectors from being queried or mixed with the new 768-dimensional index.
 ### 2.4 Generation & Token Budgeting
 
 #### Generation Settings
-- **Model**: `GPT-5.1`
-- **Reasoning Effort**: `low`
+- **Model**: `qwen3-4b-awq`
+- **Thinking Mode**: disabled (`chat_template_kwargs.enable_thinking=false`)
 - **Max Output Tokens**: `1800`
 - **Streaming Protocol**: Server-Sent Events (`SSE`)
+
+#### Qwen/SGLang configuration
+
+| Environment variable | Default |
+|---|---|
+| `QWEN_MODEL_PATH` | `qwen3-4b-awq` |
+| `QWEN_SGLANG_BASE_URL` | `http://127.0.0.1:30001/v1` |
+| `QWEN_SGLANG_API_KEY` | empty locally; required in Modal |
+| `QWEN_SGLANG_SERVED_MODEL` | `qwen3-4b-awq` |
+| `QWEN_SGLANG_CONNECT_TIMEOUT_SECONDS` | `1.0` |
+| `QWEN_SGLANG_READ_TIMEOUT_SECONDS` | `120.0` |
+| `QWEN_SGLANG_MAX_CONNECTIONS` | `32` |
+| `QWEN_ANSWER_MAX_OUTPUT_TOKENS` | `1800` |
+| `QWEN_TITLE_MAX_OUTPUT_TOKENS` | `32` |
+| `QWEN_TEMPERATURE` | `0.7` |
+| `QWEN_TOP_P` | `0.8` |
+| `QWEN_TOP_K` | `20` |
+| `QWEN_MIN_P` | `0.0` |
+| `QWEN_PRESENCE_PENALTY` | `1.5` |
+
+The Qwen checkpoint is an external AWQ 4-bit deployment artifact. The worker
+loads it once from local storage, permits no runtime downloads, and has no
+remote-provider or alternate-model fallback. P2 and P3 are each sent as one
+Qwen `user` message. All calls explicitly disable thinking.
 
 #### Token Budget Allocation
 - **Knowledge Facts Context Budget**: $\le 4,000\text{ tokens}$
@@ -203,7 +227,7 @@ dropped from the tail when necessary; the current query is never truncated. The 
 [IBM's Granite Query Rewrite model card](https://huggingface.co/ibm-granite/granitelib-rag-r1.0/blob/main/query_rewrite/README.md).
 
 #### P2: Final Answer Generation
-- **Role**: Primary LLM (`GPT-5.1`, reasoning = `low`) synthesizing the final response.
+- **Role**: Non-thinking `qwen3-4b-awq` synthesizing the final response through SGLang.
 - **Inputs**:
   - Official user query (rewritten query)
   - Retrieved Knowledge Facts chunks (Top-8, within 4,000 tokens)
@@ -211,8 +235,8 @@ dropped from the tail when necessary; the current query is never truncated. The 
 - **Delivery**: Streamed token-by-token over SSE.
 
 #### P3: Session Title Generator
-- **Role**: Background task using `GPT-5.1` reading all completed conversations within the active session.
-- **Configuration**: `SESSION_TITLE_MODEL` remains independently overridable and otherwise defaults to `PRIMARY_GENERATOR_MODEL`. Title completion passes only the model selection; P3 and output validation enforce the 3–6 word contract.
+- **Role**: Background task using non-thinking `qwen3-4b-awq` through SGLang, reading all completed conversations within the active session.
+- **Configuration**: The title and answer roles share `QWEN_SGLANG_SERVED_MODEL`. Title completion uses the configured 32-token ceiling; P3 and output validation continue to enforce the 3–6 word contract.
 - **Output**: A concise 3–6 word title describing the session theme for the sidebar.
 
 ---

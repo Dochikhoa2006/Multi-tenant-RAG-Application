@@ -101,7 +101,7 @@ Development CORS defaults to `*`. Production deployments set the comma-separated
 ## 6. Production Runtime Composition
 
 `backend.main:app` is the provider-neutral bootstrap and intentionally has no
-concrete GPT-5.1 adapter. It starts without loading local model artifacts;
+concrete Qwen or Granite adapter. It starts without loading local model artifacts;
 provider-dependent endpoints return safe `503` responses until a runtime is
 injected.
 
@@ -109,9 +109,9 @@ No production ASGI composition module currently exists in this repository.
 Deployment must supply one that constructs the concrete `LLMClient`, exactly
 one shared `ONNXEmbeddingClient`, exactly one shared
 `ONNXCrossEncoderReranker`, one shared `WeaviateManager` and
-`InMemoryTaskQueue`, wraps the provider LLM in `RoleRoutingLLMClient` with one
-shared `SGLangGraniteQueryRewriter`, then creates `RAGRuntime`, `AppServices`,
-and `create_app(services)`. Until that module is supplied, production provider
+`InMemoryTaskQueue`, constructs one shared `SGLangQwenLLMClient`, and wraps it
+in `RoleRoutingLLMClient` with one shared `SGLangGraniteQueryRewriter`. It then
+creates `RAGRuntime`, `AppServices`, and `create_app(services)`. Until that module is supplied, production provider
 wiring—including shared ONNX client reuse—cannot be verified. The provider
 adapters and credentials remain deployment dependencies outside Stage 5;
 `backend.main:app` is intentionally providerless.
@@ -120,6 +120,6 @@ Provision the merged checkpoint and its SHA-256 manifest in the Modal model
 Volume before deploying SGLang. The directory must contain `config.json`,
 `model.safetensors.index.json`, both Safetensors shards, tokenizer, and chat
 template. Runtime downloads and remote code are disabled. The FastAPI deployment
-uses a pooled authenticated SGLang connection in the same Modal region while
-GPT-5.1 remains direct. Importing `backend.main:app` does not contact SGLang or
-load model weights. See `deployment/README.md` for provisioning and rollout.
+uses pooled authenticated connections to the two SGLang workers in the same
+Modal region. Importing `backend.main:app` does not contact SGLang or load model
+weights. See `deployment/README.md` for provisioning and rollout.

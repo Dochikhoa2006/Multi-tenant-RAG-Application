@@ -40,6 +40,14 @@ def _env_float(name: str, default: float) -> float:
     return value
 
 
+def _env_nonnegative_float(name: str, default: float) -> float:
+    raw_value = os.getenv(name)
+    value = default if raw_value is None else float(raw_value)
+    if value < 0:
+        raise ValueError(f"{name} must be zero or greater")
+    return value
+
+
 def _env_choice(name: str, default: str, choices: frozenset[str]) -> str:
     value = _env_string(name, default).lower()
     if value not in choices:
@@ -269,6 +277,52 @@ class SGLangQueryRewriteConfig:
 
 
 @dataclass(frozen=True)
+class QwenSGLangConfig:
+    """Connection and decoding settings for Qwen answer/title generation."""
+
+    model_path: str
+    base_url: str
+    api_key: str = field(repr=False, compare=False)
+    served_model: str
+    connect_timeout_seconds: float
+    read_timeout_seconds: float
+    max_connections: int
+    answer_max_output_tokens: int
+    title_max_output_tokens: int
+    temperature: float
+    top_p: float
+    top_k: int
+    min_p: float
+    presence_penalty: float
+
+    def __post_init__(self) -> None:
+        if not self.model_path.strip():
+            raise ValueError("Qwen model_path must not be empty")
+        parsed = urlsplit(self.base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("Qwen SGLang base_url must be an absolute HTTP(S) URL")
+        if parsed.query or parsed.fragment:
+            raise ValueError("Qwen SGLang base_url must not contain a query or fragment")
+        if not self.served_model.strip():
+            raise ValueError("Qwen SGLang served_model must not be empty")
+        if min(self.connect_timeout_seconds, self.read_timeout_seconds) <= 0:
+            raise ValueError("Qwen SGLang timeouts must be greater than zero")
+        if self.max_connections <= 0:
+            raise ValueError("Qwen SGLang max_connections must be greater than zero")
+        if min(self.answer_max_output_tokens, self.title_max_output_tokens) <= 0:
+            raise ValueError("Qwen output-token limits must be greater than zero")
+        if not 0.0 < self.temperature <= 2.0:
+            raise ValueError("Qwen temperature must be greater than 0 and at most 2")
+        for name, value in (("top_p", self.top_p), ("min_p", self.min_p)):
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"Qwen {name} must be between 0 and 1 inclusive")
+        if self.top_k <= 0:
+            raise ValueError("Qwen top_k must be greater than zero")
+        if not 0.0 <= self.presence_penalty <= 2.0:
+            raise ValueError("Qwen presence_penalty must be between 0 and 2 inclusive")
+
+
+@dataclass(frozen=True)
 class ONNXModelConfig:
     """Local-only ONNX tokenizer and inference-session settings."""
 
@@ -302,10 +356,36 @@ class ONNXModelConfig:
             raise ValueError("local retrieval ONNX inference cannot enable CPU fallback")
 
 
+QWEN_SGLANG = QwenSGLangConfig(
+    model_path=_env_string("QWEN_MODEL_PATH", "qwen3-4b-awq"),
+    base_url=_env_string(
+        "QWEN_SGLANG_BASE_URL",
+        "http://127.0.0.1:30001/v1",
+    ).rstrip("/"),
+    api_key=_env_raw_string("QWEN_SGLANG_API_KEY", ""),
+    served_model=_env_string("QWEN_SGLANG_SERVED_MODEL", "qwen3-4b-awq"),
+    connect_timeout_seconds=_env_float(
+        "QWEN_SGLANG_CONNECT_TIMEOUT_SECONDS",
+        1.0,
+    ),
+    read_timeout_seconds=_env_float(
+        "QWEN_SGLANG_READ_TIMEOUT_SECONDS",
+        120.0,
+    ),
+    max_connections=_env_int("QWEN_SGLANG_MAX_CONNECTIONS", 32),
+    answer_max_output_tokens=_env_int("QWEN_ANSWER_MAX_OUTPUT_TOKENS", 1800),
+    title_max_output_tokens=_env_int("QWEN_TITLE_MAX_OUTPUT_TOKENS", 32),
+    temperature=_env_float("QWEN_TEMPERATURE", 0.7),
+    top_p=_env_probability("QWEN_TOP_P", 0.8),
+    top_k=_env_int("QWEN_TOP_K", 20),
+    min_p=_env_probability("QWEN_MIN_P", 0.0),
+    presence_penalty=_env_nonnegative_float("QWEN_PRESENCE_PENALTY", 1.5),
+)
+
 PRIMARY_GENERATOR = LLMConfig(
-    model=_env_string("PRIMARY_GENERATOR_MODEL", "GPT-5.1"),
-    reasoning=_env_string("PRIMARY_GENERATOR_REASONING", "low"),
-    max_output_tokens=_env_int("PRIMARY_GENERATOR_MAX_OUTPUT_TOKENS", 1800),
+    model=QWEN_SGLANG.served_model,
+    reasoning="low",
+    max_output_tokens=QWEN_SGLANG.answer_max_output_tokens,
 )
 QUERY_REWRITER = LLMConfig(
     model=_env_string(
@@ -314,7 +394,7 @@ QUERY_REWRITER = LLMConfig(
     ),
 )
 SESSION_TITLE_GENERATOR = LLMConfig(
-    model=_env_string("SESSION_TITLE_MODEL", PRIMARY_GENERATOR.model),
+    model=QWEN_SGLANG.served_model,
 )
 
 EMBEDDING_MODEL = _env_string(

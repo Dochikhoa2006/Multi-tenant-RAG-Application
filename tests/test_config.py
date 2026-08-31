@@ -158,6 +158,7 @@ from backend.model_config import (
     ONNX_EMBEDDING,
     ONNX_RERANKER,
     PRIMARY_GENERATOR,
+    QWEN_SGLANG,
     QUERY_REWRITE_ENGINE,
     QUERY_REWRITER,
     SESSION_TITLE_GENERATOR,
@@ -165,9 +166,22 @@ from backend.model_config import (
     TEXT_PROCESSING,
 )
 
-assert PRIMARY_GENERATOR.model == 'generator-override'
+assert PRIMARY_GENERATOR.model == 'served-qwen'
 assert PRIMARY_GENERATOR.max_output_tokens == 900
-assert SESSION_TITLE_GENERATOR.model == 'title-override'
+assert SESSION_TITLE_GENERATOR.model == 'served-qwen'
+assert QWEN_SGLANG.model_path == 'local/qwen'
+assert QWEN_SGLANG.base_url == 'https://qwen.example/v1'
+assert QWEN_SGLANG.served_model == 'served-qwen'
+assert QWEN_SGLANG.connect_timeout_seconds == 0.75
+assert QWEN_SGLANG.read_timeout_seconds == 9.0
+assert QWEN_SGLANG.max_connections == 15
+assert QWEN_SGLANG.answer_max_output_tokens == 900
+assert QWEN_SGLANG.title_max_output_tokens == 24
+assert QWEN_SGLANG.temperature == 0.65
+assert QWEN_SGLANG.top_p == 0.75
+assert QWEN_SGLANG.top_k == 16
+assert QWEN_SGLANG.min_p == 0.1
+assert QWEN_SGLANG.presence_penalty == 1.25
 assert HYBRID_SEARCH.components == ('dense',)
 assert HYBRID_SEARCH.alpha == 0.4
 assert CHUNKING.paragraph_threshold == 0.6
@@ -211,11 +225,23 @@ assert ONNX_RERANKER.batch_size == 4
 assert ONNX_RERANKER.device_id == 3
 assert ONNX_RERANKER.execution_provider == 'OpenVINOExecutionProvider'
 assert 'top-secret' not in repr(SGLANG_QUERY_REWRITE)
+assert 'qwen-secret' not in repr(QWEN_SGLANG)
 """,
         overrides={
-            "PRIMARY_GENERATOR_MODEL": "generator-override",
-            "PRIMARY_GENERATOR_MAX_OUTPUT_TOKENS": "900",
-            "SESSION_TITLE_MODEL": "title-override",
+            "QWEN_MODEL_PATH": "local/qwen",
+            "QWEN_SGLANG_BASE_URL": "https://qwen.example/v1/",
+            "QWEN_SGLANG_API_KEY": "qwen-secret",
+            "QWEN_SGLANG_SERVED_MODEL": "served-qwen",
+            "QWEN_SGLANG_CONNECT_TIMEOUT_SECONDS": "0.75",
+            "QWEN_SGLANG_READ_TIMEOUT_SECONDS": "9",
+            "QWEN_SGLANG_MAX_CONNECTIONS": "15",
+            "QWEN_ANSWER_MAX_OUTPUT_TOKENS": "900",
+            "QWEN_TITLE_MAX_OUTPUT_TOKENS": "24",
+            "QWEN_TEMPERATURE": "0.65",
+            "QWEN_TOP_P": "0.75",
+            "QWEN_TOP_K": "16",
+            "QWEN_MIN_P": "0.1",
+            "QWEN_PRESENCE_PENALTY": "1.25",
             "HYBRID_COMPONENTS": "dense",
             "HYBRID_ALPHA": "0.4",
             "PARAGRAPH_SIMILARITY_THRESHOLD": "0.6",
@@ -264,10 +290,9 @@ assert 'top-secret' not in repr(SGLANG_QUERY_REWRITE)
     assert result.returncode == 0, result.stderr
 
 
-def test_session_title_model_defaults_to_primary_generator_model() -> None:
+def test_answer_and_title_models_share_qwen_served_identity() -> None:
     environment = os.environ.copy()
-    environment.pop("SESSION_TITLE_MODEL", None)
-    environment["PRIMARY_GENERATOR_MODEL"] = "shared-generator"
+    environment["QWEN_SGLANG_SERVED_MODEL"] = "shared-qwen"
     result = subprocess.run(
         [
             sys.executable,
@@ -275,7 +300,7 @@ def test_session_title_model_defaults_to_primary_generator_model() -> None:
             (
                 "from backend.model_config import PRIMARY_GENERATOR, "
                 "SESSION_TITLE_GENERATOR; "
-                "assert PRIMARY_GENERATOR.model == 'shared-generator'; "
+                "assert PRIMARY_GENERATOR.model == 'shared-qwen'; "
                 "assert SESSION_TITLE_GENERATOR.model == PRIMARY_GENERATOR.model"
             ),
         ],
@@ -352,6 +377,12 @@ def test_invalid_granite_response_prefill_fails_fast() -> None:
         {"SGLANG_QUERY_REWRITE_CONNECT_TIMEOUT_SECONDS": "0"},
         {"SGLANG_QUERY_REWRITE_MAX_CONNECTIONS": "0"},
         {"SGLANG_QUERY_REWRITE_CONTINUATION_REGEX": "("},
+        {"QWEN_SGLANG_BASE_URL": "not-a-url"},
+        {"QWEN_SGLANG_CONNECT_TIMEOUT_SECONDS": "0"},
+        {"QWEN_SGLANG_MAX_CONNECTIONS": "0"},
+        {"QWEN_TEMPERATURE": "0"},
+        {"QWEN_TOP_P": "1.1"},
+        {"QWEN_PRESENCE_PENALTY": "2.1"},
         {"GRANITE_QUERY_REWRITE_DEVICE": "mps"},
         {"ONNX_RERANKER_DISABLE_CPU_FALLBACK": "false"},
     ],

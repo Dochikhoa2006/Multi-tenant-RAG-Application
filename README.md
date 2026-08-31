@@ -3,9 +3,10 @@
 Full-stack RAG application for Generative AI Engineer FAANG interview coaching. Backed by Weaviate vector database with three isolated collections (Conversation, Knowledge Facts, Policy) per user.
 
 Production query rewriting uses the merged Granite 4.1-3B checkpoint through an
-always-warm SGLang/Modal CUDA service. GPT-5.1 answer and title calls remain
-direct provider requests. Dense embeddings and Knowledge/Policy reranking run
-locally from FP16 graphs through reusable ONNX Runtime sessions (CUDA by
+always-warm SGLang/Modal CUDA service. Answer streaming and title completion use
+the external `qwen3-4b-awq` checkpoint through a second always-warm SGLang
+worker, with thinking disabled. Dense embeddings and Knowledge/Policy reranking
+run locally from FP16 graphs through reusable ONNX Runtime sessions (CUDA by
 default). See
 [deployment/README.md](./deployment/README.md).
 
