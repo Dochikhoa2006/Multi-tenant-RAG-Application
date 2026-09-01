@@ -39,6 +39,37 @@ services:
       retries: 20
       start_period: 10s
 
+  weaviate-grpc-tls:
+    image: >-
+      haproxy:3.2.23-alpine@sha256:6343ce34a132a5dceaa24767d739df2bd519f8f7c1079ae39e4821334e8eb42e
+    restart: unless-stopped
+    depends_on:
+      weaviate:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:5443:5443"
+    volumes:
+      - ./haproxy.weaviate-grpc.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ../.local/tailscale-certs:/run/tailscale-certs:ro
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /var/lib/haproxy
+    healthcheck:
+      test:
+        - CMD
+        - haproxy
+        - -c
+        - -f
+        - /usr/local/etc/haproxy/haproxy.cfg
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
 volumes:
   weaviate_data:
     name: rag_weaviate_secure_data

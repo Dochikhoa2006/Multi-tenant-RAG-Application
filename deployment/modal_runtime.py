@@ -80,8 +80,6 @@ runtime_environment = {
     "SGLANG_QUERY_REWRITE_MODEL": "merged-granite-4.1-3b-query-rewrite",
     "QWEN_MODEL_PATH": "qwen3-4b-awq",
     "QWEN_SGLANG_SERVED_MODEL": "qwen3-4b-awq",
-    "WEAVIATE_GRPC_PORT": "443",
-    "WEAVIATE_GRPC_SECURE": "true",
     "CORS_ALLOWED_ORIGINS": "*",
 }
 

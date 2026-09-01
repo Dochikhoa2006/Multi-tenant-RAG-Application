@@ -34,9 +34,12 @@ def test_qwen_sglang_offline_non_thinking_contract() -> None:
 
     headers = {"Authorization": f"Bearer {config.api_key}"}
     root = config.base_url.removesuffix("/v1")
-    with httpx.Client(timeout=config.read_timeout_seconds) as probe:
+    with httpx.Client(
+        headers=headers,
+        timeout=config.read_timeout_seconds,
+    ) as probe:
         assert probe.get(f"{root}/health").is_success
-        models = probe.get(f"{config.base_url}/models", headers=headers)
+        models = probe.get(f"{config.base_url}/models")
         models.raise_for_status()
         assert config.served_model in {
             item["id"] for item in models.json().get("data", [])

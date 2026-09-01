@@ -51,3 +51,11 @@ def test_modal_runtime_keeps_cuda_and_one_worker_contracts() -> None:
     assert "workers=1" in source
     assert "HF_HUB_OFFLINE" in source
     assert "TRANSFORMERS_OFFLINE" in source
+
+
+def test_modal_runtime_takes_weaviate_transport_from_dedicated_secret() -> None:
+    source = DEPLOYMENT_PATH.read_text(encoding="utf-8")
+
+    assert 'SECRET_NAME = os.getenv("MODAL_RAG_SECRET", "rag-runtime-secrets")' in source
+    assert '"WEAVIATE_GRPC_PORT":' not in source
+    assert '"WEAVIATE_GRPC_SECURE":' not in source

@@ -225,22 +225,36 @@ The container binds REST and gRPC only to Mac loopback, disables anonymous
 access and autoschema, grants the `rag-runtime` API-key identity administrator
 access, and persists database files in `rag_weaviate_secure_data`.
 
-After installing and signing in to Tailscale, expose the two protocols from the
-same stable tailnet hostname:
+After installing and signing in to Tailscale, issue a certificate for the
+stable tailnet hostname. The certificate directory is gitignored. HAProxy uses
+the certificate to advertise the HTTP/2 ALPN required by gRPC and forwards the
+decrypted byte stream directly to Weaviate's h2c port:
 
 ```bash
+mkdir -p .local/tailscale-certs
+tailscale cert \
+  --cert-file .local/tailscale-certs/weaviate.pem \
+  --key-file .local/tailscale-certs/weaviate.pem.key \
+  YOUR-MAC.YOUR-TAILNET.ts.net
+
+docker compose --env-file .env \
+  -f deployment/compose.weaviate-secure.yaml up -d
+
 sudo tailscale funnel --bg --https=443 http://127.0.0.1:8080
-sudo tailscale funnel --bg --tls-terminated-tcp=8443 \
-  tcp://127.0.0.1:50051
+sudo tailscale funnel --bg --tcp=8443 tcp://127.0.0.1:5443
 tailscale funnel status
 ```
 
-The Mac must remain awake, Docker must remain running, and both Funnels must
-remain active for Modal to reach Weaviate. `WEAVIATE_CONNECTION_MODE=custom`
-uses the explicit REST/gRPC endpoints with optional API-key authentication;
-`cloud` requires an API key and uses the official Cloud helper; `auto` preserves
-the prior key-selects-cloud behavior. No connection mode enables a vectorizer,
-generative module, embedded database, or alternate retrieval path.
+Do not use Tailscale's `--tls-terminated-tcp` mode for gRPC: it does not
+negotiate the `h2` ALPN required by the pinned Weaviate client. Renew the
+Tailscale certificate before it expires and restart only the
+`weaviate-grpc-tls` service so HAProxy reloads it. The Mac must remain awake,
+Docker must remain running, and both Funnels must remain active for Modal to
+reach Weaviate. `WEAVIATE_CONNECTION_MODE=custom` uses the explicit REST/gRPC
+endpoints with optional API-key authentication; `cloud` requires an API key and
+uses the official Cloud helper; `auto` preserves the prior key-selects-cloud
+behavior. No connection mode enables a vectorizer, generative module, embedded
+database, or alternate retrieval path.
 
 ## Provision and deploy the integrated Modal runtime
 

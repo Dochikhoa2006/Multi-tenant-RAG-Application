@@ -11,6 +11,9 @@
 .env.*
 !.env.example
 
+# Locally issued Tailscale TLS certificates and private keys.
+/.local/tailscale-certs/
+
 # Local interpreter and editor artifacts.
 __pycache__/
 *.py[cod]

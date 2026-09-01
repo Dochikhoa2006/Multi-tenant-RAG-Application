@@ -5,6 +5,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_PATH = PROJECT_ROOT / "deployment" / "compose.weaviate-secure.yaml"
+HAPROXY_PATH = PROJECT_ROOT / "deployment" / "haproxy.weaviate-grpc.cfg"
 
 
 def test_secure_weaviate_compose_is_persistent_authenticated_and_loopback_only() -> None:
@@ -27,3 +28,18 @@ def test_secure_weaviate_compose_does_not_enable_model_modules() -> None:
     assert "text2vec" not in source
     assert "generative-" not in source
     assert "reranker-" not in source
+
+
+def test_secure_weaviate_compose_terminates_grpc_tls_with_http2() -> None:
+    compose = COMPOSE_PATH.read_text(encoding="utf-8")
+    haproxy = HAPROXY_PATH.read_text(encoding="utf-8")
+
+    assert "haproxy:3.2.23-alpine@sha256:" in compose
+    assert '"127.0.0.1:5443:5443"' in compose
+    assert "../.local/tailscale-certs:/run/tailscale-certs:ro" in compose
+    assert "read_only: true" in compose
+    assert "no-new-privileges:true" in compose
+    assert "cap_drop:" in compose
+    assert "bind :5443 ssl" in haproxy
+    assert "alpn h2" in haproxy
+    assert "server weaviate weaviate:50051 check" in haproxy
