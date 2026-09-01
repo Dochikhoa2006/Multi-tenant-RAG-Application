@@ -2,6 +2,33 @@
 
 Full-stack RAG application for Generative AI Engineer FAANG interview coaching. Backed by Weaviate vector database with three isolated collections (Conversation, Knowledge Facts, Policy) per user.
 
+## One-command private deployment
+
+After the model Volumes, Modal account, `.env`, Standalone Tailscale node, and
+persistent Weaviate data have been provisioned as described in
+[deployment/README.md](./deployment/README.md), use the repo-local lifecycle
+command:
+
+```bash
+./rag up
+./rag ask
+./rag status
+./rag down
+```
+
+`./rag up` starts authenticated Weaviate/HAProxy and both Funnels, deploys and
+validates Granite, Qwen, and the singleton CUDA runtime, and exits only after
+authenticated health succeeds. `./rag ask` creates a fresh process-local chat
+session and streams one real RAG answer. `./rag down` stops all three Modal GPU
+apps, disables both application Funnels, and stops the local containers without
+deleting the Weaviate volume, Modal Volumes, or secrets. Credentials are loaded
+from `.env` and are never printed.
+
+The operational GPU requests are also read from `.env` as
+`MODAL_SGLANG_GPU`, `QWEN_MODAL_SGLANG_GPU`, and `MODAL_RAG_GPU`. Only L40S and
+the infrastructure-only H100 capacity substitution are accepted; deployment
+source defaults remain L40S and no automatic GPU switching occurs.
+
 Production query rewriting uses the merged Granite 4.1-3B checkpoint through an
 always-warm SGLang/Modal CUDA service. Answer streaming and title completion use
 the external `qwen3-4b-awq` checkpoint through a second always-warm SGLang

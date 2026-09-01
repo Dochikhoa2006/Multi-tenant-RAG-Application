@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+RAG_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+RAG_PYTHON="$RAG_ROOT/.venv/bin/python"
+
+if [ ! -x "$RAG_PYTHON" ]; then
+    echo "ERROR: $RAG_PYTHON is missing. Create the project Python environment first." >&2
+    exit 1
+fi
+
+exec "$RAG_PYTHON" "$RAG_ROOT/deployment/ragctl.py" "$@"
