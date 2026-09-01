@@ -30,7 +30,7 @@ MODEL_PATH = MODEL_VOLUME_ROOT / MODEL_NAME
 MANIFEST_PATH = MODEL_PATH / "granite-manifest.json"
 PORT = int(os.getenv("MODAL_SGLANG_PORT", "30000"))
 GPU = os.getenv("MODAL_SGLANG_GPU", "L40S")
-COMPUTE_REGION = os.getenv("MODAL_SGLANG_COMPUTE_REGION", "us-east")
+COMPUTE_REGION = os.getenv("MODAL_SGLANG_COMPUTE_REGION", "us")
 ROUTING_REGION = os.getenv("MODAL_SGLANG_ROUTING_REGION", "us-east")
 MIN_CONTAINERS = int(os.getenv("MODAL_SGLANG_MIN_CONTAINERS", "1"))
 MAX_CONTAINERS = int(os.getenv("MODAL_SGLANG_MAX_CONTAINERS", "4"))
@@ -41,7 +41,6 @@ CONTEXT_LENGTH = int(os.getenv("MODAL_SGLANG_CONTEXT_LENGTH", "2176"))
 MEM_FRACTION_STATIC = os.getenv("MODAL_SGLANG_MEM_FRACTION_STATIC", "0.70")
 OTLP_TRACES_ENDPOINT = os.getenv("SGLANG_OTLP_TRACES_ENDPOINT", "").strip()
 VOLUME_NAME = os.getenv("MODAL_SGLANG_MODEL_VOLUME", "rag-granite-models")
-SECRET_NAME = os.getenv("MODAL_SGLANG_SECRET", "rag-sglang-secrets")
 
 for name, value in (
     ("MODAL_SGLANG_PORT", PORT),
@@ -73,7 +72,6 @@ image = (
     )
 )
 model_volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=False)
-sglang_secret = modal.Secret.from_name(SECRET_NAME)
 app = modal.App("rag-granite-query-rewrite-sglang")
 
 
@@ -146,9 +144,6 @@ def _check_running(process: subprocess.Popen[Any]) -> None:
 def _wait_and_warm(process: subprocess.Popen[Any], timeout_seconds: int = 1200) -> None:
     import requests
 
-    api_key = os.getenv("SGLANG_QUERY_REWRITE_API_KEY", "")
-    if not api_key:
-        raise RuntimeError("SGLANG_QUERY_REWRITE_API_KEY must be provided by Modal Secret")
     deadline = time.monotonic() + timeout_seconds
     health_url = f"http://127.0.0.1:{PORT}/health"
     while time.monotonic() < deadline:
@@ -186,12 +181,10 @@ def _wait_and_warm(process: subprocess.Popen[Any], timeout_seconds: int = 1200) 
         "continue_final_message": True,
         "regex": regex,
     }
-    headers = {"Authorization": f"Bearer {api_key}"}
     for _ in range(3):
         response = requests.post(
             f"http://127.0.0.1:{PORT}/v1/chat/completions",
             json=payload,
-            headers=headers,
             timeout=30,
         )
         response.raise_for_status()
@@ -206,7 +199,6 @@ def _wait_and_warm(process: subprocess.Popen[Any], timeout_seconds: int = 1200) 
     image=image,
     gpu=GPU,
     volumes={str(MODEL_VOLUME_ROOT): model_volume},
-    secrets=[sglang_secret],
     compute_region=COMPUTE_REGION,
     routing_region=ROUTING_REGION,
     min_containers=MIN_CONTAINERS,
@@ -215,15 +207,12 @@ def _wait_and_warm(process: subprocess.Popen[Any], timeout_seconds: int = 1200) 
     startup_timeout=20 * 60,
     exit_grace_period=30,
     port=PORT,
-    unauthenticated=True,
+    unauthenticated=False,
 )
 class GraniteSGLangServer:
     @modal.enter()
     def start(self) -> None:
         _validate_checkpoint_manifest()
-        api_key = os.getenv("SGLANG_QUERY_REWRITE_API_KEY", "")
-        if not api_key:
-            raise RuntimeError("SGLANG_QUERY_REWRITE_API_KEY is required")
         command = [
             "python",
             "-m",
@@ -257,8 +246,6 @@ class GraniteSGLangServer:
             "--enable-metrics",
             "--enable-cache-report",
             "--collect-tokens-histogram",
-            "--api-key",
-            api_key,
         ]
         if OTLP_TRACES_ENDPOINT:
             command.extend(

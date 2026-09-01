@@ -181,6 +181,12 @@ def test_manager_builds_default_client_from_connection_configuration(
         "backend.weaviate_client.client.weaviate.WeaviateClient",
         client_constructor,
     )
+    monkeypatch.setattr(
+        weaviate_client_module,
+        "WEAVIATE_CONNECTION_MODE",
+        "custom",
+    )
+    monkeypatch.setattr(weaviate_client_module, "WEAVIATE_API_KEY", "")
 
     manager = WeaviateManager()
 
@@ -190,8 +196,165 @@ def test_manager_builds_default_client_from_connection_configuration(
         grpc_port=WEAVIATE_GRPC_PORT,
         grpc_secure=WEAVIATE_GRPC_SECURE,
     )
-    client_constructor.assert_called_once_with(connection_params=connection_params)
+    client_constructor.assert_called_once_with(
+        connection_params=connection_params,
+        auth_client_secret=None,
+    )
     sdk_client.connect.assert_called_once_with()
+
+
+@pytest.mark.parametrize("connection_mode", ["auto", "cloud"])
+def test_manager_uses_authenticated_weaviate_cloud_connection(
+    monkeypatch: pytest.MonkeyPatch,
+    connection_mode: str,
+) -> None:
+    sdk_client = MagicMock()
+    credentials = object()
+    api_key = "cloud-secret-value"
+    auth_factory = MagicMock(return_value=credentials)
+    cloud_connector = MagicMock(return_value=sdk_client)
+    custom_constructor = MagicMock()
+    monkeypatch.setattr(
+        weaviate_client_module,
+        "WEAVIATE_CONNECTION_MODE",
+        connection_mode,
+    )
+    monkeypatch.setattr(weaviate_client_module, "WEAVIATE_API_KEY", api_key)
+    monkeypatch.setattr(
+        "backend.weaviate_client.client.Auth.api_key",
+        auth_factory,
+    )
+    monkeypatch.setattr(
+        "backend.weaviate_client.client.weaviate.connect_to_weaviate_cloud",
+        cloud_connector,
+    )
+    monkeypatch.setattr(
+        "backend.weaviate_client.client.weaviate.WeaviateClient",
+        custom_constructor,
+    )
+
+    manager = WeaviateManager()
+
+    assert manager.connect() is sdk_client
+    assert manager.connect() is sdk_client
+    auth_factory.assert_called_once_with(api_key)
+    cloud_connector.assert_called_once_with(
+        cluster_url=WEAVIATE_URL,
+        auth_credentials=credentials,
+    )
+    custom_constructor.assert_not_called()
+    sdk_client.connect.assert_not_called()
+
+    manager.disconnect()
+    sdk_client.close.assert_called_once_with()
+
+
+def test_cloud_connection_failure_redacts_api_key_and_stays_disconnected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api_key = "do-not-expose-this-key"
+    monkeypatch.setattr(
+        weaviate_client_module,
+        "WEAVIATE_CONNECTION_MODE",
+        "cloud",
+    )
+    monkeypatch.setattr(weaviate_client_module, "WEAVIATE_API_KEY", api_key)
+    monkeypatch.setattr(
+        "backend.weaviate_client.client.weaviate.connect_to_weaviate_cloud",
+        MagicMock(side_effect=RuntimeError(f"rejected credential {api_key}")),
+    )
+
+    manager = WeaviateManager()
+
+    with pytest.raises(RuntimeError) as error:
+        manager.connect()
+    assert api_key not in str(error.value)
+    assert "[REDACTED]" in str(error.value)
+    with pytest.raises(RuntimeError, match="connect"):
+        _ = manager.client
+
+
+def test_manager_uses_api_key_with_authenticated_custom_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection_params = object()
+    credentials = object()
+    sdk_client = MagicMock()
+    api_key = "custom-secret-value"
+    from_url = MagicMock(return_value=connection_params)
+    auth_factory = MagicMock(return_value=credentials)
+    client_constructor = MagicMock(return_value=sdk_client)
+    cloud_connector = MagicMock()
+    monkeypatch.setattr(
+        weaviate_client_module,
+        "WEAVIATE_CONNECTION_MODE",
+        "custom",
+    )
+    monkeypatch.setattr(weaviate_client_module, "WEAVIATE_API_KEY", api_key)
+    monkeypatch.setattr(
+        "backend.weaviate_client.client.ConnectionParams.from_url",
+        from_url,
+    )
+    monkeypatch.setattr(
+        "backend.weaviate_client.client.Auth.api_key",
+        auth_factory,
+    )
+    monkeypatch.setattr(
+        "backend.weaviate_client.client.weaviate.WeaviateClient",
+        client_constructor,
+    )
+    monkeypatch.setattr(
+        "backend.weaviate_client.client.weaviate.connect_to_weaviate_cloud",
+        cloud_connector,
+    )
+
+    manager = WeaviateManager()
+
+    assert manager.connect() is sdk_client
+    auth_factory.assert_called_once_with(api_key)
+    from_url.assert_called_once_with(
+        WEAVIATE_URL,
+        grpc_port=WEAVIATE_GRPC_PORT,
+        grpc_secure=WEAVIATE_GRPC_SECURE,
+    )
+    client_constructor.assert_called_once_with(
+        connection_params=connection_params,
+        auth_client_secret=credentials,
+    )
+    sdk_client.connect.assert_called_once_with()
+    cloud_connector.assert_not_called()
+
+
+def test_custom_connection_failure_closes_client_and_redacts_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api_key = "custom-secret-that-must-not-leak"
+    sdk_client = MagicMock()
+    sdk_client.connect.side_effect = RuntimeError(f"rejected {api_key}")
+    monkeypatch.setattr(
+        weaviate_client_module,
+        "WEAVIATE_CONNECTION_MODE",
+        "custom",
+    )
+    monkeypatch.setattr(weaviate_client_module, "WEAVIATE_API_KEY", api_key)
+    monkeypatch.setattr(
+        "backend.weaviate_client.client.ConnectionParams.from_url",
+        MagicMock(return_value=object()),
+    )
+    monkeypatch.setattr(
+        "backend.weaviate_client.client.weaviate.WeaviateClient",
+        MagicMock(return_value=sdk_client),
+    )
+
+    manager = WeaviateManager()
+
+    with pytest.raises(RuntimeError) as error:
+        manager.connect()
+    assert api_key not in str(error.value)
+    assert "[REDACTED]" in str(error.value)
+    sdk_client.close.assert_called_once_with()
+    with pytest.raises(RuntimeError, match="connect"):
+        _ = manager.client
 
 
 def test_ensure_user_collections_creates_exact_schemas_once() -> None:

@@ -76,6 +76,8 @@ from backend.config import (
     UPLOAD_MAX_FILE_BYTES,
     UPLOAD_MAX_TOTAL_BYTES,
     UPLOAD_READ_CHUNK_BYTES,
+    WEAVIATE_API_KEY,
+    WEAVIATE_CONNECTION_MODE,
     WEAVIATE_GRPC_PORT,
     WEAVIATE_GRPC_SECURE,
     WEAVIATE_URL,
@@ -85,6 +87,8 @@ from backend.processing.file_reader import read_text_files
 
 assert COLLECTION_TYPES == frozenset({'conversations', 'knowledge_facts', 'policy'})
 assert WEAVIATE_URL == 'https://weaviate.example.test:8443'
+assert WEAVIATE_API_KEY == 'cloud-secret'
+assert WEAVIATE_CONNECTION_MODE == 'custom'
 assert WEAVIATE_GRPC_PORT == 50443
 assert WEAVIATE_GRPC_SECURE is False
 assert CORS_ALLOWED_ORIGINS == ('https://one.example', 'https://two.example')
@@ -114,6 +118,8 @@ assert read_text_files(sys.argv[1:]) == 'first||second'
             "COLLECTION_NAME_TEMPLATE": "{collection_type}__{user_id}",
             "USER_ID_PATTERN": r"^.+$",
             "WEAVIATE_URL": "https://weaviate.example.test:8443",
+            "WEAVIATE_API_KEY": " cloud-secret ",
+            "WEAVIATE_CONNECTION_MODE": "CUSTOM",
             "WEAVIATE_GRPC_PORT": "50443",
             "WEAVIATE_GRPC_SECURE": "false",
             "SUPPORTED_FILE_EXTENSIONS": ".data",
@@ -147,6 +153,20 @@ assert read_text_files(sys.argv[1:]) == 'first||second'
     ],
 )
 def test_upload_and_cors_configuration_rejects_invalid_combinations(
+    overrides: dict[str, str],
+) -> None:
+    result = _run_python("import backend.config", overrides=overrides)
+    assert result.returncode != 0
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"WEAVIATE_CONNECTION_MODE": "embedded"},
+        {"WEAVIATE_CONNECTION_MODE": "cloud", "WEAVIATE_API_KEY": ""},
+    ],
+)
+def test_weaviate_connection_configuration_rejects_invalid_values(
     overrides: dict[str, str],
 ) -> None:
     result = _run_python("import backend.config", overrides=overrides)

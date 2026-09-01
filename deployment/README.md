@@ -1,8 +1,12 @@
-# Modal SGLang Deployment
+# Modal-first RAG Deployment
 
-Production uses two dedicated SGLang 0.5.18 CUDA services. Granite handles only
+The no-GCP E2E topology uses three Modal services. Two dedicated SGLang 0.5.18
+CUDA services run Granite and Qwen, while a private singleton Modal Server runs
+the integrated FastAPI, GTE ONNX, and BGE ONNX runtime. Granite handles only
 query rewriting. The separate `qwen3-4b-awq` worker handles non-thinking answer
 streaming and title completion through the existing `RoleRoutingLLMClient`.
+Weaviate runs outside Modal so mutable database files are never placed on a
+Modal model Volume.
 
 ## Provision local ONNX retrieval models
 
@@ -111,8 +115,6 @@ modal volume create rag-granite-models
 modal volume put rag-granite-models \
   merged-granite-4.1-3b-query-rewrite \
   /merged-granite-4.1-3b-query-rewrite
-modal secret create rag-sglang-secrets \
-  SGLANG_QUERY_REWRITE_API_KEY="REPLACE_WITH_A_RANDOM_SECRET"
 ```
 
 The service verifies the manifest and refuses to start when any required model
@@ -129,8 +131,6 @@ Volume:
 python scripts/create_qwen_manifest.py qwen3-4b-awq
 modal volume create rag-qwen-models
 modal volume put rag-qwen-models qwen3-4b-awq /qwen3-4b-awq
-modal secret create rag-qwen-sglang-secrets \
-  QWEN_SGLANG_API_KEY="REPLACE_WITH_A_DIFFERENT_RANDOM_SECRET"
 ```
 
 Startup verifies the manifest, `Qwen3ForCausalLM` architecture, FP16 metadata,
@@ -138,18 +138,36 @@ AWQ GEMM 4-bit weights with group size 128, and the native thinking-aware chat
 template. The worker loads only the provisioned local files and never enables
 remote model code or downloads.
 
-## Deploy both workers
+## Protect and deploy both workers
+
+Both Modal Servers are private. Create one Modal Proxy Token in the Modal
+dashboard and store its ID and secret directly in the local `.env`; do not paste
+them into terminals whose output is retained. Modal accepts the combined
+`TOKEN_ID.TOKEN_SECRET` value as an OpenAI-compatible bearer key, so configure
+both existing provider settings with that combined value:
+
+```text
+MODAL_PROXY_TOKEN_ID=wk-...
+MODAL_PROXY_TOKEN_SECRET=ws-...
+SGLANG_QUERY_REWRITE_API_KEY=wk-....ws-...
+QWEN_SGLANG_API_KEY=wk-....ws-...
+```
+
+The token is enforced by Modal's proxy. It is not mounted in either worker and
+is never passed to SGLang as `--api-key`; localhost startup warmups therefore
+carry no authorization header. This prevents replacement credentials from
+appearing in SGLang's serialized server arguments.
 
 Start with L40S in the same compute and routing region as the FastAPI deployment:
 
 ```bash
 MODAL_SGLANG_GPU=L40S \
-MODAL_SGLANG_COMPUTE_REGION=us-east \
+MODAL_SGLANG_COMPUTE_REGION=us \
 MODAL_SGLANG_ROUTING_REGION=us-east \
 modal deploy deployment/modal_sglang.py
 
 QWEN_MODAL_SGLANG_GPU=L40S \
-QWEN_MODAL_SGLANG_COMPUTE_REGION=us-east \
+QWEN_MODAL_SGLANG_COMPUTE_REGION=us \
 QWEN_MODAL_SGLANG_ROUTING_REGION=us-east \
 modal deploy deployment/modal_qwen_sglang.py
 ```
@@ -159,13 +177,123 @@ Configure the API composition with:
 ```text
 QUERY_REWRITE_ENGINE=sglang
 SGLANG_QUERY_REWRITE_BASE_URL=https://YOUR-MODAL-SERVER/v1
-SGLANG_QUERY_REWRITE_API_KEY=the-same-secret
+SGLANG_QUERY_REWRITE_API_KEY=TOKEN_ID.TOKEN_SECRET
 SGLANG_QUERY_REWRITE_MODEL=merged-granite-4.1-3b-query-rewrite
 QWEN_MODEL_PATH=qwen3-4b-awq
 QWEN_SGLANG_BASE_URL=https://YOUR-QWEN-MODAL-SERVER/v1
-QWEN_SGLANG_API_KEY=the-qwen-secret
+QWEN_SGLANG_API_KEY=TOKEN_ID.TOKEN_SECRET
 QWEN_SGLANG_SERVED_MODEL=qwen3-4b-awq
 ```
+
+After authenticated health, model-list, Granite, and Qwen checks succeed,
+delete the retired `rag-sglang-secrets` and `rag-qwen-sglang-secrets`. Never
+delete them before the private replacements are verified.
+
+### Granite integration diagnostic
+
+The deployed Granite worker may rewrite `How do I get rid of them?` as
+`How do I get rid of fleas on my dog?`. That output is equivalent and
+standalone under the documented query-rewrite contract, but the opt-in
+integration test also requires the literal string `Rex`. Keep that assertion
+and the production prompt unchanged; record it as a stricter semantic-evaluation
+failure, not a deployment or RAG-contract blocker.
+
+## Run persistent authenticated Weaviate on the Mac
+
+The former 14-day Weaviate Cloud Sandbox is no longer the applicable free
+offering. The current managed free cluster permits only one collection, while
+this application intentionally creates three physically distinct collections
+per user. Do not collapse the schemas or replace them with tenants.
+
+Use the dedicated secure Compose definition with a strong key stored only in
+`.env`:
+
+```text
+WEAVIATE_CONNECTION_MODE=custom
+WEAVIATE_URL=https://YOUR-MAC.YOUR-TAILNET.ts.net
+WEAVIATE_API_KEY=YOUR-RANDOM-WEAVIATE-KEY
+WEAVIATE_GRPC_PORT=8443
+WEAVIATE_GRPC_SECURE=true
+```
+
+```bash
+docker compose --env-file .env \
+  -f deployment/compose.weaviate-secure.yaml up -d
+```
+
+The container binds REST and gRPC only to Mac loopback, disables anonymous
+access and autoschema, grants the `rag-runtime` API-key identity administrator
+access, and persists database files in `rag_weaviate_secure_data`.
+
+After installing and signing in to Tailscale, expose the two protocols from the
+same stable tailnet hostname:
+
+```bash
+sudo tailscale funnel --bg --https=443 http://127.0.0.1:8080
+sudo tailscale funnel --bg --tls-terminated-tcp=8443 \
+  tcp://127.0.0.1:50051
+tailscale funnel status
+```
+
+The Mac must remain awake, Docker must remain running, and both Funnels must
+remain active for Modal to reach Weaviate. `WEAVIATE_CONNECTION_MODE=custom`
+uses the explicit REST/gRPC endpoints with optional API-key authentication;
+`cloud` requires an API key and uses the official Cloud helper; `auto` preserves
+the prior key-selects-cloud behavior. No connection mode enables a vectorizer,
+generative module, embedded database, or alternate retrieval path.
+
+## Provision and deploy the integrated Modal runtime
+
+Create a dedicated Volume and upload only the already-provisioned artifacts:
+
+```bash
+modal volume create rag-runtime-models
+modal volume put rag-runtime-models \
+  models/gte-modernbert-base /gte-modernbert-base
+modal volume put rag-runtime-models \
+  models/bge-reranker-v2-m3-onnx /bge-reranker-v2-m3-onnx
+modal volume put rag-runtime-models \
+  models/all-MiniLM-L6-v2 /all-MiniLM-L6-v2
+modal volume ls rag-runtime-models
+```
+
+Create `rag-runtime-secrets` with exactly these secret values; do not upload the
+whole local `.env`:
+
+```text
+WEAVIATE_URL
+WEAVIATE_API_KEY
+WEAVIATE_CONNECTION_MODE
+WEAVIATE_GRPC_PORT
+WEAVIATE_GRPC_SECURE
+SGLANG_QUERY_REWRITE_BASE_URL
+SGLANG_QUERY_REWRITE_API_KEY
+QWEN_SGLANG_BASE_URL
+QWEN_SGLANG_API_KEY
+```
+
+Create a Modal Proxy Token for clients of the private API, then deploy:
+
+```text
+RAG_API_BASE_URL=https://YOUR-PRIVATE-MODAL-SERVER
+MODAL_PROXY_TOKEN_ID=wk-...
+MODAL_PROXY_TOKEN_SECRET=ws-...
+```
+
+```bash
+MODAL_RAG_GPU=L40S \
+MODAL_RAG_COMPUTE_REGION=us \
+MODAL_RAG_ROUTING_REGION=us-east \
+modal deploy deployment/modal_runtime.py
+```
+
+`deployment/modal_runtime.py` keeps exactly one container and starts exactly
+one Uvicorn worker. It mounts the retrieval/segmentation Volume plus the
+existing Granite Volume, preloads the pip-provisioned CUDA and cuDNN libraries,
+runs `nvidia-smi`, and refuses startup unless ONNX Runtime exposes
+`CUDAExecutionProvider`. Requests to its URL must carry `Modal-Key` and
+`Modal-Secret` headers. Do not set `unauthenticated=True` merely to make the
+development browser page convenient.
 
 `backend.runtime_app:create_runtime_app` constructs exactly one pooled
 `SGLangQwenLLMClient` and `SGLangGraniteQueryRewriter`, wraps them with
@@ -225,12 +353,23 @@ metrics during the same run; retain both the benchmark JSON and metrics snapshot
 with the rollout record.
 
 Use L40S if warm rewrite p95 is at most 500 ms and the full RAG TTFT p95 remains
-at most two seconds. Otherwise repeat on H100 and select H100 only if it passes.
+at most two seconds. If L40S cannot obtain capacity after the image, secrets,
+Volumes, region configuration, and deployment health are otherwise confirmed,
+H100 may be used as an infrastructure-only substitution. Do not alter model
+identity, quantization, context, prompt, tokenizer, sampling, or inference
+behavior. Otherwise repeat performance validation on H100 and select it only
+if it passes.
 GPU memory snapshots remain disabled until a separate cold-start benchmark proves
 they are correct and beneficial.
 
+If the FastAPI container restarts after wizards or sessions are created, that
+E2E attempt is invalid because those mappings and the task queue are
+process-local. Use a new user ID and recreate both wizards and the session. A
+restart is not an infrastructure failure and does not corrupt Weaviate.
+
 ## Rollback
 
-`QUERY_REWRITE_ENGINE=transformers` is an explicit redeploy-only rollback. Its
-existing adapter now requires CUDA/FP16. There is no automatic per-request retry,
-original-query fallback, CPU fallback, MPS path, or hidden model substitution.
+The Transformers query-rewriter adapter remains a separately implemented
+redeploy-only rollback, but it is not permitted for this contract-faithful E2E.
+There is no automatic per-request retry, original-query fallback, CPU fallback,
+MPS path, or hidden model substitution.

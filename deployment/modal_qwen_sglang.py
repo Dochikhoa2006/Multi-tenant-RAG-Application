@@ -23,7 +23,7 @@ MODEL_PATH = MODEL_VOLUME_ROOT / os.getenv("QWEN_MODEL_PATH", "qwen3-4b-awq")
 MANIFEST_PATH = MODEL_PATH / "qwen-manifest.json"
 PORT = int(os.getenv("QWEN_MODAL_SGLANG_PORT", "30001"))
 GPU = os.getenv("QWEN_MODAL_SGLANG_GPU", "L40S")
-COMPUTE_REGION = os.getenv("QWEN_MODAL_SGLANG_COMPUTE_REGION", "us-east")
+COMPUTE_REGION = os.getenv("QWEN_MODAL_SGLANG_COMPUTE_REGION", "us")
 ROUTING_REGION = os.getenv("QWEN_MODAL_SGLANG_ROUTING_REGION", "us-east")
 MIN_CONTAINERS = int(os.getenv("QWEN_MODAL_SGLANG_MIN_CONTAINERS", "1"))
 MAX_CONTAINERS = int(os.getenv("QWEN_MODAL_SGLANG_MAX_CONTAINERS", "4"))
@@ -34,7 +34,6 @@ CONTEXT_LENGTH = int(os.getenv("QWEN_MODAL_CONTEXT_LENGTH", "32768"))
 MEM_FRACTION_STATIC = os.getenv("QWEN_MODAL_MEM_FRACTION_STATIC", "0.80")
 OTLP_TRACES_ENDPOINT = os.getenv("QWEN_SGLANG_OTLP_TRACES_ENDPOINT", "").strip()
 VOLUME_NAME = os.getenv("QWEN_MODAL_MODEL_VOLUME", "rag-qwen-models")
-SECRET_NAME = os.getenv("QWEN_MODAL_SGLANG_SECRET", "rag-qwen-sglang-secrets")
 
 for name, value in (
     ("QWEN_MODAL_SGLANG_PORT", PORT),
@@ -66,7 +65,6 @@ image = (
     )
 )
 model_volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=False)
-sglang_secret = modal.Secret.from_name(SECRET_NAME)
 app = modal.App("rag-qwen-answer-title-sglang")
 
 
@@ -160,9 +158,6 @@ def _request_body(prompt: str, *, stream: bool, max_tokens: int) -> dict[str, ob
 def _wait_and_warm(process: subprocess.Popen[Any], timeout_seconds: int = 1200) -> None:
     import requests
 
-    api_key = os.getenv("QWEN_SGLANG_API_KEY", "")
-    if not api_key:
-        raise RuntimeError("QWEN_SGLANG_API_KEY must be provided by Modal Secret")
     deadline = time.monotonic() + timeout_seconds
     health_url = f"http://127.0.0.1:{PORT}/health"
     while time.monotonic() < deadline:
@@ -177,12 +172,10 @@ def _wait_and_warm(process: subprocess.Popen[Any], timeout_seconds: int = 1200) 
     else:
         raise TimeoutError("Qwen SGLang did not become healthy before startup timeout")
 
-    headers = {"Authorization": f"Bearer {api_key}"}
     endpoint = f"http://127.0.0.1:{PORT}/v1/chat/completions"
     title = requests.post(
         endpoint,
         json=_request_body("Create a three word session title.", stream=False, max_tokens=32),
-        headers=headers,
         timeout=60,
     )
     title.raise_for_status()
@@ -197,7 +190,6 @@ def _wait_and_warm(process: subprocess.Popen[Any], timeout_seconds: int = 1200) 
     answer = requests.post(
         endpoint,
         json=_request_body("Answer with one short sentence.", stream=True, max_tokens=32),
-        headers=headers,
         timeout=60,
         stream=True,
     )
@@ -224,7 +216,6 @@ def _wait_and_warm(process: subprocess.Popen[Any], timeout_seconds: int = 1200) 
     image=image,
     gpu=GPU,
     volumes={str(MODEL_VOLUME_ROOT): model_volume},
-    secrets=[sglang_secret],
     compute_region=COMPUTE_REGION,
     routing_region=ROUTING_REGION,
     min_containers=MIN_CONTAINERS,
@@ -233,15 +224,12 @@ def _wait_and_warm(process: subprocess.Popen[Any], timeout_seconds: int = 1200) 
     startup_timeout=20 * 60,
     exit_grace_period=30,
     port=PORT,
-    unauthenticated=True,
+    unauthenticated=False,
 )
 class QwenSGLangServer:
     @modal.enter()
     def start(self) -> None:
         _validate_checkpoint_manifest()
-        api_key = os.getenv("QWEN_SGLANG_API_KEY", "")
-        if not api_key:
-            raise RuntimeError("QWEN_SGLANG_API_KEY is required")
         command = [
             "python",
             "-m",
@@ -273,8 +261,6 @@ class QwenSGLangServer:
             "--enable-metrics",
             "--enable-cache-report",
             "--collect-tokens-histogram",
-            "--api-key",
-            api_key,
         ]
         if OTLP_TRACES_ENDPOINT:
             command.extend(

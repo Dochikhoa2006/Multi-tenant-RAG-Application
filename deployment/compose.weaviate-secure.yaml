@@ -1,0 +1,44 @@
+name: rag-weaviate-secure
+
+services:
+  weaviate:
+    image: cr.weaviate.io/semitechnologies/weaviate:1.39.0
+    restart: unless-stopped
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --scheme
+      - http
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:50051:50051"
+    volumes:
+      - weaviate_data:/var/lib/weaviate
+    environment:
+      PERSISTENCE_DATA_PATH: /var/lib/weaviate
+      QUERY_DEFAULTS_LIMIT: "30"
+      CLUSTER_HOSTNAME: node1
+      AUTOSCHEMA_ENABLED: "false"
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "false"
+      AUTHENTICATION_APIKEY_ENABLED: "true"
+      AUTHENTICATION_APIKEY_ALLOWED_KEYS: ${WEAVIATE_API_KEY:?Set WEAVIATE_API_KEY in .env}
+      AUTHENTICATION_APIKEY_USERS: rag-runtime
+      AUTHORIZATION_ADMINLIST_ENABLED: "true"
+      AUTHORIZATION_ADMINLIST_USERS: rag-runtime
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          wget --spider -q
+          --header="Authorization: Bearer $${AUTHENTICATION_APIKEY_ALLOWED_KEYS}"
+          http://127.0.0.1:8080/v1/.well-known/ready
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+volumes:
+  weaviate_data:
+    name: rag_weaviate_secure_data

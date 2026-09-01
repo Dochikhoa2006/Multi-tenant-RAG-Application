@@ -69,7 +69,23 @@ def _boolean(name: str, default: bool) -> bool:
     raise ValueError(f"{name} must be a boolean value")
 
 
+def _choice(name: str, default: str, choices: frozenset[str]) -> str:
+    value = _required_string(name, default).lower()
+    if value not in choices:
+        allowed = ", ".join(sorted(choices))
+        raise ValueError(f"{name} must be one of: {allowed}")
+    return value
+
+
 WEAVIATE_URL = _required_string("WEAVIATE_URL", "http://localhost:8080")
+WEAVIATE_API_KEY = _raw_string("WEAVIATE_API_KEY", "").strip()
+WEAVIATE_CONNECTION_MODE = _choice(
+    "WEAVIATE_CONNECTION_MODE",
+    "auto",
+    frozenset({"auto", "cloud", "custom"}),
+)
+if WEAVIATE_CONNECTION_MODE == "cloud" and not WEAVIATE_API_KEY:
+    raise ValueError("WEAVIATE_API_KEY is required in cloud connection mode")
 WEAVIATE_GRPC_PORT = _positive_int("WEAVIATE_GRPC_PORT", 50051)
 WEAVIATE_GRPC_SECURE = _boolean(
     "WEAVIATE_GRPC_SECURE",

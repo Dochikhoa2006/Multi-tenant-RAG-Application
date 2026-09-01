@@ -8,9 +8,12 @@ from typing import Any
 
 import weaviate
 from weaviate.classes.config import Configure, DataType, Property
+from weaviate.classes.init import Auth
 from weaviate.connect import ConnectionParams
 
 from backend.config import (
+    WEAVIATE_API_KEY,
+    WEAVIATE_CONNECTION_MODE,
     WEAVIATE_GRPC_PORT,
     WEAVIATE_GRPC_SECURE,
     WEAVIATE_URL,
@@ -219,14 +222,45 @@ class WeaviateManager:
         if self._connected:
             return self._client
         if self._client is None:
+            connection_mode = WEAVIATE_CONNECTION_MODE
+            if connection_mode == "auto":
+                connection_mode = "cloud" if WEAVIATE_API_KEY else "custom"
+            if connection_mode == "cloud":
+                try:
+                    self._client = weaviate.connect_to_weaviate_cloud(
+                        cluster_url=WEAVIATE_URL,
+                        auth_credentials=Auth.api_key(WEAVIATE_API_KEY),
+                    )
+                except Exception as exc:
+                    detail = str(exc).replace(WEAVIATE_API_KEY, "[REDACTED]")
+                    raise RuntimeError(
+                        f"Weaviate Cloud connection failed: {detail}"
+                    ) from None
+                self._connected = True
+                return self._client
+            credentials = (
+                Auth.api_key(WEAVIATE_API_KEY) if WEAVIATE_API_KEY else None
+            )
             self._client = weaviate.WeaviateClient(
                 connection_params=ConnectionParams.from_url(
                     WEAVIATE_URL,
                     grpc_port=WEAVIATE_GRPC_PORT,
                     grpc_secure=WEAVIATE_GRPC_SECURE,
-                )
+                ),
+                auth_client_secret=credentials,
             )
-        self._client.connect()
+        try:
+            self._client.connect()
+        except Exception as exc:
+            try:
+                self._client.close()
+            except Exception:
+                pass
+            detail = str(exc)
+            if WEAVIATE_API_KEY:
+                detail = detail.replace(WEAVIATE_API_KEY, "[REDACTED]")
+            self._client = None
+            raise RuntimeError(f"Weaviate custom connection failed: {detail}") from None
         self._connected = True
         return self._client
 
