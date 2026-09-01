@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 import hashlib
 import json
+import logging
 import math
 from pathlib import Path
 from typing import Any
@@ -12,11 +13,22 @@ from typing import Any
 import numpy as np
 
 from backend.model_config import ONNX_RERANKER, RERANKER_MODEL, ONNXModelConfig
+from backend.providers.onnx_cuda import (
+    enable_assignment_recording,
+    validate_cuda_placement,
+)
 from backend.rag.runtime import RerankResult
 
 
 _MANIFEST_SCHEMA_VERSION = "1.0"
 _TOKENIZER_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json")
+_EXPECTED_CPU_ASSIGNMENT_SHA256 = (
+    "9d2a616f42094a8195c5316cd31d0c77755625f7310d3c26d4a53a78e94cafd8"
+)
+_REQUIRED_CUDA_OPERATORS = frozenset(
+    {"Gemm", "LayerNormalization", "MatMul", "Softmax"}
+)
+_LOGGER = logging.getLogger(__name__)
 
 
 class ONNXRerankerError(RuntimeError):
@@ -131,6 +143,7 @@ class ONNXCrossEncoderReranker:
         if not callable(tokenizer):
             raise TypeError("tokenizer must be callable")
 
+        options: object | None = None
         if session is None:
             if session_factory is None or available_providers is None:
                 import onnxruntime as ort
@@ -138,13 +151,11 @@ class ONNXCrossEncoderReranker:
                 session_factory = session_factory or ort.InferenceSession
                 available_providers = available_providers or ort.get_available_providers()
                 options = ort.SessionOptions()
-                if config.disable_cpu_fallback:
-                    options.add_session_config_entry(
-                        "session.disable_cpu_ep_fallback",
-                        "1",
-                    )
-            else:
-                options = None
+                if (
+                    config.disable_cpu_fallback
+                    and config.execution_provider == "CUDAExecutionProvider"
+                ):
+                    enable_assignment_recording(options)
             if config.execution_provider not in available_providers:
                 raise ONNXRerankerError(
                     f"required execution provider {config.execution_provider!r} is unavailable"
@@ -159,6 +170,7 @@ class ONNXCrossEncoderReranker:
                 str(model_path),
                 sess_options=options,
                 providers=[provider],
+                enable_fallback=False,
             )
 
         get_inputs = getattr(session, "get_inputs", None)
@@ -175,6 +187,19 @@ class ONNXCrossEncoderReranker:
         providers = list(get_providers())
         if not providers or providers[0] != config.execution_provider:
             raise ONNXRerankerError("reranker session did not activate the required provider")
+        if options is not None and config.execution_provider == "CUDAExecutionProvider":
+            summary = validate_cuda_placement(
+                session,
+                expected_cpu_digest=_EXPECTED_CPU_ASSIGNMENT_SHA256,
+                required_cuda_operators=_REQUIRED_CUDA_OPERATORS,
+                error_factory=ONNXRerankerError,
+                label="BGE reranker graph",
+            )
+            _LOGGER.info(
+                "BGE CUDA placement validated with %d CPU bookkeeping nodes (%s)",
+                summary.cpu_count,
+                dict(summary.cpu_operators),
+            )
         inputs = list(get_inputs())
         outputs = list(get_outputs())
         input_names = {getattr(item, "name", None) for item in inputs}

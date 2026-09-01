@@ -42,4 +42,8 @@ def test_secure_weaviate_compose_terminates_grpc_tls_with_http2() -> None:
     assert "cap_drop:" in compose
     assert "bind :5443 ssl" in haproxy
     assert "alpn h2" in haproxy
+    assert "timeout client 1h" in haproxy
+    assert "timeout server 1h" in haproxy
+    assert "timeout client 60s" not in haproxy
+    assert "timeout server 60s" not in haproxy
     assert "server weaviate weaviate:50051 check" in haproxy

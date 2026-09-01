@@ -143,7 +143,6 @@ uvicorn.run(
     gpu=GPU,
     cpu=4.0,
     memory=16_384,
-    ephemeral_disk=10_240,
     volumes={
         str(RUNTIME_MODEL_ROOT): runtime_model_volume,
         str(GRANITE_MODEL_ROOT): granite_model_volume,

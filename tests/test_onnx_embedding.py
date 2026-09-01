@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import backend.providers.onnx_embedding as onnx_embedding
 from backend.model_config import EMBEDDING_MODEL, EMBEDDING_MODEL_REVISION, ONNXModelConfig
 from backend.providers.onnx_embedding import (
     EMBEDDING_DIMENSION,
@@ -197,6 +198,7 @@ def test_embedding_constructs_tokenizer_and_session_once(tmp_path: Path) -> None
     assert sessions[0][1]["providers"] == [
         ("CUDAExecutionProvider", {"device_id": "0"})
     ]
+    assert sessions[0][1]["enable_fallback"] is False
     assert session.disable_fallback_calls == 1
 
 
@@ -223,7 +225,7 @@ def test_embedding_accepts_explicit_cpu_without_cuda_options_or_fallback(
     assert session.disable_fallback_calls == 1
 
 
-def test_embedding_disables_session_cpu_and_runtime_fallback(
+def test_embedding_records_placement_and_disables_runtime_recovery_fallback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _artifacts(tmp_path)
@@ -247,12 +249,18 @@ def test_embedding_disables_session_cpu_and_runtime_fallback(
         get_available_providers=lambda: ["CUDAExecutionProvider"],
     )
     monkeypatch.setitem(sys.modules, "onnxruntime", fake_runtime)
+    monkeypatch.setattr(
+        onnx_embedding,
+        "validate_cuda_placement",
+        lambda *args, **kwargs: SimpleNamespace(cpu_count=0, cpu_operators=()),
+    )
 
     ONNXEmbeddingClient(_config(tmp_path), tokenizer=FakeTokenizer())
 
     options = captured["sess_options"]
     assert isinstance(options, FakeSessionOptions)
-    assert options.entries == {"session.disable_cpu_ep_fallback": "1"}
+    assert options.entries == {"session.record_ep_graph_assignment_info": "1"}
+    assert captured["enable_fallback"] is False
     assert session.disable_fallback_calls == 1
 
 

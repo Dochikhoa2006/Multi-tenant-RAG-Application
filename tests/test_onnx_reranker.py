@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+import backend.providers.onnx_reranker as onnx_reranker
 from backend.model_config import ONNXModelConfig, RERANKER_MODEL, RERANKER_MODEL_REVISION
 from backend.providers.onnx_reranker import (
     ONNXCrossEncoderReranker,
@@ -165,6 +167,46 @@ def test_reranker_reuses_loaded_tokenizer_and_session(tmp_path: Path) -> None:
     assert sessions[0][1]["providers"] == [
         ("CUDAExecutionProvider", {"device_id": "0"})
     ]
+    assert sessions[0][1]["enable_fallback"] is False
+    assert session.disable_fallback_calls == 1
+
+
+def test_reranker_records_placement_and_disables_runtime_recovery_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _artifacts(tmp_path)
+    session = FakeRerankerSession([np.array([0.5], dtype=np.float32)])
+    captured: dict[str, object] = {}
+
+    class FakeSessionOptions:
+        def __init__(self) -> None:
+            self.entries: dict[str, str] = {}
+
+        def add_session_config_entry(self, name: str, value: str) -> None:
+            self.entries[name] = value
+
+    def session_factory(path: str, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return session
+
+    fake_runtime = SimpleNamespace(
+        SessionOptions=FakeSessionOptions,
+        InferenceSession=session_factory,
+        get_available_providers=lambda: ["CUDAExecutionProvider"],
+    )
+    monkeypatch.setitem(sys.modules, "onnxruntime", fake_runtime)
+    monkeypatch.setattr(
+        onnx_reranker,
+        "validate_cuda_placement",
+        lambda *args, **kwargs: SimpleNamespace(cpu_count=0, cpu_operators=()),
+    )
+
+    ONNXCrossEncoderReranker(_config(tmp_path), tokenizer=FakePairTokenizer())
+
+    options = captured["sess_options"]
+    assert isinstance(options, FakeSessionOptions)
+    assert options.entries == {"session.record_ep_graph_assignment_info": "1"}
+    assert captured["enable_fallback"] is False
     assert session.disable_fallback_calls == 1
 
 

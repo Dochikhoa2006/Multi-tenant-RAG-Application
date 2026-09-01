@@ -5,17 +5,27 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 import hashlib
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from backend.model_config import EMBEDDING_MODEL, ONNX_EMBEDDING, ONNXModelConfig
+from backend.providers.onnx_cuda import (
+    enable_assignment_recording,
+    validate_cuda_placement,
+)
 
 
 EMBEDDING_DIMENSION = 768
 _MANIFEST_SCHEMA_VERSION = "1.0"
 _TOKENIZER_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json")
+_EXPECTED_CPU_ASSIGNMENT_SHA256 = (
+    "a63fd5859352eb6901eaa58f9ed6e94a0fc230987d799e38996ca8b012206ca1"
+)
+_REQUIRED_CUDA_OPERATORS = frozenset({"MatMul", "ReduceMean", "Softmax"})
+_LOGGER = logging.getLogger(__name__)
 
 
 class ONNXEmbeddingError(RuntimeError):
@@ -130,6 +140,7 @@ class ONNXEmbeddingClient:
         if not callable(tokenizer):
             raise TypeError("tokenizer must be callable")
 
+        options: object | None = None
         if session is None:
             if session_factory is None or available_providers is None:
                 import onnxruntime as ort
@@ -137,13 +148,11 @@ class ONNXEmbeddingClient:
                 session_factory = session_factory or ort.InferenceSession
                 available_providers = available_providers or ort.get_available_providers()
                 options = ort.SessionOptions()
-                if config.disable_cpu_fallback:
-                    options.add_session_config_entry(
-                        "session.disable_cpu_ep_fallback",
-                        "1",
-                    )
-            else:
-                options = None
+                if (
+                    config.disable_cpu_fallback
+                    and config.execution_provider == "CUDAExecutionProvider"
+                ):
+                    enable_assignment_recording(options)
             if config.execution_provider not in available_providers:
                 raise ONNXEmbeddingError(
                     f"required execution provider {config.execution_provider!r} is unavailable"
@@ -158,6 +167,7 @@ class ONNXEmbeddingClient:
                 str(model_path),
                 sess_options=options,
                 providers=[provider],
+                enable_fallback=False,
             )
 
         get_inputs = getattr(session, "get_inputs", None)
@@ -174,6 +184,19 @@ class ONNXEmbeddingClient:
         providers = list(get_providers())
         if not providers or providers[0] != config.execution_provider:
             raise ONNXEmbeddingError("embedding session did not activate the required provider")
+        if options is not None and config.execution_provider == "CUDAExecutionProvider":
+            summary = validate_cuda_placement(
+                session,
+                expected_cpu_digest=_EXPECTED_CPU_ASSIGNMENT_SHA256,
+                required_cuda_operators=_REQUIRED_CUDA_OPERATORS,
+                error_factory=ONNXEmbeddingError,
+                label="GTE embedding graph",
+            )
+            _LOGGER.info(
+                "GTE CUDA placement validated with %d CPU bookkeeping nodes (%s)",
+                summary.cpu_count,
+                dict(summary.cpu_operators),
+            )
         inputs = list(get_inputs())
         outputs = list(get_outputs())
         input_names = {getattr(item, "name", None) for item in inputs}

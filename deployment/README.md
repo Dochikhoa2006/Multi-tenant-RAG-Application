@@ -55,9 +55,27 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 RUN_ONNX_CUDA_TESTS=1 \
 The configured ONNX execution provider must be installed and able to execute
 the provisioned FP16 graph. `CUDAExecutionProvider` is the production default;
 another provider may be selected explicitly with the corresponding
-`ONNX_*_EXECUTION_PROVIDER` setting. Each client registers only that provider,
-passes `device_id` only to CUDA, and disables ONNX Runtime fallback. There is no
+`ONNX_*_EXECUTION_PROVIDER` setting. Each client requests only that provider,
+passes `device_id` only to CUDA, and disables ONNX Runtime's Python recovery
+fallback before session construction and again before inference. There is no
 automatic CPU or remote-inference fallback.
+
+ONNX Runtime always installs its default CPU EP and may deliberately place
+shape, mask, axis, and metadata bookkeeping there. Production records the
+optimized graph assignment and requires an exact, artifact-specific CPU-node
+fingerprint; any added, removed, or changed CPU node fails startup. H100
+profiling with ONNX Runtime 1.29.0 established these approved assignments:
+
+- GTE: 1,370 CUDA nodes and 9 CPU bookkeeping nodes. All MatMul, Softmax,
+  normalization, GELU, and transformer tensor arithmetic executed on CUDA.
+- BGE: 1,036 CUDA nodes and 232 CPU bookkeeping nodes. All 192 MatMul, two
+  classifier Gemm, 49 LayerNormalization, 24 Softmax, and embedding operations
+  executed on CUDA.
+
+The approved CPU operators are limited to the exact recorded dynamic-shape and
+attention-mask construction nodes. Operator-name allowlisting alone is not
+used, so an embedding Gather or other meaningful compute node moving to CPU
+cannot be silently accepted.
 
 Stage 1 segmentation separately loads `all-MiniLM-L6-v2` from the required
 `SEGMENTATION_MODEL_PATH` with `local_files_only=True`. Its explicit
@@ -244,6 +262,13 @@ sudo tailscale funnel --bg --https=443 http://127.0.0.1:8080
 sudo tailscale funnel --bg --tcp=8443 tcp://127.0.0.1:5443
 tailscale funnel status
 ```
+
+Treat `tailscale funnel status` as configuration evidence, not external
+readiness. Before deploying the runtime, probe both endpoints from Modal and
+require REST readiness over HTTPS plus successful gRPC TLS negotiation with
+ALPN `h2`. See the current [Funnel macOS
+requirements](https://tailscale.com/docs/features/tailscale-funnel) when
+diagnosing a configured Funnel that does not receive public ingress.
 
 Do not use Tailscale's `--tls-terminated-tcp` mode for gRPC: it does not
 negotiate the `h2` ALPN required by the pinned Weaviate client. Renew the
