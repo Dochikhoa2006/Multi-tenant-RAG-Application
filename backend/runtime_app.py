@@ -21,7 +21,7 @@ from backend.processing.paragraph_splitter import (
     _get_sentence_transformer,
 )
 from backend.providers.granite_query_rewriter import RoleRoutingLLMClient
-from backend.providers.onnx_embedding import ONNXEmbeddingClient
+from backend.providers.onnx_embedding import ONNXEmbeddingClient, ONNXLateOnProvider
 from backend.providers.onnx_reranker import ONNXCrossEncoderReranker
 from backend.providers.sglang_query_rewriter import SGLangGraniteQueryRewriter
 from backend.providers.sglang_qwen_llm import SGLangQwenLLMClient
@@ -39,18 +39,6 @@ class RuntimeDependencyError(RuntimeError):
 Factory = Callable[[], Any]
 ModelEndpointValidator = Callable[[object, str, str, str, str], None]
 _LOGGER = logging.getLogger(__name__)
-
-
-def _missing_multi_vector_provider() -> object:
-    raise RuntimeDependencyError(
-        "a real multi-vector provider is required; Stage 2 is not configured"
-    )
-
-
-def _missing_conversation_segmenter() -> object:
-    raise RuntimeDependencyError(
-        "a real Conversation retrieval segmenter is required; Stage 2 is not configured"
-    )
 
 
 def _response_json(response: object) -> object:
@@ -141,8 +129,8 @@ def create_runtime_app(
     task_queue_factory: Factory = InMemoryTaskQueue,
     embedding_factory: Factory = ONNXEmbeddingClient,
     reranker_factory: Factory = ONNXCrossEncoderReranker,
-    multi_vector_factory: Factory = _missing_multi_vector_provider,
-    conversation_segmenter_factory: Factory = _missing_conversation_segmenter,
+    multi_vector_factory: Factory = ONNXLateOnProvider,
+    conversation_segmenter_factory: Factory | None = None,
     granite_factory: Factory = SGLangGraniteQueryRewriter,
     qwen_factory: Factory = SGLangQwenLLMClient,
     tokenizer_factory: Factory | None = None,
@@ -158,7 +146,6 @@ def create_runtime_app(
         embedding_factory,
         reranker_factory,
         multi_vector_factory,
-        conversation_segmenter_factory,
         granite_factory,
         qwen_factory,
         processing_warmup,
@@ -167,15 +154,24 @@ def create_runtime_app(
     )
     if any(not callable(item) for item in factories):
         raise TypeError("runtime factories and lifecycle callbacks must be callable")
+    if conversation_segmenter_factory is not None and not callable(
+        conversation_segmenter_factory
+    ):
+        raise TypeError("conversation_segmenter_factory must be callable when provided")
 
     construction_cleanup: list[tuple[str, Callable[[], None]]] = []
     try:
         multi_vectors = multi_vector_factory()
         construction_cleanup.append(("multi-vector provider", lambda: _close(multi_vectors)))
-        conversation_segmenter = conversation_segmenter_factory()
-        construction_cleanup.append(
-            ("Conversation segmenter", lambda: _close(conversation_segmenter))
+        conversation_segmenter = (
+            multi_vectors
+            if conversation_segmenter_factory is None
+            else conversation_segmenter_factory()
         )
+        if conversation_segmenter is not multi_vectors:
+            construction_cleanup.append(
+                ("Conversation segmenter", lambda: _close(conversation_segmenter))
+            )
 
         manager = manager_factory()
         construction_cleanup.append(("Weaviate manager", manager.disconnect))
@@ -283,9 +279,10 @@ def create_runtime_app(
                                 await asyncio.to_thread(_close, multi_vectors)
                             finally:
                                 try:
-                                    await asyncio.to_thread(
-                                        _close, conversation_segmenter
-                                    )
+                                    if conversation_segmenter is not multi_vectors:
+                                        await asyncio.to_thread(
+                                            _close, conversation_segmenter
+                                        )
                                 finally:
                                     await asyncio.to_thread(processing_cleanup)
 

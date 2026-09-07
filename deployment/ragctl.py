@@ -705,8 +705,6 @@ def build_runtime_secret(
         "QWEN_SGLANG_BASE_URL": qwen_url,
         "QWEN_SGLANG_API_KEY": bearer,
     }
-    if tuple(secret) != RUNTIME_SECRET_KEYS:
-        raise RagCtlError("Internal runtime secret definition is not the approved nine-key set")
     return secret
 
 

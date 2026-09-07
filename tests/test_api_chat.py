@@ -16,6 +16,7 @@ from backend.api.telemetry import TELEMETRY_SCHEMA_VERSION, TIMING_KEYS
 from backend.api.chat import delete_session as delete_session_endpoint
 from backend.api.chat import query as query_endpoint
 from backend.main import create_app
+from backend.model_config import LATEON_EMBEDDING_DIMENSION
 from backend.rag.pipeline import UserRetrievalCollections
 from backend.rag.runtime import RAGRuntime, RerankResult
 from backend.services import AppServices
@@ -23,6 +24,10 @@ from backend.weaviate_client.models import DeletionReport, SearchResult
 
 
 USER_ID = "usr_api"
+
+
+def _lateon_row(first: float, second: float = 0.0) -> list[float]:
+    return [first, second, *([0.0] * (LATEON_EMBEDDING_DIMENSION - 2))]
 
 
 class FakeManager:
@@ -111,14 +116,14 @@ class FakeMultiVectors:
     def encode_query(self, text: str) -> Sequence[Sequence[float]]:
         self.query_calls.append(text)
         self.events.append(f"multi_query:{text[:12]}")
-        return [[1.0, 0.0]]
+        return [_lateon_row(1.0)]
 
     def encode_documents(
         self, texts: Sequence[str]
     ) -> Sequence[Sequence[Sequence[float]]]:
         values = list(texts)
         self.document_calls.append(values)
-        return [[[1.0, 0.0]] for _ in values]
+        return [[_lateon_row(1.0)] for _ in values]
 
 
 class OneSegment:

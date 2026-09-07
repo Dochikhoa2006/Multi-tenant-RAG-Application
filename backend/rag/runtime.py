@@ -45,9 +45,9 @@ class EmbeddingClient(Protocol):
 class MultiVectorProvider(Protocol):
     """Model-agnostic late-interaction encoding contract.
 
-    Document inputs are retrieval units whose model-token limit is defined by
-    ``RETRIEVAL_UNIT_MAX_MODEL_TOKENS``. Implementations must reject oversized
-    inputs rather than truncate them; Stage 1 intentionally does not tokenize.
+    Document inputs are retrieval units whose exact model-token limit is
+    defined by the pinned provider. Implementations must reject oversized
+    inputs rather than truncate them.
     """
 
     def encode_query(self, text: str) -> Sequence[Sequence[float]]: ...

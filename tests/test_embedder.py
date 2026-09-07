@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from backend.model_config import EMBEDDING_MODEL
+from backend.model_config import EMBEDDING_MODEL, LATEON_EMBEDDING_DIMENSION
 from backend.rag.embedder import (
     conversation_segments,
     encode_documents,
@@ -19,6 +19,10 @@ from backend.rag.runtime import RAGRuntime, RerankResult
 
 
 CONVERSATION_ID = "81000000-0000-0000-0000-000000000001"
+
+
+def _lateon_row(value: float) -> list[float]:
+    return [value, *([0.0] * (LATEON_EMBEDDING_DIMENSION - 1))]
 
 
 class DummyLLM:
@@ -74,7 +78,7 @@ class FakeEmbeddings:
 class FakeMultiVectors:
     def __init__(self, documents: object | None = None, query: object | None = None) -> None:
         self.documents = documents
-        self.query = query if query is not None else [[0.1, 0.2]]
+        self.query = query if query is not None else [_lateon_row(0.1)]
         self.document_calls: list[list[str]] = []
 
     def encode_query(self, text: str) -> object:
@@ -85,7 +89,7 @@ class FakeMultiVectors:
         self.document_calls.append(values)
         if self.documents is not None:
             return self.documents
-        return [[[float(index + 1), 0.5]] for index in range(len(values))]
+        return [[_lateon_row(float(index + 1))] for index in range(len(values))]
 
 
 class LosslessSegmenter:
@@ -222,7 +226,7 @@ def test_background_embedding_returns_observable_task_and_inserts_labeled_text()
     assert users == ["usr_test"]
     assert embeddings.single_calls == [(raw_text, EMBEDDING_MODEL)]
     assert collection.inserts == [
-        (CONVERSATION_ID, raw_text, [raw_text], [[[1.0, 0.5]]], [0.4, 0.6])
+        (CONVERSATION_ID, raw_text, [raw_text], [[_lateon_row(1.0)]], [0.4, 0.6])
     ]
 
 
@@ -230,19 +234,21 @@ def test_multi_vector_contract_validates_shape_finiteness_and_dimensions() -> No
     runtime, _ = _runtime(
         FakeEmbeddings(),
         multi_vectors=FakeMultiVectors(
-            documents=[[[1.0, 2.0]], [[3.0, 4.0], [5.0, 6.0]]],
-            query=[[7.0, 8.0]],
+            documents=[[_lateon_row(1.0)], [_lateon_row(3.0), _lateon_row(5.0)]],
+            query=[_lateon_row(7.0)],
         ),
     )
-    assert encode_query("query", runtime=runtime) == [[7.0, 8.0]]
+    assert encode_query("query", runtime=runtime) == [_lateon_row(7.0)]
     assert encode_documents(["a", "b"], runtime=runtime) == [
-        [[1.0, 2.0]],
-        [[3.0, 4.0], [5.0, 6.0]],
+        [_lateon_row(1.0)],
+        [_lateon_row(3.0), _lateon_row(5.0)],
     ]
 
     malformed, _ = _runtime(
         FakeEmbeddings(),
-        multi_vectors=FakeMultiVectors(documents=[[[1.0]], [[float("nan")]]]),
+        multi_vectors=FakeMultiVectors(
+            documents=[[_lateon_row(1.0)], [_lateon_row(float("nan"))]]
+        ),
     )
     with pytest.raises(ValueError, match="finite"):
         encode_documents(["a", "b"], runtime=malformed)

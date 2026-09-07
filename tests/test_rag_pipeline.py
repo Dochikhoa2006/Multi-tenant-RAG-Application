@@ -12,6 +12,7 @@ from backend.model_config import (
     CONVERSATION_SEARCH,
     EMBEDDING_MODEL,
     KNOWLEDGE_SEARCH,
+    LATEON_EMBEDDING_DIMENSION,
     POLICY_SEARCH,
     RERANKER_MODEL,
 )
@@ -24,6 +25,10 @@ USER_ID = "usr_pipeline"
 CONVERSATION_ID = "70000000-0000-0000-0000-000000000001"
 ORIGINAL_QUERY = "How does that retrieval method work?"
 REWRITTEN_QUERY = "Explain MMR retrieval in this RAG architecture"
+
+
+def _lateon_row(first: float, second: float = 0.0) -> list[float]:
+    return [first, second, *([0.0] * (LATEON_EMBEDDING_DIMENSION - 2))]
 
 
 def _uuid(index: int) -> str:
@@ -94,13 +99,17 @@ class RecordingMultiVectors:
     def encode_query(self, text: str) -> Sequence[Sequence[float]]:
         self.calls.append(("query", text, threading.get_ident()))
         self.events.append(f"multi:{text}")
-        return [[1.0, 0.0]] if text == ORIGINAL_QUERY else [[0.0, 1.0]]
+        return (
+            [_lateon_row(1.0, 0.0)]
+            if text == ORIGINAL_QUERY
+            else [_lateon_row(0.0, 1.0)]
+        )
 
     def encode_documents(
         self, texts: Sequence[str]
     ) -> Sequence[Sequence[Sequence[float]]]:
         self.calls.append(("documents", "\n".join(texts), threading.get_ident()))
-        return [[[0.2, 0.8]] for _ in texts]
+        return [[_lateon_row(0.2, 0.8)] for _ in texts]
 
 
 class OneSegment:
@@ -371,17 +380,17 @@ def test_pipeline_uses_official_rewritten_query_and_enqueues_complete_answer() -
     assert harness.embeddings.calls == []
     assert harness.conversation.calls[0][:3] == (
         ORIGINAL_QUERY,
-        [[1.0, 0.0]],
+        [_lateon_row(1.0, 0.0)],
         CONVERSATION_SEARCH.candidate_count,
     )
     assert harness.knowledge.calls[0][:3] == (
         REWRITTEN_QUERY,
-        [[0.0, 1.0]],
+        [_lateon_row(0.0, 1.0)],
         KNOWLEDGE_SEARCH.candidate_count,
     )
     assert harness.policy.calls[0][:3] == (
         REWRITTEN_QUERY,
-        [[0.0, 1.0]],
+        [_lateon_row(0.0, 1.0)],
         POLICY_SEARCH.candidate_count,
     )
     assert {call["query"] for call in harness.reranker.calls} == {

@@ -1,4 +1,4 @@
-"""Empty-state-only Weaviate vector-profile maintenance migration."""
+"""Non-destructive empty-state Weaviate vector-profile maintenance migration."""
 
 from __future__ import annotations
 
@@ -35,8 +35,8 @@ from backend.weaviate_client.client import (
 
 
 _MANIFEST_NAME = "vector-migration-manifest.json"
-_MANIFEST_VERSION = "2.0"
-_MIGRATION_SCOPE = "disposable-empty-prototype-state"
+_MANIFEST_VERSION = "3.0"
+_MIGRATION_SCOPE = "empty-lateon-vector-profile-cutover"
 _COLLECTION_PATTERN = re.compile(
     r"^RagUser_(?P<token>[A-Z2-7]+)_(?P<suffix>Conversations|KnowledgeFacts|Policy)$"
 )
@@ -196,7 +196,8 @@ def _require_existing_targets_empty(
         count = _total_count(collection, name)
         if count != 0:
             raise VectorMigrationError(
-                f"collection {name!r} contains {count} objects; populated state is unsupported"
+                f"collection {name!r} contains {count} objects; populated legacy data "
+                "is preserved and must be re-indexed by a separately approved migration"
             )
         _validate_source_schema(collection, name, str(entry["collection_type"]))
 

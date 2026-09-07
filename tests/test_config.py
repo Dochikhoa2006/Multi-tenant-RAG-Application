@@ -211,6 +211,7 @@ from backend.model_config import (
     GRANITE_QUERY_REWRITE,
     HYBRID_SEARCH,
     ONNX_EMBEDDING,
+    ONNX_LATE_INTERACTION,
     ONNX_RERANKER,
     PRIMARY_GENERATOR,
     QWEN_SGLANG,
@@ -279,6 +280,13 @@ assert ONNX_EMBEDDING.max_tokens == 4096
 assert ONNX_EMBEDDING.batch_size == 8
 assert ONNX_EMBEDDING.device_id == 2
 assert ONNX_EMBEDDING.execution_provider == 'CPUExecutionProvider'
+assert ONNX_LATE_INTERACTION.model_path == 'local/lateon'
+assert ONNX_LATE_INTERACTION.onnx_filename == 'lateon-fp16.onnx'
+assert ONNX_LATE_INTERACTION.batch_size == 16
+assert ONNX_LATE_INTERACTION.max_tokens == 300
+assert ONNX_LATE_INTERACTION.device_id == 4
+assert ONNX_LATE_INTERACTION.execution_provider == 'CUDAExecutionProvider'
+assert ONNX_LATE_INTERACTION.disable_cpu_fallback is True
 assert ONNX_RERANKER.model_path == 'local/bge'
 assert ONNX_RERANKER.onnx_filename == 'custom/reranker.onnx'
 assert ONNX_RERANKER.max_tokens == 256
@@ -340,6 +348,10 @@ assert 'qwen-secret' not in repr(QWEN_SGLANG)
             "ONNX_EMBEDDING_BATCH_SIZE": "8",
             "ONNX_EMBEDDING_CUDA_DEVICE_ID": "2",
             "ONNX_EMBEDDING_EXECUTION_PROVIDER": "CPUExecutionProvider",
+            "ONNX_LATE_INTERACTION_MODEL_PATH": "local/lateon",
+            "ONNX_LATE_INTERACTION_FILENAME": "lateon-fp16.onnx",
+            "ONNX_LATE_INTERACTION_BATCH_SIZE": "16",
+            "ONNX_LATE_INTERACTION_CUDA_DEVICE_ID": "4",
             "ONNX_RERANKER_MODEL_PATH": "local/bge",
             "ONNX_RERANKER_FILENAME": "custom/reranker.onnx",
             "ONNX_RERANKER_MAX_TOKENS": "256",
@@ -433,6 +445,20 @@ def test_invalid_environment_configuration_fails_fast() -> None:
 
     assert result.returncode != 0
     assert "min <= target <= max" in result.stderr
+
+
+def test_chunk_hard_cap_cannot_exceed_lateon_document_limit() -> None:
+    result = _run_python(
+        "import backend.model_config",
+        overrides={
+            "MIN_CHUNK_TOKENS": "80",
+            "TARGET_CHUNK_TOKENS": "220",
+            "MAX_CHUNK_TOKENS": "301",
+        },
+    )
+
+    assert result.returncode != 0
+    assert "LateOn's 300-model-token document limit" in result.stderr
 
 
 def test_invalid_granite_response_prefill_fails_fast() -> None:

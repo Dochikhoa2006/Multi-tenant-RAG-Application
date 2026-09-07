@@ -13,6 +13,7 @@ from weaviate.classes.query import HybridFusion, MetadataQuery
 from backend.config import get_collection_name
 from backend.model_config import (
     HYBRID_SEARCH,
+    LATEON_EMBEDDING_DIMENSION,
     LATE_INTERACTION_VECTOR_NAME,
     MMR_DIVERSITY_VECTOR_NAME,
 )
@@ -33,6 +34,8 @@ def _required_text(value: object, name: str) -> str:
 
 
 def _uuid_text(value: object, name: str) -> str:
+    if isinstance(value, UUID):
+        return str(value)
     raw_value = _required_text(value, name)
     try:
         return str(UUID(raw_value))
@@ -87,6 +90,8 @@ def _multi_vector_values(
     dimensions = {len(row) for row in rows}
     if len(dimensions) != 1:
         raise ValueError(f"{name} rows must have consistent dimensions")
+    if len(rows[0]) != LATEON_EMBEDDING_DIMENSION:
+        raise ValueError(f"{name} rows must have exactly 128 dimensions")
     return rows
 
 
@@ -206,7 +211,14 @@ class _CollectionBase:
                 raise WeaviateResponseError(
                     "hybrid result properties must be a mapping"
                 )
-            properties = dict(raw_properties)
+            # UUID-typed Weaviate properties deserialize as ``uuid.UUID`` in
+            # the pinned v4 client.  Normalize them at this storage boundary
+            # so provider-neutral retrieval and persistence models retain
+            # their documented canonical-string identifiers.
+            properties = {
+                key: str(value) if isinstance(value, UUID) else value
+                for key, value in raw_properties.items()
+            }
             if properties.get("user_id") != self.user_id:
                 raise UserIsolationError(
                     "hybrid result user_id does not match the bound collection user"

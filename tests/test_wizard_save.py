@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from backend.model_config import LATEON_EMBEDDING_DIMENSION
 from backend.weaviate_client.models import (
     ChunkRecord,
     DeletionReport,
@@ -17,6 +18,10 @@ from backend.wizard.save import save_wizard
 
 USER_ID = "usr_abc123"
 DOCUMENT_ID = "60000000-0000-0000-0000-000000000001"
+
+
+def _lateon_row(value: float) -> tuple[float, ...]:
+    return (value, *([0.0] * (LATEON_EMBEDDING_DIMENSION - 1)))
 
 
 def _uuid(index: int, *, prefix: int = 7) -> str:
@@ -54,13 +59,13 @@ class RecordingMultiVectors:
         self.events = events
 
     def encode_query(self, text: str) -> Sequence[Sequence[float]]:
-        return [[0.5, 0.5]]
+        return [_lateon_row(0.5)]
 
     def encode_documents(
         self, texts: Sequence[str]
     ) -> Sequence[Sequence[Sequence[float]]]:
         self.events.append(("encode_documents", tuple(texts)))
-        return [[[0.6, 0.4]] for _ in texts]
+        return [[_lateon_row(0.6)] for _ in texts]
 
 
 class RecordingCollection:
@@ -94,7 +99,7 @@ class RecordingCollection:
                     paragraph_id,
                     chunk_id,
                     paragraph_data[paragraph_id],
-                    ((0.3, 0.7),),
+                    (_lateon_row(0.3),),
                     (0.1, 0.2),
                 )
 
@@ -339,7 +344,7 @@ def test_single_modified_paragraph_runs_all_steps_and_commits() -> None:
             1,
             new_chunk_id,
             "new text",
-            ((0.6, 0.4),),
+            (_lateon_row(0.6),),
             (0.25, 0.75),
         )
     ]

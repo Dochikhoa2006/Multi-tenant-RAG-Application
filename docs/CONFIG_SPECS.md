@@ -20,7 +20,7 @@ Embedding
 └── Alibaba-NLP/gte-modernbert-base (stored MMR diversity vectors; CUDA/FP16)
 
 Late interaction
-└── External model-agnostic multi-vector provider (Stage 2 implementation)
+└── lightonai/LateOn (ONNX Runtime CUDA/FP16; 128-D MaxSim token vectors)
 
 Reranker
 └── BAAI/bge-reranker-v2-m3 (local ONNX Runtime CUDA/FP16)
@@ -51,7 +51,7 @@ Chunking
 ├── chunk threshold = 0.76
 ├── target = 220 tokens
 ├── min = 80
-└── max = 320
+└── max = 300 LateOn model tokens
 
 Prompts
 ├── P1 Query Rewriter
@@ -82,7 +82,7 @@ Context
 | **Query Rewriter (Model A)** | `merged-granite-4.1-3b-query-rewrite` | SGLang 0.5.18 / Modal NVIDIA CUDA | IBM Granite 4.1-3B with the standard query-rewrite LoRA permanently merged. Produces a standalone query from structured dialogue history. |
 | **Session Title Generator** | `qwen3-4b-awq` | SGLang 0.5.18 / Modal NVIDIA CUDA | Non-thinking asynchronous summarization of chat sessions for UI sidebar display. Uses the same served model identity as the primary generator. |
 | **Embedding Model** | `Alibaba-NLP/gte-modernbert-base` | Local ONNX Runtime, CUDA/FP16 | Persisted 768-dimensional CLS-pooled, float32 L2-normalized document/document diversity vectors for application MMR; never first-stage retrieval. |
-| **Late-interaction Provider** | Stage 2 integration | External model-agnostic provider contract | Supplies query/document token matrices for Weaviate MaxSim; absent in Stage 1 production, which therefore fails closed. |
+| **Late-interaction Provider** | `lightonai/LateOn` at `62911e105059585d244384c7d17826e35f669c17` | Local ONNX Runtime, CUDA/FP16 | Supplies normalized 128-dimensional query/document token matrices for Weaviate MaxSim; query length 32 and document hard limit 300. |
 | **Reranker (Cross-Encoder)** | `BAAI/bge-reranker-v2-m3` | Local ONNX Runtime, CUDA/FP16 | Authoritative batched query/document logits for Conversation, Knowledge Facts, and Policy candidates. |
 
 ---
@@ -111,10 +111,12 @@ then considers the first
 Each lambda, raw-logit score floor, and sigmoid-gap threshold is independently
 configurable per collection.
 
-Every late-interaction retrieval unit must be at most 300 model tokens with no
-silent truncation. Stage 1 establishes that contract and validates matrix shape
-and lossless Conversation segmentation only; exact provider token counting and
-tokenizer-aware segmentation are Stage 2 responsibilities.
+Every late-interaction retrieval unit is measured by the pinned LateOn tokenizer
+and must be at most 300 model tokens with no silent truncation. Knowledge/Policy
+retain the existing semantic chunking target/minimum behavior, with 300 as the
+authoritative final cap. Conversation segmentation is lossless and all segments
+retain one canonical `conversation_id`. The exact pinned PyLate prefix, special
+token, query truncation, padding, and punctuation-skiplist behavior is preserved.
 
 #### Local ONNX configuration
 
@@ -122,7 +124,13 @@ The embedding checkpoint is pinned to revision
 `e7f32e3c00f91d699e8c43b53106206bcc72bb22`; the reranker source is pinned to
 revision `953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e`. Both tokenizer and ONNX
 artifacts are provisioned before deployment and verified through a SHA-256
-manifest. Runtime downloads and remote model code are disabled.
+manifest. LateOn is pinned to revision
+`62911e105059585d244384c7d17826e35f669c17`; its published FP32 graph is parity
+gated against PyLate 1.3.4 before the accepted FP16 graph is published. Runtime
+downloads and remote model code are disabled.
+The isolated parity environment uses Transformers 4.56.2 and Torch 2.8.0, the
+versions permitted by the pinned PyLate dependency graph; the model metadata's
+recorded build versions are informational and are not installed in production.
 `CUDAExecutionProvider` is the production default. A deployment may explicitly
 select another ONNX Runtime provider that is installed and can execute the FP16
 artifact. Only the selected provider is registered, runtime fallback is
@@ -140,6 +148,11 @@ settings apply only when CUDA is selected.
 | `ONNX_EMBEDDING_CUDA_DEVICE_ID` | `0` |
 | `ONNX_EMBEDDING_OUTPUT_NAME` | `last_hidden_state` |
 | `ONNX_EMBEDDING_DISABLE_CPU_FALLBACK` | `true` |
+| `ONNX_LATE_INTERACTION_MODEL_PATH` | `models/LateOn` |
+| `ONNX_LATE_INTERACTION_FILENAME` | `model_fp16.onnx` |
+| `ONNX_LATE_INTERACTION_MANIFEST_FILENAME` | `onnx-manifest.json` |
+| `ONNX_LATE_INTERACTION_BATCH_SIZE` | `32` |
+| `ONNX_LATE_INTERACTION_CUDA_DEVICE_ID` | `0` |
 | `ONNX_RERANKER_MODEL_PATH` | `models/bge-reranker-v2-m3-onnx` |
 | `ONNX_RERANKER_FILENAME` | `model_fp16.onnx` |
 | `ONNX_RERANKER_MANIFEST_FILENAME` | `onnx-manifest.json` |
@@ -150,7 +163,7 @@ settings apply only when CUDA is selected.
 | `ONNX_RERANKER_OUTPUT_NAME` | `logits` |
 | `ONNX_RERANKER_DISABLE_CPU_FALLBACK` | `true` |
 
-Stage 1 semantic segmentation retains `all-MiniLM-L6-v2`, but loads it only
+Semantic segmentation retains `all-MiniLM-L6-v2`, but loads it only
 from an explicitly provisioned local directory. The loader passes
 `local_files_only=True` and an explicit device; it never resolves the model
 through the Hugging Face network at runtime. Segmentation defaults to CPU and is
@@ -162,10 +175,10 @@ independent of the CUDA ONNX retrieval providers.
 | `SEGMENTATION_MODEL_PATH` | `models/all-MiniLM-L6-v2` |
 | `SEGMENTATION_EMBEDDING_DEVICE` | `cpu` |
 
-Every ready Weaviate collection carries vector profile
-`gte-modernbert-base-e7f32e3-fp16-cls-l2-768-v1`. A missing, stale, or
-`rebuilding` profile fails schema validation. This prevents 1,536-dimensional
-legacy vectors from being queried or mixed with the new 768-dimensional index.
+Every ready Weaviate collection carries the combined immutable LateOn/GTE
+retrieval profile. A missing, stale, or `rebuilding` profile fails schema
+validation, preventing legacy GTE first-stage vectors from being mixed with
+LateOn token matrices.
 
 ---
 
@@ -177,7 +190,7 @@ legacy vectors from being queried or mixed with the new 768-dimensional index.
 | **Intra-Paragraph Chunk Threshold** | `0.76` | Cosine similarity threshold for grouping consecutive sentences within a paragraph. |
 | **Target Chunk Size** | `220 tokens` | Desired token length for each generated semantic chunk. |
 | **Min Chunk Size** | `80 tokens` | Minimum allowed chunk size before merging with adjacent sentence group. |
-| **Max Chunk Size** | `320 tokens` | Hard ceiling on chunk length to prevent embedding information dilution. |
+| **Max Chunk Size** | `300 LateOn model tokens` | Authoritative hard ceiling; oversized input is losslessly subdivided and never truncated. |
 
 ---
 

@@ -9,6 +9,7 @@ import math
 from uuid import UUID
 
 from backend.mappings._common import positive_paragraph_id
+from backend.model_config import LATEON_EMBEDDING_DIMENSION
 from backend.weaviate_client.models import ChunkRecord, PartialParagraphUpdateError
 from backend.wizard.errors import WizardSaveError, WizardSaveRecoveryError
 from backend.wizard.runtime import WizardRuntime, resolve_runtime
@@ -283,6 +284,8 @@ def _validated_multi_vector(value: object) -> tuple[tuple[float, ...], ...]:
         raise ValueError("multi-vector provider must not return an empty matrix")
     if len({len(row) for row in rows}) != 1:
         raise ValueError("multi-vector rows must have consistent dimensions")
+    if len(rows[0]) != LATEON_EMBEDDING_DIMENSION:
+        raise ValueError("LateOn multi-vector rows must have exactly 128 dimensions")
     return rows
 
 

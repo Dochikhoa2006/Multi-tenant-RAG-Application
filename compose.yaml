@@ -41,6 +41,7 @@ services:
       WEAVIATE_GRPC_SECURE: "false"
       ONNX_EMBEDDING_MODEL_PATH: /opt/models/gte-modernbert-base
       ONNX_RERANKER_MODEL_PATH: /opt/models/bge-reranker-v2-m3-onnx
+      ONNX_LATE_INTERACTION_MODEL_PATH: /opt/models/LateOn
       GRANITE_QUERY_REWRITE_MODEL_PATH: /opt/models/merged-granite-4.1-3b-query-rewrite
       SEGMENTATION_EMBEDDING_MODEL: all-MiniLM-L6-v2
       SEGMENTATION_MODEL_PATH: /opt/models/all-MiniLM-L6-v2
@@ -58,6 +59,10 @@ services:
       - type: bind
         source: ${BGE_RERANKER_HOST_PATH:?Set BGE_RERANKER_HOST_PATH in .env}
         target: /opt/models/bge-reranker-v2-m3-onnx
+        read_only: true
+      - type: bind
+        source: ${LATEON_MODEL_HOST_PATH:?Set LATEON_MODEL_HOST_PATH in .env}
+        target: /opt/models/LateOn
         read_only: true
       - type: bind
         source: ${GRANITE_MODEL_HOST_PATH:?Set GRANITE_MODEL_HOST_PATH in .env}

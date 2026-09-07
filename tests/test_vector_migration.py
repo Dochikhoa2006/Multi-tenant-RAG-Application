@@ -223,7 +223,7 @@ def test_populated_collection_blocks_export_before_manifest_or_mutation(
     populated_name = get_collection_name(USER_ID, collection_type)
     collections.values[populated_name].config.value = _legacy_config(populated_name)
 
-    with pytest.raises(VectorMigrationError, match="populated state is unsupported"):
+    with pytest.raises(VectorMigrationError, match="populated legacy data is preserved"):
         _export(manager, tmp_path)
 
     assert not (tmp_path / "vector-migration-manifest.json").exists()
@@ -257,8 +257,8 @@ def test_empty_canonical_triplets_rebuild_and_verify(tmp_path: Path) -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
     assert manifest == {
-        "schema_version": "2.0",
-        "migration_scope": "disposable-empty-prototype-state",
+        "schema_version": "3.0",
+        "migration_scope": "empty-lateon-vector-profile-cutover",
         "mapping_state_preserved": False,
         "embedding_model": EMBEDDING_MODEL,
         "vector_profile": RETRIEVAL_VECTOR_PROFILE,
@@ -296,7 +296,7 @@ def test_objects_added_after_export_block_rebuild_before_mutation(tmp_path: Path
     name = get_collection_name(USER_ID, "knowledge_facts")
     collections.values[name].items.append(object())
 
-    with pytest.raises(VectorMigrationError, match="populated state is unsupported"):
+    with pytest.raises(VectorMigrationError, match="populated legacy data is preserved"):
         _rebuild(manager, tmp_path)
 
     assert collections.deleted == []

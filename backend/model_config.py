@@ -407,11 +407,16 @@ RERANKER_MODEL = _env_string("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
 EMBEDDING_MODEL_REVISION = "e7f32e3c00f91d699e8c43b53106206bcc72bb22"
 RERANKER_MODEL_REVISION = "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"
 EMBEDDING_VECTOR_PROFILE = "gte-modernbert-base-e7f32e3-fp16-cls-l2-768-v1"
+LATEON_MODEL = "lightonai/LateOn"
+LATEON_MODEL_REVISION = "62911e105059585d244384c7d17826e35f669c17"
+LATEON_QUERY_MAX_MODEL_TOKENS = 32
+LATEON_DOCUMENT_MAX_MODEL_TOKENS = 300
+LATEON_EMBEDDING_DIMENSION = 128
 LATE_INTERACTION_VECTOR_NAME = "late_interaction"
 MMR_DIVERSITY_VECTOR_NAME = "mmr_diversity"
-RETRIEVAL_UNIT_MAX_MODEL_TOKENS = 300
+RETRIEVAL_UNIT_MAX_MODEL_TOKENS = LATEON_DOCUMENT_MAX_MODEL_TOKENS
 RETRIEVAL_VECTOR_PROFILE = (
-    "external-late-interaction-maxsim-unbound-v1+"
+    "lateon-62911e1050-fp16-colbert-maxsim-q32-d300-128-v1+"
     f"{EMBEDDING_VECTOR_PROFILE}"
 )
 SEGMENTATION_EMBEDDING_MODEL = _env_string(
@@ -450,6 +455,28 @@ ONNX_EMBEDDING = ONNXModelConfig(
     device_id=_env_nonnegative_int("ONNX_EMBEDDING_CUDA_DEVICE_ID", 0),
     output_name=_env_string("ONNX_EMBEDDING_OUTPUT_NAME", "last_hidden_state"),
     disable_cpu_fallback=_env_bool("ONNX_EMBEDDING_DISABLE_CPU_FALLBACK", True),
+)
+
+ONNX_LATE_INTERACTION = ONNXModelConfig(
+    model_path=_env_string(
+        "ONNX_LATE_INTERACTION_MODEL_PATH",
+        "models/LateOn",
+    ),
+    revision=LATEON_MODEL_REVISION,
+    onnx_filename=_env_string(
+        "ONNX_LATE_INTERACTION_FILENAME",
+        "model_fp16.onnx",
+    ),
+    manifest_filename=_env_string(
+        "ONNX_LATE_INTERACTION_MANIFEST_FILENAME",
+        "onnx-manifest.json",
+    ),
+    max_tokens=LATEON_DOCUMENT_MAX_MODEL_TOKENS,
+    batch_size=_env_int("ONNX_LATE_INTERACTION_BATCH_SIZE", 32),
+    execution_provider="CUDAExecutionProvider",
+    device_id=_env_nonnegative_int("ONNX_LATE_INTERACTION_CUDA_DEVICE_ID", 0),
+    output_name="output",
+    disable_cpu_fallback=True,
 )
 
 ONNX_RERANKER = ONNXModelConfig(
@@ -576,8 +603,12 @@ CHUNKING = ChunkingConfig(
     chunk_threshold=_env_probability("CHUNK_SIMILARITY_THRESHOLD", 0.76),
     target_tokens=_env_int("TARGET_CHUNK_TOKENS", 220),
     min_tokens=_env_int("MIN_CHUNK_TOKENS", 80),
-    max_tokens=_env_int("MAX_CHUNK_TOKENS", 320),
+    max_tokens=_env_int("MAX_CHUNK_TOKENS", RETRIEVAL_UNIT_MAX_MODEL_TOKENS),
 )
+if CHUNKING.max_tokens > RETRIEVAL_UNIT_MAX_MODEL_TOKENS:
+    raise ValueError(
+        "MAX_CHUNK_TOKENS cannot exceed LateOn's 300-model-token document limit"
+    )
 
 TOKEN_BUDGETS = TokenBudgetConfig(
     knowledge_tokens=_env_int("KNOWLEDGE_CONTEXT_TOKENS", 2500),

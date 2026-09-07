@@ -32,9 +32,9 @@ source defaults remain L40S and no automatic GPU switching occurs.
 Production query rewriting uses the merged Granite 4.1-3B checkpoint through an
 always-warm SGLang/Modal CUDA service. Answer streaming and title completion use
 the external `qwen3-4b-awq` checkpoint through a second always-warm SGLang
-worker, with thinking disabled. Dense embeddings and Knowledge/Policy reranking
-run locally from FP16 graphs through reusable ONNX Runtime sessions (CUDA by
-default). See
+worker, with thinking disabled. LateOn token embeddings, dense MMR-diversity
+embeddings, and reranking run locally from reusable FP16 ONNX Runtime CUDA
+sessions. See
 [deployment/README.md](./deployment/README.md).
 
 ## Integrated Development Runtime
@@ -67,8 +67,8 @@ Open <http://localhost:8000/dev/e2e> for the minimal development-only browser
 harness, or <http://localhost:8000/health> for readiness. The fake console
 allows only one active manual chat request and is not the Stage 6 frontend. The Docker profile
 requires Linux/amd64, NVIDIA Container Toolkit, one compatible GPU, provisioned
-FP16 ONNX artifacts, the local Granite checkpoint/tokenizer, and a local copy of
-the Stage 1 segmentation model. Segmentation loads only from
+FP16 GTE, LateOn, and BGE ONNX artifacts, the local Granite checkpoint/tokenizer,
+and a local copy of the segmentation model. Segmentation loads only from
 `SEGMENTATION_MODEL_PATH`, uses `SEGMENTATION_EMBEDDING_DEVICE=cpu` by default,
 and never downloads at runtime. Docker Compose starts Weaviate but deliberately
 does not bundle either SGLang worker.

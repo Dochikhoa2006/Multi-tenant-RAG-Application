@@ -174,9 +174,9 @@ def test_tiny_chunk_merges_with_most_similar_legal_neighbor() -> None:
 
 
 def test_tiny_chunk_remains_when_neither_adjacent_merge_is_legal() -> None:
-    first = _line("First large topic", 300)
+    first = _line("First large topic", 260)
     tiny = _line("Tiny isolated topic", 40)
-    following = _line("Following large topic", 300)
+    following = _line("Following large topic", 260)
     paragraph = f"{first}\n{tiny}\n{following}"
     encoder = SequenceEncoder([[0.0, 1.0], [1.0, 0.0], [0.0, 1.0]])
 
@@ -186,7 +186,7 @@ def test_tiny_chunk_remains_when_neither_adjacent_merge_is_legal() -> None:
         tokenizer=CharacterTokenizer(),
     )
 
-    assert [len(chunk) for chunk in chunks] == [301, 41, 300]
+    assert [len(chunk) for chunk in chunks] == [261, 41, 260]
     assert len(chunks[1]) < CHUNKING.min_tokens
     assert "".join(chunks) == paragraph
     assert all(len(chunk) <= CHUNKING.max_tokens for chunk in chunks)

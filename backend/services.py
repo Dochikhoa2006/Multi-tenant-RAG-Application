@@ -10,6 +10,7 @@ from uuid import uuid4
 from backend.mappings._common import required_uuid, validated_user_id
 from backend.mappings.session_map import SessionMap
 from backend.model_config import EMBEDDING_MODEL
+from backend.processing.chunker import chunk_paragraph
 from backend.rag.pipeline import UserRetrievalCollections
 from backend.rag.runtime import RAGRuntime
 from backend.rag.session_title import validate_session_title
@@ -311,6 +312,11 @@ class AppServices:
                     rag_runtime.multi_vectors
                     if rag_runtime is not None
                     else _UnavailableMultiVectorProvider()
+                ),
+                paragraph_chunker=(
+                    rag_runtime.conversation_segmenter.segment_document
+                    if rag_runtime is not None
+                    else chunk_paragraph
                 ),
             )
         )

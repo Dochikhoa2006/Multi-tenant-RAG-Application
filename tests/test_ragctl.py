@@ -67,13 +67,12 @@ def test_load_dotenv_does_not_evaluate_shell(tmp_path: Path) -> None:
     assert not marker.exists()
 
 
-def test_runtime_secret_contains_exactly_nine_approved_values() -> None:
+def test_runtime_secret_contains_only_the_current_required_values() -> None:
     secret = ragctl.build_runtime_secret(
         _config(), "https://granite.example/v1", "https://qwen.example/v1"
     )
 
     assert tuple(secret) == ragctl.RUNTIME_SECRET_KEYS
-    assert len(secret) == 9
     assert secret["SGLANG_QUERY_REWRITE_API_KEY"] == "wk-private-id.ws-private-secret"
     assert secret["QWEN_SGLANG_API_KEY"] == "wk-private-id.ws-private-secret"
     assert "MODAL_PROXY_TOKEN_ID" not in secret

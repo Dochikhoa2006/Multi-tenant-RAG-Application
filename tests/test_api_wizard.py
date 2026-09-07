@@ -9,12 +9,17 @@ import pytest
 
 from backend.config import TEXT_FILE_JOIN_SEPARATOR
 from backend.main import create_app
+from backend.model_config import LATEON_EMBEDDING_DIMENSION
 from backend.services import AppServices
 from backend.weaviate_client.models import ChunkRecord, DeletionReport
 from backend.wizard.runtime import WizardRuntime
 
 
 USER_ID = "usr_wizard_api"
+
+
+def _lateon_row(value: float) -> list[float]:
+    return [value, *([0.0] * (LATEON_EMBEDDING_DIMENSION - 1))]
 
 
 class FakeManager:
@@ -46,12 +51,12 @@ class FakeEmbedder:
 
 class FakeMultiVectors:
     def encode_query(self, text: str) -> Sequence[Sequence[float]]:
-        return [[0.5, 0.5]]
+        return [_lateon_row(0.5)]
 
     def encode_documents(
         self, texts: Sequence[str]
     ) -> Sequence[Sequence[Sequence[float]]]:
-        return [[[0.5, 0.5]] for _ in texts]
+        return [[_lateon_row(0.5)] for _ in texts]
 
 
 class MemoryChunkCollection:

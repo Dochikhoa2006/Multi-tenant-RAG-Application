@@ -163,11 +163,11 @@ min-max normalization.
 | Knowledge Facts | `50` chunks | BGE → Adaptive-K → MMR (`lambda = 0.70`) | `8` |
 | Policy | `40` chunks | BGE → Adaptive-K → MMR (`lambda = 0.70`) | `5` |
 
-Retrieval units have a contract ceiling of 300 tokens in the external
-late-interaction model's tokenizer and must never be silently truncated. Stage 1
-validates only multi-vector shape and lossless Conversation segment concatenation;
-the real tokenizer-aware provider and segmenter are intentionally deferred to
-Stage 2, so production composition fails closed until both are supplied.
+Retrieval units have a hard ceiling of 300 tokens in the pinned LateOn tokenizer
+and are never silently truncated. Knowledge/Policy keep one lossless semantic
+chunk per object. Oversized canonical Conversation Q+A text is losslessly
+segmented, with every segment pointing to the same `conversation_id`; the
+segments collapse after their single BGE pass.
 
 *(See [CONFIG_SPECS.md](./CONFIG_SPECS.md) for full configuration details.)*
 
@@ -360,17 +360,17 @@ After a Q&A exchange is fully rendered in the chat UI:
 
 1. The backend receives the complete question + answer text.
 2. Concatenate them into a single string.
-3. Generate a vector embedding for the concatenated text.
-4. Create a new record in the Conversation Collection with a new `conversation_id`.
-5. This operation runs asynchronously. The user continues interacting with the chat without delay.
+3. Losslessly segment the canonical text with the pinned LateOn tokenizer.
+4. Generate each segment's LateOn matrix and one canonical GTE diversity vector.
+5. Create the segment records under one new stable `conversation_id`.
+6. This operation runs asynchronously. The user continues interacting with the chat without delay.
 
 ---
 
 ## 6. Text Processing Pipeline
 
-Stage 1 has no required external services or network calls during deterministic
-unit tests. Tests inject deterministic encoders and tokenizers; production
-runtime dependencies and configured model loading remain explicit.
+Deterministic unit tests inject local encoders and tokenizers. Production uses
+only manifest-verified local model artifacts and performs no runtime downloads.
 
 ### 6.1 Semantic Paragraph Splitting
 
@@ -476,7 +476,9 @@ factory calls `create_app(services)` and owns readiness validation and cleanup.
 Uvicorn worker because mappings and queue state are process-local. Model paths,
 endpoints, and credentials remain explicit environment configuration.
 
-The integrated startup also warms the Stage 1 `all-MiniLM-L6-v2` segmentation
-encoder from `SEGMENTATION_MODEL_PATH` with `local_files_only=True` and the
+The integrated startup constructs one shared FP16 CUDA `ONNXLateOnProvider` for
+query/document encoding and exact token-aware lossless segmentation. It also
+warms the `all-MiniLM-L6-v2` semantic segmentation encoder from
+`SEGMENTATION_MODEL_PATH` with `local_files_only=True` and the
 explicit `SEGMENTATION_EMBEDDING_DEVICE` (`cpu` by default). A missing or invalid
 local artifact prevents readiness; runtime model downloads are not permitted.

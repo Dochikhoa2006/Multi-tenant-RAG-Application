@@ -76,6 +76,9 @@ class RecordingMultiVectors:
     ) -> Sequence[Sequence[Sequence[float]]]:
         return [[[1.0]] for _ in texts]
 
+    def segment_document(self, text: str) -> Sequence[str]:
+        return [text]
+
     def close(self) -> None:
         self.events.append("multi_vectors.close")
 
@@ -470,9 +473,25 @@ def test_full_construction_cleanup_preserves_original_when_cleanup_fails() -> No
     ]
 
 
-def test_production_composition_fails_closed_without_stage2_dependencies() -> None:
-    with pytest.raises(RuntimeDependencyError, match="multi-vector provider"):
-        create_runtime_app()
+def test_default_segmenter_reuses_the_single_runtime_multi_vector_provider() -> None:
+    events: list[str] = []
+    provider = RecordingMultiVectors(events)
+    app = create_runtime_app(
+        manager_factory=lambda: RecordingManager(events),
+        task_queue_factory=lambda: RecordingQueue(events),
+        embedding_factory=lambda: RecordingEmbedding(events),
+        reranker_factory=lambda: RecordingReranker(events),
+        multi_vector_factory=lambda: provider,
+        granite_factory=lambda: RecordingGranite(events),
+        qwen_factory=lambda: RecordingQwen(events),
+        tokenizer_factory=RecordingTokenizer,
+        processing_warmup=lambda: None,
+        processing_cleanup=lambda: None,
+        model_endpoint_validator=lambda *args: None,
+    )
 
-    with pytest.raises(RuntimeDependencyError, match="retrieval segmenter"):
-        create_runtime_app(multi_vector_factory=lambda: RecordingMultiVectors([]))
+    assert app.state.services.rag_runtime.multi_vectors is provider
+    assert app.state.services.rag_runtime.conversation_segmenter is provider
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+    assert events.count("multi_vectors.close") == 1

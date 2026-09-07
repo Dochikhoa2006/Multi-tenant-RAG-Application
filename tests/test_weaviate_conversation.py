@@ -18,6 +18,7 @@ from backend.config import (
 from backend.model_config import (
     CONVERSATION_SEARCH,
     HYBRID_SEARCH,
+    LATEON_EMBEDDING_DIMENSION,
     LATE_INTERACTION_VECTOR_NAME,
     MMR_DIVERSITY_VECTOR_NAME,
 )
@@ -49,6 +50,10 @@ EXISTING_COLLECTION_SUBSETS = [
     )
     for mask in range(8)
 ]
+
+
+def _lateon_row(first: float, second: float = 0.0) -> list[float]:
+    return [first, second, *([0.0] * (LATEON_EMBEDDING_DIMENSION - 2))]
 
 
 def _property_config(
@@ -701,7 +706,7 @@ def test_insert_uses_deterministic_segment_uuid_and_both_named_vectors() -> None
         CONVERSATION_ID,
         "Question\nAnswer",
         ["Question\nAnswer"],
-        [[[0.3, 0.7], [0.4, 0.6]]],
+        [[_lateon_row(0.3, 0.7), _lateon_row(0.4, 0.6)]],
         [0.1, 0.2],
     )
 
@@ -718,7 +723,7 @@ def test_insert_uses_deterministic_segment_uuid_and_both_named_vectors() -> None
         },
         uuid=SEGMENT_ID,
         vector={
-            "late_interaction": [[0.3, 0.7], [0.4, 0.6]],
+            "late_interaction": [_lateon_row(0.3, 0.7), _lateon_row(0.4, 0.6)],
             "mmr_diversity": [0.1, 0.2],
         },
     )
@@ -742,7 +747,7 @@ def test_partial_segment_write_is_compensated_before_failure_surfaces() -> None:
             CONVERSATION_ID,
             "onetwo",
             ["one", "two"],
-            [[[0.2]], [[0.3]]],
+            [[_lateon_row(0.2)], [_lateon_row(0.3)]],
             [0.1],
         )
 
@@ -810,7 +815,7 @@ def test_unverified_segment_compensation_surfaces_explicit_recovery_error(
             CONVERSATION_ID,
             "Question\nAnswer",
             ["Question\nAnswer"],
-            [[[0.2]]],
+            [[_lateon_row(0.2)]],
             [0.1],
         )
 
@@ -834,7 +839,7 @@ def test_insert_uuid_mismatch_is_compensated_and_original_error_surfaces() -> No
             CONVERSATION_ID,
             "Question\nAnswer",
             ["Question\nAnswer"],
-            [[[0.2]]],
+            [[_lateon_row(0.2)]],
             [0.1],
         )
 
@@ -971,8 +976,8 @@ def test_hybrid_search_returns_typed_results_and_expected_query() -> None:
                 uuid=UUID(SEGMENT_ID),
                 properties={
                     "user_id": USER_ID,
-                    "conversation_id": CONVERSATION_ID,
-                    "segment_id": SEGMENT_ID,
+                    "conversation_id": UUID(CONVERSATION_ID),
+                    "segment_id": UUID(SEGMENT_ID),
                     "segment_index": 0,
                     "raw_text": "Question\nAnswer",
                     "segment_text": "Question\nAnswer",
@@ -985,7 +990,7 @@ def test_hybrid_search_returns_typed_results_and_expected_query() -> None:
     conversations = ConversationCollection(manager, USER_ID)
 
     results = conversations.hybrid_search(
-        "database indexing", [[0.3, 0.7], [0.2, 0.8]], 40
+        "database indexing", [_lateon_row(0.3, 0.7), _lateon_row(0.2, 0.8)], 40
     )
 
     assert results == [
@@ -1005,7 +1010,7 @@ def test_hybrid_search_returns_typed_results_and_expected_query() -> None:
     ]
     kwargs = collection.query.hybrid.call_args.kwargs
     assert kwargs["query"] == "database indexing"
-    assert kwargs["vector"] == [[0.3, 0.7], [0.2, 0.8]]
+    assert kwargs["vector"] == [_lateon_row(0.3, 0.7), _lateon_row(0.2, 0.8)]
     assert HYBRID_SEARCH.alpha == 0.70
     assert kwargs["alpha"] == 0.70
     assert kwargs["query_properties"] == ["segment_text"]
@@ -1027,7 +1032,7 @@ def test_sdk_errors_are_not_swallowed() -> None:
 
     with pytest.raises(RuntimeError, match="write failed"):
         conversations.insert(
-            CONVERSATION_ID, "content", ["content"], [[[0.2]]], [0.1]
+            CONVERSATION_ID, "content", ["content"], [[_lateon_row(0.2)]], [0.1]
         )
 
 
@@ -1061,7 +1066,7 @@ def test_conversation_uuid_validation_prevents_insert(
 
     with pytest.raises((TypeError, ValueError)):
         conversations.insert(
-            conversation_id, "content", ["content"], [[[0.2]]], [0.1]
+            conversation_id, "content", ["content"], [[_lateon_row(0.2)]], [0.1]
         )  # type: ignore[arg-type]
     collection.data.insert.assert_not_called()
 
@@ -1073,7 +1078,7 @@ def test_conversation_text_validation_prevents_insert(raw_text: str) -> None:
 
     with pytest.raises(ValueError, match="raw_text"):
         conversations.insert(
-            CONVERSATION_ID, raw_text, [raw_text], [[[0.2]]], [0.1]
+            CONVERSATION_ID, raw_text, [raw_text], [[_lateon_row(0.2)]], [0.1]
         )
     collection.data.insert.assert_not_called()
 
@@ -1088,7 +1093,7 @@ def test_conversation_vector_validation_prevents_insert(vector: list[object]) ->
 
     with pytest.raises((TypeError, ValueError)):
         conversations.insert(
-            CONVERSATION_ID, "content", ["content"], [[[0.2]]], vector
+            CONVERSATION_ID, "content", ["content"], [[_lateon_row(0.2)]], vector
         )  # type: ignore[arg-type]
     collection.data.insert.assert_not_called()
 
@@ -1099,7 +1104,7 @@ def test_search_top_k_validation_prevents_query(top_k: object) -> None:
     conversations = ConversationCollection(manager, USER_ID)
 
     with pytest.raises((TypeError, ValueError)):
-        conversations.hybrid_search("query", [[0.1]], top_k)  # type: ignore[arg-type]
+        conversations.hybrid_search("query", [_lateon_row(0.1)], top_k)  # type: ignore[arg-type]
     collection.query.hybrid.assert_not_called()
 
 
@@ -1108,7 +1113,7 @@ def test_collection_search_has_no_native_mmr() -> None:
     collection.query.hybrid.return_value = SimpleNamespace(objects=[])
     conversations = ConversationCollection(manager, USER_ID)
 
-    assert conversations.hybrid_search("query", [[0.1]], 3) == []
+    assert conversations.hybrid_search("query", [_lateon_row(0.1)], 3) == []
 
     kwargs = collection.query.hybrid.call_args.kwargs
     assert kwargs["limit"] == 3
@@ -1118,8 +1123,8 @@ def test_collection_search_has_no_native_mmr() -> None:
 @pytest.mark.parametrize(
     ("query_text", "query_vector"),
     [
-        ("", [[0.1]]),
-        (" \n", [[0.1]]),
+        ("", [_lateon_row(0.1)]),
+        (" \n", [_lateon_row(0.1)]),
         ("query", []),
         ("query", [[float("nan")]]),
         ("query", [[float("-inf")]]),
@@ -1159,7 +1164,7 @@ def test_search_requires_requested_mmr_diversity_vector() -> None:
     conversations = ConversationCollection(manager, USER_ID)
 
     with pytest.raises(WeaviateResponseError, match="MMR-diversity"):
-        conversations.hybrid_search("query", [[0.1]], 40)
+        conversations.hybrid_search("query", [_lateon_row(0.1)], 40)
 
 
 @pytest.mark.parametrize("bad_score", [None, float("nan"), float("inf"), "bad"])
@@ -1185,7 +1190,7 @@ def test_missing_or_malformed_response_scores_are_rejected(bad_score: object) ->
     conversations = ConversationCollection(manager, USER_ID)
 
     with pytest.raises(WeaviateResponseError, match="score"):
-        conversations.hybrid_search("query", [[0.1]], 40)
+        conversations.hybrid_search("query", [_lateon_row(0.1)], 40)
 
 
 def test_cross_user_search_result_is_rejected() -> None:
@@ -1210,7 +1215,7 @@ def test_cross_user_search_result_is_rejected() -> None:
     conversations = ConversationCollection(manager, USER_ID)
 
     with pytest.raises(UserIsolationError, match="user_id"):
-        conversations.hybrid_search("query", [[0.1]], 40)
+        conversations.hybrid_search("query", [_lateon_row(0.1)], 40)
 
 
 @pytest.mark.parametrize(
@@ -1243,7 +1248,7 @@ def test_malformed_or_mismatched_result_ids_are_rejected(
     conversations = ConversationCollection(manager, USER_ID)
 
     with pytest.raises(WeaviateResponseError, match="UUID|segment_id"):
-        conversations.hybrid_search("query", [[0.1]], 40)
+        conversations.hybrid_search("query", [_lateon_row(0.1)], 40)
 
 
 @pytest.mark.parametrize("properties", [None, [], "not-a-mapping"])
@@ -1262,7 +1267,7 @@ def test_malformed_result_properties_are_rejected(properties: object) -> None:
     conversations = ConversationCollection(manager, USER_ID)
 
     with pytest.raises(WeaviateResponseError, match="properties"):
-        conversations.hybrid_search("query", [[0.1]], 40)
+        conversations.hybrid_search("query", [_lateon_row(0.1)], 40)
 
 
 @pytest.mark.parametrize(
@@ -1303,11 +1308,11 @@ def test_every_conversation_operation_uses_only_its_bound_collection(
     conversations = ConversationCollection(manager, user_id)
 
     conversations.insert(
-        CONVERSATION_ID, "content", ["content"], [[[0.2]]], [0.1]
+        CONVERSATION_ID, "content", ["content"], [[_lateon_row(0.2)]], [0.1]
     )
     conversations.delete(CONVERSATION_ID)
     conversations.delete_batch([CONVERSATION_ID])
-    conversations.hybrid_search("query", [[0.1]], 40)
+    conversations.hybrid_search("query", [_lateon_row(0.1)], 40)
 
     assert [call.args[0] for call in client.collections.use.call_args_list] == [
         expected_name,

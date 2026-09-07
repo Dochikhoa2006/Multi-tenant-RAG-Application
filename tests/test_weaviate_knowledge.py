@@ -7,6 +7,7 @@ from uuid import UUID
 import pytest
 
 from backend.config import get_collection_name
+from backend.model_config import LATEON_EMBEDDING_DIMENSION
 from backend.weaviate_client.client import WeaviateManager
 from backend.weaviate_client.knowledge import KnowledgeCollection
 from backend.weaviate_client.models import (
@@ -23,6 +24,10 @@ DOCUMENT_ID = "10000000-0000-0000-0000-000000000001"
 CHUNK_ID = "20000000-0000-0000-0000-000000000001"
 SECOND_CHUNK_ID = "20000000-0000-0000-0000-000000000002"
 THIRD_CHUNK_ID = "20000000-0000-0000-0000-000000000003"
+
+
+def _lateon_row(first: float, second: float = 0.0) -> list[float]:
+    return [first, second, *([0.0] * (LATEON_EMBEDDING_DIMENSION - 2))]
 
 
 def _manager_and_collection() -> tuple[WeaviateManager, MagicMock, MagicMock]:
@@ -78,7 +83,7 @@ def test_insert_chunk_uses_chunk_id_as_uuid() -> None:
         2,
         CHUNK_ID,
         "  Exact chunk text.\n",
-        [[0.3, 0.7], [0.4, 0.6]],
+        [_lateon_row(0.3, 0.7), _lateon_row(0.4, 0.6)],
         [0.1, 0.9],
     )
 
@@ -96,7 +101,7 @@ def test_insert_chunk_uses_chunk_id_as_uuid() -> None:
         },
         uuid=CHUNK_ID,
         vector={
-            "late_interaction": [[0.3, 0.7], [0.4, 0.6]],
+            "late_interaction": [_lateon_row(0.3, 0.7), _lateon_row(0.4, 0.6)],
             "mmr_diversity": [0.1, 0.9],
         },
     )
@@ -186,7 +191,7 @@ def test_policy_uses_separate_collection_with_same_interface() -> None:
     policy = PolicyCollection(manager, USER_ID)
 
     policy.insert_chunk(
-        DOCUMENT_ID, 1, CHUNK_ID, "Policy text", [[0.4, 0.6]], [0.2, 0.8]
+        DOCUMENT_ID, 1, CHUNK_ID, "Policy text", [_lateon_row(0.4, 0.6)], [0.2, 0.8]
     )
 
     client.collections.use.assert_called_once_with(get_collection_name(USER_ID, "policy"))
@@ -227,7 +232,7 @@ def test_knowledge_hybrid_search_keeps_collection_result_order() -> None:
     )
     knowledge = KnowledgeCollection(manager, USER_ID)
 
-    results = knowledge.hybrid_search("query", [[0.5, 0.5]], 50)
+    results = knowledge.hybrid_search("query", [_lateon_row(0.5, 0.5)], 50)
 
     assert [item.object_id for item in results] == [CHUNK_ID, SECOND_CHUNK_ID]
     assert [item.vector for item in results] == [(0.1, 0.2), (0.2, 0.1)]
@@ -316,13 +321,13 @@ def _snapshot_object(chunk_id: str = CHUNK_ID, paragraph_id: int = 2) -> SimpleN
         uuid=UUID(chunk_id),
         properties={
             "user_id": USER_ID,
-            "document_id": DOCUMENT_ID,
+            "document_id": UUID(DOCUMENT_ID),
             "paragraph_id": paragraph_id,
-            "chunk_id": chunk_id,
+            "chunk_id": UUID(chunk_id),
             "raw_text": "exact text",
         },
         vector={
-            "late_interaction": [[0.3, 0.7]],
+            "late_interaction": [_lateon_row(0.3, 0.7)],
             "mmr_diversity": [0.2, 0.8],
         },
     )
@@ -346,7 +351,7 @@ def test_snapshot_by_paragraphs_returns_complete_recoverable_records() -> None:
             2,
             CHUNK_ID,
             "exact text",
-            ((0.3, 0.7),),
+            (tuple(_lateon_row(0.3, 0.7)),),
             (0.2, 0.8),
         ),
     )
@@ -377,7 +382,7 @@ def test_restore_chunks_inserts_missing_records_then_verifies_exact_state() -> N
         2,
         CHUNK_ID,
         "exact text",
-        ((0.3, 0.7),),
+        (tuple(_lateon_row(0.3, 0.7)),),
         (0.2, 0.8),
     )
     collection.query.fetch_objects_by_ids.side_effect = [
@@ -422,7 +427,7 @@ def test_chunk_paragraph_validation_prevents_insert(paragraph_id: object) -> Non
             paragraph_id,  # type: ignore[arg-type]
             CHUNK_ID,
             "content",
-            [[0.2]],
+            [_lateon_row(0.2)],
             [0.1],
         )
     collection.data.insert.assert_not_called()
@@ -440,7 +445,7 @@ def test_chunk_uuid_validation_prevents_insert(
     knowledge = KnowledgeCollection(manager, USER_ID)
 
     with pytest.raises(ValueError, match="UUID"):
-        knowledge.insert_chunk(document_id, 1, chunk_id, "content", [[0.2]], [0.1])
+        knowledge.insert_chunk(document_id, 1, chunk_id, "content", [_lateon_row(0.2)], [0.1])
     collection.data.insert.assert_not_called()
 
 
@@ -457,7 +462,7 @@ def test_chunk_content_validation_prevents_insert(
     knowledge = KnowledgeCollection(manager, USER_ID)
 
     with pytest.raises((TypeError, ValueError)):
-        knowledge.insert_chunk(DOCUMENT_ID, 1, CHUNK_ID, raw_text, [[0.2]], vector)
+        knowledge.insert_chunk(DOCUMENT_ID, 1, CHUNK_ID, raw_text, [_lateon_row(0.2)], vector)
     collection.data.insert.assert_not_called()
 
 
@@ -542,11 +547,11 @@ def test_every_chunk_operation_uses_only_its_bound_collection(
     client.collections.use.reset_mock()
     chunks = collection_class(manager, user_id)
 
-    chunks.insert_chunk(DOCUMENT_ID, 1, CHUNK_ID, "content", [[0.2]], [0.1])
+    chunks.insert_chunk(DOCUMENT_ID, 1, CHUNK_ID, "content", [_lateon_row(0.2)], [0.1])
     chunks.delete_by_document(DOCUMENT_ID)
     chunks.delete_by_paragraphs(DOCUMENT_ID, [1])
     chunks.update_paragraph_ids({CHUNK_ID: 2})
-    chunks.hybrid_search("query", [[0.1]], 20)
+    chunks.hybrid_search("query", [_lateon_row(0.1)], 20)
 
     assert [call.args[0] for call in client.collections.use.call_args_list] == [
         expected_name,

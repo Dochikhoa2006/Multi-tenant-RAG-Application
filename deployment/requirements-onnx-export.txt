@@ -1,6 +1,9 @@
 # Isolated provisioning environment only; never installed in the API runtime.
-optimum==2.3.0
+optimum==2.1.0
 optimum-onnx==0.1.0
-transformers==4.57.3
-torch==2.9.1
+transformers==4.56.2
+sentence-transformers==5.1.1
+torch==2.8.0
 onnx==1.19.1
+pylate @ git+https://github.com/lightonai/pylate.git@b1453fda370137f14e02fc907e388f2532b4343b
+onnxruntime-gpu[cuda,cudnn]==1.29.0 ; sys_platform == "linux" and platform_machine == "x86_64"

@@ -46,6 +46,8 @@ def test_modal_runtime_keeps_cuda_and_one_worker_contracts() -> None:
     assert 'COMPUTE_REGION = os.getenv("MODAL_RAG_COMPUTE_REGION", "us")' in source
     assert '"ONNX_EMBEDDING_EXECUTION_PROVIDER": "CUDAExecutionProvider"' in source
     assert '"ONNX_EMBEDDING_DISABLE_CPU_FALLBACK": "true"' in source
+    assert 'LATEON_MODEL_PATH = RUNTIME_MODEL_ROOT / "LateOn"' in source
+    assert '"ONNX_LATE_INTERACTION_CUDA_DEVICE_ID": "0"' in source
     assert '"ONNX_RERANKER_EXECUTION_PROVIDER": "CUDAExecutionProvider"' in source
     assert '"ONNX_RERANKER_DISABLE_CPU_FALLBACK": "true"' in source
     assert "workers=1" in source

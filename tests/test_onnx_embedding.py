@@ -10,11 +10,21 @@ import numpy as np
 import pytest
 
 import backend.providers.onnx_embedding as onnx_embedding
-from backend.model_config import EMBEDDING_MODEL, EMBEDDING_MODEL_REVISION, ONNXModelConfig
+import scripts.create_onnx_manifest as onnx_manifest
+from backend.model_config import (
+    EMBEDDING_MODEL,
+    EMBEDDING_MODEL_REVISION,
+    LATEON_EMBEDDING_DIMENSION,
+    LATEON_MODEL,
+    LATEON_MODEL_REVISION,
+    ONNXModelConfig,
+)
 from backend.providers.onnx_embedding import (
     EMBEDDING_DIMENSION,
     ONNXEmbeddingClient,
     ONNXEmbeddingError,
+    ONNXLateOnError,
+    ONNXLateOnProvider,
 )
 
 
@@ -59,6 +69,135 @@ def _config(
         output_name="last_hidden_state",
         disable_cpu_fallback=True,
     )
+
+
+def _lateon_artifacts(root: Path) -> None:
+    skiplist = list(onnx_embedding._LATEON_SKIPLIST)
+    files = {
+        "model_fp16.onnx": b"fp16-onnx",
+        "config.json": b"{}",
+        "special_tokens_map.json": b"{}",
+        "tokenizer.json": b"{}",
+        "tokenizer_config.json": b"{}",
+        "onnx_config.json": json.dumps(
+            {
+                "model_type": "ColBERT",
+                "uses_token_type_ids": False,
+                "query_prefix": "[Q] ",
+                "document_prefix": "[D] ",
+                "query_length": 32,
+                "document_length": 300,
+                "do_query_expansion": False,
+                "attend_to_expansion_tokens": False,
+                "embedding_dim": 128,
+                "query_prefix_id": 50368,
+                "document_prefix_id": 50369,
+                "mask_token_id": 50284,
+                "pad_token_id": 50284,
+                "do_lower_case": False,
+                "skiplist_words": skiplist,
+            }
+        ).encode(),
+        "config_sentence_transformers.json": json.dumps(
+            {
+                "model_type": "ColBERT",
+                "query_prefix": "[Q] ",
+                "document_prefix": "[D] ",
+                "query_length": 32,
+                "document_length": 300,
+                "do_query_expansion": False,
+                "attend_to_expansion_tokens": False,
+                "similarity_fn_name": "MaxSim",
+                "skiplist_words": skiplist,
+            }
+        ).encode(),
+    }
+    for name, contents in files.items():
+        (root / name).write_bytes(contents)
+    manifest = {
+        "schema_version": "1.0",
+        "model_id": LATEON_MODEL,
+        "revision": LATEON_MODEL_REVISION,
+        "files": {
+            name: hashlib.sha256(contents).hexdigest()
+            for name, contents in files.items()
+        },
+    }
+    (root / "onnx-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def _lateon_config(root: Path, *, batch_size: int = 2) -> ONNXModelConfig:
+    return ONNXModelConfig(
+        model_path=str(root),
+        revision=LATEON_MODEL_REVISION,
+        onnx_filename="model_fp16.onnx",
+        manifest_filename="onnx-manifest.json",
+        max_tokens=300,
+        batch_size=batch_size,
+        execution_provider="CUDAExecutionProvider",
+        device_id=0,
+        output_name="output",
+        disable_cpu_fallback=True,
+    )
+
+
+class FakeLateOnTokenizer:
+    pad_token_id = 50284
+
+    def __init__(self, *, document_tokens: int = 3) -> None:
+        self.document_tokens = document_tokens
+        self.calls: list[tuple[object, dict[str, object]]] = []
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        if token == "[Q] ":
+            return 50368
+        if token == "[D] ":
+            return 50369
+        return 40000 + onnx_embedding._LATEON_SKIPLIST.index(token)
+
+    def __call__(self, texts: object, **kwargs: object) -> dict[str, object]:
+        self.calls.append((texts, dict(kwargs)))
+        if isinstance(texts, str):
+            count = self.document_tokens
+            return {"input_ids": [50281, *range(100, 100 + count), 50282]}
+        values = list(texts)  # type: ignore[arg-type]
+        sequences = [[50281, 100 + index, 50282] for index, _ in enumerate(values)]
+        width = max(len(item) for item in sequences)
+        ids = np.full((len(values), width), self.pad_token_id, dtype=np.int64)
+        mask = np.zeros_like(ids)
+        for index, sequence in enumerate(sequences):
+            ids[index, : len(sequence)] = sequence
+            mask[index, : len(sequence)] = 1
+        return {"input_ids": ids, "attention_mask": mask}
+
+
+class FakeLateOnSession:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, np.ndarray]] = []
+        self.disable_fallback_calls = 0
+
+    def get_inputs(self) -> list[object]:
+        return [
+            SimpleNamespace(name="input_ids", type="tensor(int64)"),
+            SimpleNamespace(name="attention_mask", type="tensor(int64)"),
+        ]
+
+    def get_outputs(self) -> list[object]:
+        return [SimpleNamespace(name="output", type="tensor(float16)")]
+
+    def get_providers(self) -> list[str]:
+        return ["CUDAExecutionProvider"]
+
+    def disable_fallback(self) -> None:
+        self.disable_fallback_calls += 1
+
+    def run(self, names: list[str], feed: dict[str, np.ndarray]) -> list[object]:
+        assert names == ["output"]
+        self.calls.append(feed)
+        batch, tokens = feed["input_ids"].shape
+        output = np.zeros((batch, tokens, LATEON_EMBEDDING_DIMENSION), dtype=np.float16)
+        output[:, :, 0] = 1.0
+        return [output]
 
 
 class FakeTokenizer:
@@ -318,3 +457,198 @@ def test_embedding_requires_configured_provider_and_exact_model(tmp_path: Path) 
     )
     with pytest.raises(ValueError, match="does not match"):
         client.embed("text", model="some-other-model")
+
+
+def test_lateon_reuses_one_session_batches_and_preserves_document_order(
+    tmp_path: Path,
+) -> None:
+    _lateon_artifacts(tmp_path)
+    tokenizer = FakeLateOnTokenizer()
+    session = FakeLateOnSession()
+    provider = ONNXLateOnProvider(
+        _lateon_config(tmp_path, batch_size=2),
+        tokenizer=tokenizer,
+        session=session,
+        warmup=False,
+    )
+
+    documents = provider.encode_documents([" first ", "second", "third"])
+    query = provider.encode_query(" query ")
+
+    assert len(documents) == 3
+    assert len(session.calls) == 3
+    assert all(len(row) == LATEON_EMBEDDING_DIMENSION for matrix in documents for row in matrix)
+    assert all(np.linalg.norm(row) == pytest.approx(1.0) for matrix in documents for row in matrix)
+    assert session.calls[0]["input_ids"][:, 1].tolist() == [50369, 50369]
+    assert session.calls[1]["input_ids"][:, 1].tolist() == [50369]
+    assert session.calls[2]["input_ids"][:, 1].tolist() == [50368]
+    assert len(query[0]) == LATEON_EMBEDDING_DIMENSION
+    assert session.disable_fallback_calls == 1
+    batch_calls = [call for call in tokenizer.calls if isinstance(call[0], list)]
+    assert batch_calls[0] == (
+        ["first", "second"],
+        {
+            "add_special_tokens": True,
+            "padding": True,
+            "truncation": "longest_first",
+            "max_length": 299,
+            "return_tensors": "np",
+        },
+    )
+    assert batch_calls[-1][1]["max_length"] == 31
+
+
+def test_lateon_golden_prefix_special_token_and_retained_mask_contract(
+    tmp_path: Path,
+) -> None:
+    _lateon_artifacts(tmp_path)
+    tokenizer = FakeLateOnTokenizer()
+    session = FakeLateOnSession()
+    provider = ONNXLateOnProvider(
+        _lateon_config(tmp_path),
+        tokenizer=tokenizer,
+        session=session,
+        warmup=False,
+    )
+
+    provider.encode_query("  query  ")
+    provider.encode_documents(["  document  "])
+
+    assert session.calls[0]["input_ids"].tolist() == [[50281, 50368, 100, 50282]]
+    assert session.calls[0]["attention_mask"].tolist() == [[1, 1, 1, 1]]
+    assert session.calls[1]["input_ids"].tolist() == [[50281, 50369, 100, 50282]]
+    assert session.calls[1]["attention_mask"].tolist() == [[1, 1, 1, 1]]
+
+
+def test_lateon_rejects_oversized_documents_before_onnx_inference(
+    tmp_path: Path,
+) -> None:
+    _lateon_artifacts(tmp_path)
+    tokenizer = FakeLateOnTokenizer(document_tokens=298)
+    session = FakeLateOnSession()
+    provider = ONNXLateOnProvider(
+        _lateon_config(tmp_path),
+        tokenizer=tokenizer,
+        session=session,
+        warmup=False,
+    )
+
+    with pytest.raises(ONNXLateOnError, match="300-model-token"):
+        provider.encode_documents(["oversized"])
+    assert session.calls == []
+
+
+def test_lateon_artifacts_are_pinned_and_hash_verified(tmp_path: Path) -> None:
+    _lateon_artifacts(tmp_path)
+    (tmp_path / "onnx_config.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ONNXLateOnError, match="hash verification"):
+        ONNXLateOnProvider(
+            _lateon_config(tmp_path),
+            tokenizer=FakeLateOnTokenizer(),
+            session=FakeLateOnSession(),
+            warmup=False,
+        )
+
+
+def test_lateon_constructs_cuda_only_with_recovery_disabled_and_validates_placement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _lateon_artifacts(tmp_path)
+    session = FakeLateOnSession()
+    captured: dict[str, object] = {}
+
+    class FakeSessionOptions:
+        def __init__(self) -> None:
+            self.entries: dict[str, str] = {}
+
+        def add_session_config_entry(self, name: str, value: str) -> None:
+            self.entries[name] = value
+
+    def session_factory(path: str, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return session
+
+    fake_runtime = SimpleNamespace(
+        SessionOptions=FakeSessionOptions,
+        InferenceSession=session_factory,
+        get_available_providers=lambda: ["CUDAExecutionProvider"],
+    )
+    placement: dict[str, object] = {}
+
+    def validate(*args: object, **kwargs: object) -> object:
+        placement.update(kwargs)
+        return SimpleNamespace(cpu_count=2, cpu_operators=(("Shape", 2),))
+
+    monkeypatch.setitem(sys.modules, "onnxruntime", fake_runtime)
+    monkeypatch.setattr(
+        onnx_embedding, "_EXPECTED_LATEON_CPU_ASSIGNMENT_SHA256", "verified-digest"
+    )
+    monkeypatch.setattr(onnx_embedding, "validate_cuda_placement", validate)
+
+    ONNXLateOnProvider(
+        _lateon_config(tmp_path),
+        tokenizer=FakeLateOnTokenizer(),
+        warmup=False,
+    )
+
+    assert captured["providers"] == [
+        ("CUDAExecutionProvider", {"device_id": "0"})
+    ]
+    assert captured["enable_fallback"] is False
+    assert captured["sess_options"].entries == {
+        "session.record_ep_graph_assignment_info": "1"
+    }
+    assert placement["expected_cpu_digest"] == "verified-digest"
+    assert placement["required_cuda_operators"] == frozenset({"MatMul", "Softmax"})
+    assert session.disable_fallback_calls == 1
+
+
+def test_lateon_production_cpu_assignment_is_bound_to_profiled_graph() -> None:
+    assert onnx_embedding._EXPECTED_LATEON_CPU_ASSIGNMENT_SHA256 == (
+        "53dbd9af5e31b81d735e0d7bc26118edff611a0b430627b0c3f87663a9f7a2a3"
+    )
+
+
+def test_generic_onnx_manifest_cli_behavior_remains_compatible(tmp_path: Path) -> None:
+    artifact = tmp_path / "model.onnx"
+    artifact.write_bytes(b"generic")
+
+    manifest_path = onnx_manifest.create_manifest(
+        tmp_path, "example/model", "immutable-revision"
+    )
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest == {
+        "schema_version": "1.0",
+        "model_id": "example/model",
+        "revision": "immutable-revision",
+        "files": {"model.onnx": hashlib.sha256(b"generic").hexdigest()},
+    }
+
+
+def test_lateon_provisioning_metadata_requires_exact_pinned_fp32_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _lateon_artifacts(tmp_path)
+    (tmp_path / "model.onnx").write_bytes(b"published-fp32")
+    (tmp_path / "model.safetensors").write_bytes(b"weights")
+    (tmp_path / "modules.json").write_text("[]", encoding="utf-8")
+    (tmp_path / "sentence_bert_config.json").write_text("{}", encoding="utf-8")
+    for directory in ("1_Dense", "2_Dense", "3_Dense"):
+        path = tmp_path / directory
+        path.mkdir()
+        (path / "config.json").write_text("{}", encoding="utf-8")
+        (path / "model.safetensors").write_bytes(b"weights")
+    monkeypatch.setattr(
+        onnx_manifest,
+        "_LATEON_FP32_SHA256",
+        hashlib.sha256(b"published-fp32").hexdigest(),
+    )
+
+    metadata = onnx_manifest._validate_lateon_metadata(tmp_path)
+    assert metadata["embedding_dim"] == 128
+
+    (tmp_path / "model.onnx").write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="FP32 model.onnx SHA256"):
+        onnx_manifest._validate_lateon_metadata(tmp_path)

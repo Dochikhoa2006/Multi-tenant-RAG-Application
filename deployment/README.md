@@ -2,7 +2,7 @@
 
 The no-GCP E2E topology uses three Modal services. Two dedicated SGLang 0.5.18
 CUDA services run Granite and Qwen, while a private singleton Modal Server runs
-the integrated FastAPI, GTE ONNX, and BGE ONNX runtime. Granite handles only
+the integrated FastAPI, GTE ONNX, LateOn ONNX, and BGE ONNX runtime. Granite handles only
 query rewriting. The separate `qwen3-4b-awq` worker handles non-thinking answer
 streaming and title completion through the existing `RoleRoutingLLMClient`.
 Weaviate runs outside Modal so mutable database files are never placed on a
@@ -41,11 +41,16 @@ python scripts/create_onnx_manifest.py \
   models/bge-reranker-v2-m3-onnx \
   BAAI/bge-reranker-v2-m3 \
   953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e
+
+# Run in the isolated CUDA provisioning environment. This downloads only the
+# immutable LateOn revision, verifies the published FP32 SHA256, checks pinned
+# PyLate/FP32/FP16 token and MaxSim parity, and atomically publishes only the
+# accepted production files.
+python scripts/create_onnx_manifest.py provision-lateon models/LateOn
 ```
 
-Before deployment, run the opt-in offline CUDA smoke test. It checks the GTE
-768-dimensional normalized output and BGE pair-ranking contract without any
-network access:
+Before deployment, run the opt-in offline CUDA smoke test. It checks GTE,
+LateOn, and BGE output/ranking contracts without any network access:
 
 ```bash
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 RUN_ONNX_CUDA_TESTS=1 \
@@ -77,7 +82,7 @@ attention-mask construction nodes. Operator-name allowlisting alone is not
 used, so an embedding Gather or other meaningful compute node moving to CPU
 cannot be silently accepted.
 
-Stage 1 segmentation separately loads `all-MiniLM-L6-v2` from the required
+Semantic segmentation separately loads `all-MiniLM-L6-v2` from the required
 `SEGMENTATION_MODEL_PATH` with `local_files_only=True`. Its explicit
 `SEGMENTATION_EMBEDDING_DEVICE` defaults to `cpu`; no Hugging Face download is
 allowed during API startup. The Docker profile mounts the provisioned directory
@@ -292,12 +297,14 @@ modal volume put rag-runtime-models \
 modal volume put rag-runtime-models \
   models/bge-reranker-v2-m3-onnx /bge-reranker-v2-m3-onnx
 modal volume put rag-runtime-models \
+  models/LateOn /LateOn
+modal volume put rag-runtime-models \
   models/all-MiniLM-L6-v2 /all-MiniLM-L6-v2
 modal volume ls rag-runtime-models
 ```
 
-Create `rag-runtime-secrets` with exactly these secret values; do not upload the
-whole local `.env`:
+Create `rag-runtime-secrets` with the following required values; do not upload
+the whole local `.env`:
 
 ```text
 WEAVIATE_URL

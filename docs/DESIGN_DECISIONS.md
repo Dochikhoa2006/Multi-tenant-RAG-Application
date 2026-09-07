@@ -68,6 +68,24 @@ the reranker returns descending raw logits with original result indices.
 Runtime model downloads, remote code, CPU fallback, and paid embedding or
 reranking calls are deliberately prohibited.
 
+First-stage semantic retrieval uses `lightonai/LateOn` at immutable revision
+`62911e105059585d244384c7d17826e35f669c17`. Its normalized 128-dimensional
+token vectors execute through one reusable FP16 ONNX Runtime CUDA session and
+Weaviate applies MaxSim inside native hybrid search with BM25. Pinned PyLate
+1.3.4 is provisioning-only parity reference code, never a production retrieval
+dependency. GTE remains solely the persisted document/document diversity vector
+for application MMR.
+
+The parity-gated FP16 graph was profiled with ONNX Runtime 1.29 on an NVIDIA
+H100. All 1,563 model-compute nodes execute on CUDA, including 139 `MatMul`, 22
+`Softmax`, and 90 `ReduceMean` nodes. The exact 368-node CPU fingerprint contains
+only integer shape/control operations and scalar sequence-length casts; no
+floating non-scalar model tensor is assigned to CPU. Startup rejects any change
+to that fingerprint. Batch 32 was retained after p95 measurements for batches
+8/16/32 (40.800/31.211/30.587 ms for 32 representative documents). I/O Binding
+was rejected because its 8.702 ms p95 did not improve on `session.run` at 8.688
+ms, despite exact output parity.
+
 The embedding-space change cannot preserve an existing populated prototype:
 its session, transcript/title, document, paragraph, and chunk-ownership maps
 are process-local and disappear when FastAPI stops. The supplied maintenance
