@@ -38,6 +38,68 @@ def _validated_vector(value: object) -> list[float]:
     return vector
 
 
+def _validated_multi_vector(value: object) -> list[list[float]]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise TypeError("multi-vector provider must return a sequence of vectors")
+    rows = [_validated_vector(row) for row in value]
+    if not rows:
+        raise ValueError("multi-vector provider must not return an empty matrix")
+    if len({len(row) for row in rows}) != 1:
+        raise ValueError("multi-vector rows must have consistent dimensions")
+    return rows
+
+
+def encode_query(
+    text: str,
+    *,
+    runtime: RAGRuntime | None = None,
+) -> list[list[float]]:
+    value = _required_text(text, "text")
+    active_runtime = resolve_runtime(runtime)
+    return _validated_multi_vector(active_runtime.multi_vectors.encode_query(value))
+
+
+def encode_documents(
+    texts: Sequence[str],
+    *,
+    runtime: RAGRuntime | None = None,
+) -> list[list[list[float]]]:
+    if isinstance(texts, (str, bytes)) or not isinstance(texts, Sequence):
+        raise TypeError("texts must be a sequence of strings")
+    validated = [_required_text(text, "document") for text in texts]
+    if not validated:
+        return []
+    active_runtime = resolve_runtime(runtime)
+    raw = active_runtime.multi_vectors.encode_documents(validated)
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
+        raise TypeError("multi-vector provider must return a sequence of matrices")
+    if len(raw) != len(validated):
+        raise ValueError("multi-vector provider returned the wrong document count")
+    matrices = [_validated_multi_vector(matrix) for matrix in raw]
+    dimensions = {len(row) for matrix in matrices for row in matrix}
+    if len(dimensions) != 1:
+        raise ValueError("document multi-vectors must have consistent dimensions")
+    return matrices
+
+
+def conversation_segments(
+    text: str,
+    *,
+    runtime: RAGRuntime | None = None,
+) -> list[str]:
+    canonical = _required_text(text, "text")
+    active_runtime = resolve_runtime(runtime)
+    raw = active_runtime.conversation_segmenter.segment_document(canonical)
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
+        raise TypeError("conversation segmenter must return a sequence of strings")
+    segments = [_required_text(item, "conversation segment") for item in raw]
+    if not segments:
+        raise ValueError("conversation segmenter must return at least one segment")
+    if "".join(segments) != canonical:
+        raise ValueError("conversation segments must reconstruct canonical text exactly")
+    return segments
+
+
 def embed_text(
     text: str,
     *,
@@ -116,10 +178,20 @@ async def embed_conversation(
     active_runtime = resolve_runtime(runtime)
     raw_text = f"Question:\n{question_text}\n\nAnswer:\n{answer_text}"
 
-    vector = await asyncio.to_thread(
-        embed_text,
-        raw_text,
-        runtime=active_runtime,
+    segments = await asyncio.to_thread(
+        conversation_segments, raw_text, runtime=active_runtime
+    )
+    segment_vectors, diversity_vector = await asyncio.gather(
+        asyncio.to_thread(
+            encode_documents,
+            segments,
+            runtime=active_runtime,
+        ),
+        asyncio.to_thread(
+            embed_text,
+            raw_text,
+            runtime=active_runtime,
+        ),
     )
 
     def insert() -> None:
@@ -127,7 +199,9 @@ async def embed_conversation(
         collection.insert(
             conversation,
             raw_text,
-            vector,
+            segments,
+            segment_vectors,
+            diversity_vector,
         )
 
     await asyncio.to_thread(insert)
@@ -135,6 +209,9 @@ async def embed_conversation(
 
 __all__ = [
     "embed_chunks",
+    "encode_documents",
+    "encode_query",
+    "conversation_segments",
     "embed_conversation",
     "embed_conversation_background",
     "embed_text",

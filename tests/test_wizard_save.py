@@ -49,11 +49,25 @@ class RecordingEmbedder:
         return [self.vector for _ in texts]
 
 
+class RecordingMultiVectors:
+    def __init__(self, events: list[tuple[object, ...]]) -> None:
+        self.events = events
+
+    def encode_query(self, text: str) -> Sequence[Sequence[float]]:
+        return [[0.5, 0.5]]
+
+    def encode_documents(
+        self, texts: Sequence[str]
+    ) -> Sequence[Sequence[Sequence[float]]]:
+        self.events.append(("encode_documents", tuple(texts)))
+        return [[[0.6, 0.4]] for _ in texts]
+
+
 class RecordingCollection:
     def __init__(self, events: list[tuple[object, ...]]) -> None:
         self.events = events
         self.deleted_unions: list[tuple[int, ...]] = []
-        self.inserted: list[tuple[str, int, str, str, tuple[float, ...]]] = []
+        self.inserted: list[tuple[object, ...]] = []
         self.updated: list[dict[str, int]] = []
         self.fail_insert = False
         self.fail_insert_after: int | None = None
@@ -80,6 +94,7 @@ class RecordingCollection:
                     paragraph_id,
                     chunk_id,
                     paragraph_data[paragraph_id],
+                    ((0.3, 0.7),),
                     (0.1, 0.2),
                 )
 
@@ -155,14 +170,16 @@ class RecordingCollection:
         paragraph_id: int,
         chunk_id: str,
         raw_text: str,
-        vector: Sequence[float],
+        multi_vector: Sequence[Sequence[float]],
+        diversity_vector: Sequence[float],
     ) -> str:
         record = (
             document_id,
             paragraph_id,
             chunk_id,
             raw_text,
-            tuple(vector),
+            tuple(tuple(row) for row in multi_vector),
+            tuple(diversity_vector),
         )
         self.events.append(("insert", paragraph_id, chunk_id, raw_text))
         self.insert_attempts += 1
@@ -179,7 +196,8 @@ class RecordingCollection:
             paragraph_id,
             chunk_id,
             raw_text,
-            tuple(vector),
+            tuple(tuple(row) for row in multi_vector),
+            tuple(diversity_vector),
         )
         if self.ambiguous_insert_at == self.insert_attempts:
             self.ambiguous_insert_at = None
@@ -209,14 +227,16 @@ class RecordingCollection:
                             paragraph_id,
                             record.chunk_id,
                             record.raw_text,
-                            record.vector,
+                            record.late_interaction,
+                            record.mmr_diversity,
                         )
                         self.mutate_failed_update = False
                     raise PartialParagraphUpdateError(tuple(completed), chunk_id)
                 record = self.records[chunk_id]
                 self.records[chunk_id] = ChunkRecord(
                     record.object_id, record.user_id, record.document_id,
-                    paragraph_id, record.chunk_id, record.raw_text, record.vector,
+                    paragraph_id, record.chunk_id, record.raw_text,
+                    record.late_interaction, record.mmr_diversity,
                 )
                 completed.append(chunk_id)
             return
@@ -230,7 +250,8 @@ class RecordingCollection:
                 paragraph_id,
                 record.chunk_id,
                 record.raw_text,
-                record.vector,
+                record.late_interaction,
+                record.mmr_diversity,
             )
 
 
@@ -257,6 +278,7 @@ def _runtime(
     runtime = WizardRuntime(
         MagicMock(),
         RecordingEmbedder(events, embedding_vector),
+        multi_vectors=RecordingMultiVectors(events),
         paragraph_splitter=splitter,
         paragraph_chunker=chunker,
         uuid_factory=UUIDSequence(new_chunk_ids),
@@ -307,11 +329,19 @@ def test_single_modified_paragraph_runs_all_steps_and_commits() -> None:
         "delete",
         "split",
         "chunk",
+        "encode_documents",
         "embed_many",
         "insert",
     ]
     assert collection.inserted == [
-        (DOCUMENT_ID, 1, new_chunk_id, "new text", (0.25, 0.75))
+        (
+            DOCUMENT_ID,
+            1,
+            new_chunk_id,
+            "new text",
+            ((0.6, 0.4),),
+            (0.25, 0.75),
+        )
     ]
     assert collection.updated == []
     assert runtime.document_map(
@@ -692,7 +722,9 @@ def test_embedder_single_and_batch_apis_share_implementation() -> None:
             return [self.embed(text) for text in texts]
 
     embedder = SharedEmbedder()
-    runtime = WizardRuntime(MagicMock(), embedder)
+    runtime = WizardRuntime(
+        MagicMock(), embedder, multi_vectors=RecordingMultiVectors([])
+    )
 
     assert runtime.embedder.embed("one") == [0.4, 0.6]
     assert runtime.embedder.embed_many(["two", "three"]) == [
@@ -716,7 +748,9 @@ def test_runtime_rejects_incomplete_embedder_interface(
         embedder.embed = lambda text: [0.1]  # type: ignore[attr-defined]
 
     with pytest.raises(TypeError, match="both embed"):
-        WizardRuntime(MagicMock(), embedder)  # type: ignore[arg-type]
+        WizardRuntime(
+            MagicMock(), embedder, multi_vectors=RecordingMultiVectors([])
+        )  # type: ignore[arg-type]
 
 
 def test_partial_step7a_is_compensated_and_retry_has_no_orphans() -> None:

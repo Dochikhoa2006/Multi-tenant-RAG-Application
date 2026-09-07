@@ -54,16 +54,32 @@ class FakeCollection:
         self.user_id = user_id
         self.collection_type = collection_type
         self.text = text
-        self.calls: list[tuple[str, list[float], int]] = []
+        self.calls: list[tuple[str, list[list[float]], int]] = []
 
     def hybrid_search(
-        self, query_text: str, query_vector: Sequence[float], top_k: int
+        self, query_text: str, query_vector: Sequence[Sequence[float]], top_k: int
     ) -> list[SearchResult]:
-        self.calls.append((query_text, list(query_vector), top_k))
+        self.calls.append((query_text, [list(row) for row in query_vector], top_k))
+        object_id = str(uuid4())
+        properties: dict[str, object] = {
+            "user_id": self.user_id,
+            "raw_text": self.text,
+        }
+        if self.collection_type == "conversations":
+            properties.update(
+                {
+                    "segment_id": object_id,
+                    "conversation_id": str(uuid4()),
+                    "segment_index": 0,
+                    "segment_text": self.text,
+                }
+            )
+        else:
+            properties["chunk_id"] = object_id
         return [
             SearchResult(
-                object_id=str(uuid4()),
-                properties={"raw_text": self.text},
+                object_id=object_id,
+                properties=properties,
                 vector=(1.0, 0.0),
                 score=0.9,
             )
@@ -84,6 +100,30 @@ class FakeEmbeddings:
         self, texts: Sequence[str], *, model: str
     ) -> Sequence[Sequence[float]]:
         return [[1.0, 0.0] for _ in texts]
+
+
+class FakeMultiVectors:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.query_calls: list[str] = []
+        self.document_calls: list[list[str]] = []
+
+    def encode_query(self, text: str) -> Sequence[Sequence[float]]:
+        self.query_calls.append(text)
+        self.events.append(f"multi_query:{text[:12]}")
+        return [[1.0, 0.0]]
+
+    def encode_documents(
+        self, texts: Sequence[str]
+    ) -> Sequence[Sequence[Sequence[float]]]:
+        values = list(texts)
+        self.document_calls.append(values)
+        return [[[1.0, 0.0]] for _ in values]
+
+
+class OneSegment:
+    def segment_document(self, text: str) -> Sequence[str]:
+        return [text]
 
 
 class FakeReranker:
@@ -131,16 +171,29 @@ class FakeLLM:
 class FakeConversationWriter:
     def __init__(self, events: list[str]) -> None:
         self.events = events
-        self.inserted: list[tuple[str, str, list[float]]] = []
+        self.inserted: list[tuple[object, ...]] = []
         self.deleted: list[list[str]] = []
         self.stored_ids: set[str] = set()
         self.delete_failure: Exception | None = None
 
     def insert(
-        self, conversation_id: str, raw_text: str, vector: Sequence[float]
+        self,
+        conversation_id: str,
+        raw_text: str,
+        segment_texts: Sequence[str],
+        segment_vectors: Sequence[Sequence[Sequence[float]]],
+        diversity_vector: Sequence[float],
     ) -> str:
         self.events.append("conversation_insert")
-        self.inserted.append((conversation_id, raw_text, list(vector)))
+        self.inserted.append(
+            (
+                conversation_id,
+                raw_text,
+                list(segment_texts),
+                [[list(row) for row in matrix] for matrix in segment_vectors],
+                list(diversity_vector),
+            )
+        )
         self.stored_ids.add(conversation_id)
         return conversation_id
 
@@ -180,6 +233,7 @@ def _services(
     events: list[str] = []
     manager = FakeManager()
     embeddings = FakeEmbeddings(events)
+    multi_vectors = FakeMultiVectors(events)
     llm = FakeLLM(
         events,
         fail_stream=fail_stream,
@@ -192,6 +246,8 @@ def _services(
         embeddings,
         FakeReranker(),
         lambda user_id: writer,
+        multi_vectors=multi_vectors,
+        conversation_segmenter=OneSegment(),
         tokenizer=WordTokenizer(),
     )
     conversations = FakeCollection(USER_ID, "conversations", "previous answer")
@@ -284,7 +340,7 @@ def test_chat_query_streams_json_sse_and_persists_only_complete_answer() -> None
     assert len(writer.inserted) == 1
     assert "Question:\noriginal question\n\nAnswer:\nfirst second" in writer.inserted[0][1]
     assert events.index("conversation_insert") < events.index("title")
-    assert len(embeddings.calls) == 3
+    assert len(embeddings.calls) == 1
     assert services.chat_registry.get_session(USER_ID, session_id).title == (
         "Useful Retrieval Session"
     )
@@ -323,7 +379,7 @@ def test_failed_generation_emits_error_without_partial_transcript_or_embedding()
             "succeeded"
         )
     assert writer.inserted == []
-    assert len(embeddings.calls) == 2
+    assert len(embeddings.calls) == 0
 
 
 def test_session_crud_cascade_delete_and_task_ownership() -> None:

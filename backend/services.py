@@ -245,6 +245,15 @@ class _UnavailableWizardEmbedder:
         raise RuntimeError("wizard embedding provider is not configured")
 
 
+class _UnavailableMultiVectorProvider:
+    def encode_query(self, text: str) -> Sequence[Sequence[float]]:
+        raise RuntimeError("multi-vector provider is not configured")
+
+    def encode_documents(
+        self, texts: Sequence[str]
+    ) -> Sequence[Sequence[Sequence[float]]]:
+        raise RuntimeError("multi-vector provider is not configured")
+
 class _RAGWizardEmbedder:
     def __init__(self, runtime: RAGRuntime) -> None:
         self._embeddings = runtime.embeddings
@@ -298,6 +307,11 @@ class AppServices:
                 _RAGWizardEmbedder(rag_runtime)
                 if rag_runtime is not None
                 else _UnavailableWizardEmbedder(),
+                multi_vectors=(
+                    rag_runtime.multi_vectors
+                    if rag_runtime is not None
+                    else _UnavailableMultiVectorProvider()
+                ),
             )
         )
         self.retrieval_collections_factory = (

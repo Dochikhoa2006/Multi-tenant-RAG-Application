@@ -10,10 +10,16 @@ import os
 from pathlib import Path
 import re
 
-from weaviate.classes.config import Configure
+from weaviate.classes.config import Configure, DataType
+from weaviate.collections.classes.config_vector_index import MultiVectorAggregation
 
 from backend.config import get_collection_name
-from backend.model_config import EMBEDDING_MODEL, EMBEDDING_VECTOR_PROFILE
+from backend.model_config import (
+    EMBEDDING_MODEL,
+    LATE_INTERACTION_VECTOR_NAME,
+    MMR_DIVERSITY_VECTOR_NAME,
+    RETRIEVAL_VECTOR_PROFILE,
+)
 from backend.weaviate_client.client import (
     WeaviateManager,
     _CHUNK_CONTRACT,
@@ -21,6 +27,8 @@ from backend.weaviate_client.client import (
     _chunk_properties,
     _collection_description,
     _conversation_properties,
+    _enum_value,
+    _field,
     _validate_properties,
     _validate_vector_config,
 )
@@ -42,6 +50,53 @@ _REQUIRED_TYPES = frozenset(_SUFFIX_TYPES.values())
 
 class VectorMigrationError(RuntimeError):
     """Raised when empty-state migration safety cannot be proven."""
+
+
+def _is_supported_legacy_empty_schema(config: object, collection_type: str) -> bool:
+    """Recognize only the prior self-provided single-vector empty schema."""
+
+    expected = (
+        {
+            "user_id": (DataType.TEXT, True, False),
+            "conversation_id": (DataType.UUID, True, False),
+            "raw_text": (DataType.TEXT, False, True),
+        }
+        if collection_type == "conversations"
+        else {
+            "user_id": (DataType.TEXT, True, False),
+            "document_id": (DataType.UUID, True, False),
+            "paragraph_id": (DataType.INT, True, False),
+            "chunk_id": (DataType.UUID, True, False),
+            "raw_text": (DataType.TEXT, False, True),
+        }
+    )
+    properties = _field(config, "properties")
+    if not isinstance(properties, Sequence) or isinstance(properties, (str, bytes)):
+        return False
+    actual = {
+        _field(item, "name"): (
+            _field(item, "data_type", "dataType"),
+            _field(item, "index_filterable", "indexFilterable"),
+            _field(item, "index_searchable", "indexSearchable"),
+        )
+        for item in properties
+    }
+    if actual != expected:
+        return False
+    vector_config = _field(config, "vector_config", "vectorConfig")
+    if not isinstance(vector_config, Mapping) or len(vector_config) != 1:
+        return False
+    named_vector = next(iter(vector_config.values()))
+    vectorizer_config = _field(named_vector, "vectorizer")
+    vectorizer = _enum_value(_field(vectorizer_config, "vectorizer"))
+    source_properties = _field(
+        vectorizer_config, "source_properties", "sourceProperties"
+    )
+    return (
+        isinstance(vectorizer, str)
+        and vectorizer.lower() == "none"
+        and source_properties in (None, [])
+    )
 
 
 def _decoded_collection(name: str) -> tuple[str, str] | None:
@@ -77,7 +132,10 @@ def _validate_source_schema(collection: object, name: str, collection_type: str)
         _validate_properties(name, config, contract)
         _validate_vector_config(name, config)
     except Exception as exc:
-        raise VectorMigrationError(f"collection {name!r} has an incompatible schema") from exc
+        if not _is_supported_legacy_empty_schema(config, collection_type):
+            raise VectorMigrationError(
+                f"collection {name!r} has an incompatible schema"
+            ) from exc
 
 
 def _total_count(collection: object, name: str) -> int:
@@ -135,12 +193,12 @@ def _require_existing_targets_empty(
         if not collections.exists(name):
             continue
         collection = collections.use(name)
-        _validate_source_schema(collection, name, str(entry["collection_type"]))
         count = _total_count(collection, name)
         if count != 0:
             raise VectorMigrationError(
                 f"collection {name!r} contains {count} objects; populated state is unsupported"
             )
+        _validate_source_schema(collection, name, str(entry["collection_type"]))
 
 
 def export_collections(
@@ -170,7 +228,7 @@ def export_collections(
         "migration_scope": _MIGRATION_SCOPE,
         "mapping_state_preserved": False,
         "embedding_model": EMBEDDING_MODEL,
-        "vector_profile": EMBEDDING_VECTOR_PROFILE,
+        "vector_profile": RETRIEVAL_VECTOR_PROFILE,
         "collections": entries,
     }
     with manifest_path.open("x", encoding="utf-8") as output:
@@ -193,7 +251,7 @@ def _load_manifest(export_directory: Path) -> list[dict[str, object]]:
         or manifest.get("migration_scope") != _MIGRATION_SCOPE
         or manifest.get("mapping_state_preserved") is not False
         or manifest.get("embedding_model") != EMBEDDING_MODEL
-        or manifest.get("vector_profile") != EMBEDDING_VECTOR_PROFILE
+        or manifest.get("vector_profile") != RETRIEVAL_VECTOR_PROFILE
     ):
         raise VectorMigrationError("migration manifest is not an empty-state manifest")
     raw_entries = manifest.get("collections")
@@ -285,7 +343,17 @@ def rebuild_collections(
                 if collection_type == "conversations"
                 else _chunk_properties()
             ),
-            vector_config=Configure.Vectors.self_provided(),
+            vector_config=[
+                Configure.MultiVectors.self_provided(
+                    name=LATE_INTERACTION_VECTOR_NAME,
+                    multi_vector_config=(
+                        Configure.VectorIndex.MultiVector.multi_vector(
+                            aggregation=MultiVectorAggregation.MAX_SIM
+                        )
+                    ),
+                ),
+                Configure.Vectors.self_provided(name=MMR_DIVERSITY_VECTOR_NAME),
+            ],
         )
         _validate_source_schema(collection, name, collection_type)
         if _total_count(collection, name) != 0:

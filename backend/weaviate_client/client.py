@@ -8,6 +8,7 @@ from typing import Any
 
 import weaviate
 from weaviate.classes.config import Configure, DataType, Property
+from weaviate.collections.classes.config_vector_index import MultiVectorAggregation
 from weaviate.classes.init import Auth
 from weaviate.connect import ConnectionParams
 
@@ -19,7 +20,11 @@ from backend.config import (
     WEAVIATE_URL,
     get_collection_name,
 )
-from backend.model_config import EMBEDDING_VECTOR_PROFILE
+from backend.model_config import (
+    LATE_INTERACTION_VECTOR_NAME,
+    MMR_DIVERSITY_VECTOR_NAME,
+    RETRIEVAL_VECTOR_PROFILE,
+)
 from backend.weaviate_client.models import IncompatibleCollectionSchemaError
 
 
@@ -31,7 +36,7 @@ def _collection_description(state: str = "ready") -> str:
     if state not in {"ready", "rebuilding"}:
         raise ValueError("collection vector state must be ready or rebuilding")
     return (
-        f"{_VECTOR_PROFILE_PREFIX}={EMBEDDING_VECTOR_PROFILE};"
+        f"{_VECTOR_PROFILE_PREFIX}={RETRIEVAL_VECTOR_PROFILE};"
         f"state={state}"
     )
 
@@ -47,7 +52,10 @@ class _PropertyContract:
 _CONVERSATION_CONTRACT = {
     "user_id": _PropertyContract(DataType.TEXT, True, False),
     "conversation_id": _PropertyContract(DataType.UUID, True, False),
-    "raw_text": _PropertyContract(DataType.TEXT, False, True),
+    "segment_id": _PropertyContract(DataType.UUID, True, False),
+    "segment_index": _PropertyContract(DataType.INT, True, False),
+    "raw_text": _PropertyContract(DataType.TEXT, False, False),
+    "segment_text": _PropertyContract(DataType.TEXT, False, True),
 }
 _CHUNK_CONTRACT = {
     "user_id": _PropertyContract(DataType.TEXT, True, False),
@@ -122,24 +130,40 @@ def _validate_properties(
 
 def _validate_vector_config(collection_name: str, config: object) -> None:
     vector_config = _field(config, "vector_config", "vectorConfig")
-    if not isinstance(vector_config, Mapping) or len(vector_config) != 1:
+    expected_names = {
+        LATE_INTERACTION_VECTOR_NAME,
+        MMR_DIVERSITY_VECTOR_NAME,
+    }
+    if not isinstance(vector_config, Mapping) or set(vector_config) != expected_names:
         _schema_error(
             collection_name,
-            "exactly one named native vector configuration is required",
+            "the late-interaction and MMR-diversity named vectors are required",
         )
-
-    named_vector = next(iter(vector_config.values()))
-    vectorizer_config = _field(named_vector, "vectorizer")
-    vectorizer = _enum_value(_field(vectorizer_config, "vectorizer"))
-    if not isinstance(vectorizer, str) or vectorizer.lower() != "none":
-        _schema_error(collection_name, "the vectorizer must be self-provided/none")
-
-    source_properties = _field(vectorizer_config, "source_properties", "sourceProperties")
-    if source_properties not in (None, []):
-        _schema_error(
-            collection_name,
-            "self-provided vectors must not declare source properties",
+    for name, named_vector in vector_config.items():
+        vectorizer_config = _field(named_vector, "vectorizer")
+        vectorizer = _enum_value(_field(vectorizer_config, "vectorizer"))
+        if not isinstance(vectorizer, str) or vectorizer.lower() != "none":
+            _schema_error(collection_name, "the vectorizer must be self-provided/none")
+        source_properties = _field(
+            vectorizer_config, "source_properties", "sourceProperties"
         )
+        if source_properties not in (None, []):
+            _schema_error(
+                collection_name,
+                "self-provided vectors must not declare source properties",
+            )
+        index_config = _field(
+            named_vector, "vector_index_config", "vectorIndexConfig"
+        )
+        multivector = _field(index_config, "multi_vector", "multivector")
+        if name == LATE_INTERACTION_VECTOR_NAME:
+            if multivector is None:
+                _schema_error(collection_name, "late_interaction must be a multi-vector")
+            aggregation = _enum_value(_field(multivector, "aggregation"))
+            if aggregation != MultiVectorAggregation.MAX_SIM.value:
+                _schema_error(collection_name, "late_interaction must use MaxSim")
+        elif multivector is not None:
+            _schema_error(collection_name, "mmr_diversity must be a dense vector")
 
 
 def _validate_existing_collection(
@@ -176,8 +200,16 @@ def _conversation_properties() -> list[Property]:
     return [
         _identifier_property("user_id", DataType.TEXT),
         _identifier_property("conversation_id", DataType.UUID),
+        _identifier_property("segment_id", DataType.UUID),
+        _identifier_property("segment_index", DataType.INT),
         Property(
             name="raw_text",
+            data_type=DataType.TEXT,
+            index_filterable=False,
+            index_searchable=False,
+        ),
+        Property(
+            name="segment_text",
             data_type=DataType.TEXT,
             index_filterable=False,
             index_searchable=True,
@@ -282,7 +314,7 @@ class WeaviateManager:
             (collection_type, get_collection_name(user_id, collection_type))
             for collection_type in _COLLECTION_ORDER
         ]
-        cache_key = (user_id, EMBEDDING_VECTOR_PROFILE)
+        cache_key = (user_id, RETRIEVAL_VECTOR_PROFILE)
         if cache_key in self._validated_collection_profiles:
             return
         collection_states = [
@@ -311,6 +343,18 @@ class WeaviateManager:
                 name=name,
                 description=_collection_description(),
                 properties=properties,
-                vector_config=Configure.Vectors.self_provided(),
+                vector_config=[
+                    Configure.MultiVectors.self_provided(
+                        name=LATE_INTERACTION_VECTOR_NAME,
+                        multi_vector_config=(
+                            Configure.VectorIndex.MultiVector.multi_vector(
+                                aggregation=MultiVectorAggregation.MAX_SIM
+                            )
+                        ),
+                    ),
+                    Configure.Vectors.self_provided(
+                        name=MMR_DIVERSITY_VECTOR_NAME,
+                    ),
+                ],
             )
         self._validated_collection_profiles.add(cache_key)

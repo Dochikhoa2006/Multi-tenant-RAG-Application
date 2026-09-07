@@ -42,6 +42,28 @@ class EmbeddingClient(Protocol):
     ) -> Sequence[Sequence[float]]: ...
 
 
+class MultiVectorProvider(Protocol):
+    """Model-agnostic late-interaction encoding contract.
+
+    Document inputs are retrieval units whose model-token limit is defined by
+    ``RETRIEVAL_UNIT_MAX_MODEL_TOKENS``. Implementations must reject oversized
+    inputs rather than truncate them; Stage 1 intentionally does not tokenize.
+    """
+
+    def encode_query(self, text: str) -> Sequence[Sequence[float]]: ...
+
+    def encode_documents(
+        self,
+        texts: Sequence[str],
+    ) -> Sequence[Sequence[Sequence[float]]]: ...
+
+
+class RetrievalSegmenter(Protocol):
+    """Lossless Conversation retrieval-unit segmentation contract."""
+
+    def segment_document(self, text: str) -> Sequence[str]: ...
+
+
 class Tokenizer(Protocol):
     """Minimal token-counting seam implemented by ``tiktoken.Encoding``."""
 
@@ -72,7 +94,9 @@ class ConversationCollectionWriter(Protocol):
         self,
         conversation_id: str,
         raw_text: str,
-        vector: Sequence[float],
+        segment_texts: Sequence[str],
+        segment_vectors: Sequence[Sequence[Sequence[float]]],
+        diversity_vector: Sequence[float],
     ) -> str: ...
 
 
@@ -105,6 +129,8 @@ class RAGRuntime:
         reranker: CrossEncoderReranker,
         conversation_collection_factory: ConversationCollectionFactory,
         *,
+        multi_vectors: MultiVectorProvider,
+        conversation_segmenter: RetrievalSegmenter,
         tokenizer: Tokenizer | None = None,
         background_queue: BackgroundTaskQueue | None = None,
     ) -> None:
@@ -118,6 +144,16 @@ class RAGRuntime:
             raise TypeError("embeddings must provide embed() and embed_many()")
         if not callable(getattr(reranker, "rerank", None)):
             raise TypeError("reranker must provide rerank()")
+        if not callable(getattr(multi_vectors, "encode_query", None)) or not callable(
+            getattr(multi_vectors, "encode_documents", None)
+        ):
+            raise TypeError(
+                "multi_vectors must provide encode_query() and encode_documents()"
+            )
+        if not callable(getattr(conversation_segmenter, "segment_document", None)):
+            raise TypeError(
+                "conversation_segmenter must provide segment_document()"
+            )
         if not callable(conversation_collection_factory):
             raise TypeError("conversation_collection_factory must be callable")
         if tokenizer is not None and not callable(getattr(tokenizer, "encode", None)):
@@ -128,6 +164,8 @@ class RAGRuntime:
             raise TypeError("background_queue must provide enqueue()")
         self.llm = llm
         self.embeddings = embeddings
+        self.multi_vectors = multi_vectors
+        self.conversation_segmenter = conversation_segmenter
         self.reranker = reranker
         self.conversation_collection_factory = conversation_collection_factory
         self.tokenizer = tokenizer

@@ -14,6 +14,7 @@ from backend.mappings.document_map import DocumentMap
 from backend.mappings.paragraph_map import ParagraphMap
 from backend.processing.chunker import chunk_paragraph
 from backend.processing.paragraph_splitter import split_into_paragraphs
+from backend.rag.runtime import MultiVectorProvider
 from backend.weaviate_client.client import WeaviateManager
 from backend.weaviate_client.knowledge import KnowledgeCollection
 from backend.weaviate_client.models import ChunkRecord, DeletionReport
@@ -59,7 +60,8 @@ class ChunkCollection(Protocol):
         paragraph_id: int,
         chunk_id: str,
         raw_text: str,
-        vector: Sequence[float],
+        multi_vector: Sequence[Sequence[float]],
+        diversity_vector: Sequence[float],
     ) -> str: ...
 
     def update_paragraph_ids(
@@ -91,6 +93,7 @@ class WizardRuntime:
         manager: WeaviateManager,
         embedder: ChunkEmbedder,
         *,
+        multi_vectors: MultiVectorProvider,
         paragraph_splitter: TextProcessor = split_into_paragraphs,
         paragraph_chunker: TextProcessor = chunk_paragraph,
         uuid_factory: UUIDFactory = uuid4,
@@ -110,9 +113,16 @@ class WizardRuntime:
             raise TypeError(
                 "embedder must provide both embed(text) and embed_many(texts)"
             )
+        if not callable(getattr(multi_vectors, "encode_query", None)) or not callable(
+            getattr(multi_vectors, "encode_documents", None)
+        ):
+            raise TypeError(
+                "multi_vectors must provide encode_query() and encode_documents()"
+            )
 
         self.manager = manager
         self.embedder = embedder
+        self.multi_vectors = multi_vectors
         self.paragraph_splitter = paragraph_splitter
         self.paragraph_chunker = paragraph_chunker
         self.uuid_factory = uuid_factory

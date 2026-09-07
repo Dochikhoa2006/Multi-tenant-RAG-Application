@@ -41,6 +41,18 @@ ModelEndpointValidator = Callable[[object, str, str, str, str], None]
 _LOGGER = logging.getLogger(__name__)
 
 
+def _missing_multi_vector_provider() -> object:
+    raise RuntimeDependencyError(
+        "a real multi-vector provider is required; Stage 2 is not configured"
+    )
+
+
+def _missing_conversation_segmenter() -> object:
+    raise RuntimeDependencyError(
+        "a real Conversation retrieval segmenter is required; Stage 2 is not configured"
+    )
+
+
 def _response_json(response: object) -> object:
     raise_for_status = getattr(response, "raise_for_status", None)
     json_method = getattr(response, "json", None)
@@ -129,6 +141,8 @@ def create_runtime_app(
     task_queue_factory: Factory = InMemoryTaskQueue,
     embedding_factory: Factory = ONNXEmbeddingClient,
     reranker_factory: Factory = ONNXCrossEncoderReranker,
+    multi_vector_factory: Factory = _missing_multi_vector_provider,
+    conversation_segmenter_factory: Factory = _missing_conversation_segmenter,
     granite_factory: Factory = SGLangGraniteQueryRewriter,
     qwen_factory: Factory = SGLangQwenLLMClient,
     tokenizer_factory: Factory | None = None,
@@ -143,6 +157,8 @@ def create_runtime_app(
         task_queue_factory,
         embedding_factory,
         reranker_factory,
+        multi_vector_factory,
+        conversation_segmenter_factory,
         granite_factory,
         qwen_factory,
         processing_warmup,
@@ -154,6 +170,13 @@ def create_runtime_app(
 
     construction_cleanup: list[tuple[str, Callable[[], None]]] = []
     try:
+        multi_vectors = multi_vector_factory()
+        construction_cleanup.append(("multi-vector provider", lambda: _close(multi_vectors)))
+        conversation_segmenter = conversation_segmenter_factory()
+        construction_cleanup.append(
+            ("Conversation segmenter", lambda: _close(conversation_segmenter))
+        )
+
         manager = manager_factory()
         construction_cleanup.append(("Weaviate manager", manager.disconnect))
 
@@ -194,6 +217,8 @@ def create_runtime_app(
             embedding,
             reranker,
             lambda user_id: ConversationCollection(manager, user_id),
+            multi_vectors=multi_vectors,
+            conversation_segmenter=conversation_segmenter,
             tokenizer=tokenizer,
             background_queue=task_queue,
         )
@@ -254,7 +279,15 @@ def create_runtime_app(
                         try:
                             await asyncio.to_thread(_close, reranker)
                         finally:
-                            await asyncio.to_thread(processing_cleanup)
+                            try:
+                                await asyncio.to_thread(_close, multi_vectors)
+                            finally:
+                                try:
+                                    await asyncio.to_thread(
+                                        _close, conversation_segmenter
+                                    )
+                                finally:
+                                    await asyncio.to_thread(processing_cleanup)
 
     application = create_app(
         services,

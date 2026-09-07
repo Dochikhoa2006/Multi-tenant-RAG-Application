@@ -32,7 +32,8 @@ class _ParagraphUnion:
 class _StagedChunk:
     chunk_id: str
     raw_text: str
-    vector: tuple[float, ...]
+    late_interaction: tuple[tuple[float, ...], ...]
+    mmr_diversity: tuple[float, ...]
 
 
 @dataclass(frozen=True)
@@ -274,24 +275,51 @@ def _new_chunk_uuid(
     return chunk_id
 
 
-def _batch_embeddings(
+def _validated_multi_vector(value: object) -> tuple[tuple[float, ...], ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise TypeError("multi-vector provider must return a sequence of vectors")
+    rows = tuple(_validated_vector(row) for row in value)
+    if not rows:
+        raise ValueError("multi-vector provider must not return an empty matrix")
+    if len({len(row) for row in rows}) != 1:
+        raise ValueError("multi-vector rows must have consistent dimensions")
+    return rows
+
+
+def _batch_vectors(
     runtime: WizardRuntime,
     texts: list[str],
-) -> list[tuple[float, ...]]:
+) -> tuple[list[tuple[tuple[float, ...], ...]], list[tuple[float, ...]]]:
     if not texts:
-        return []
-    raw_vectors = runtime.embedder.embed_many(texts)
-    if isinstance(raw_vectors, (str, bytes)) or not isinstance(
-        raw_vectors, Sequence
+        return [], []
+    raw_multi_vectors = runtime.multi_vectors.encode_documents(texts)
+    if isinstance(raw_multi_vectors, (str, bytes)) or not isinstance(
+        raw_multi_vectors, Sequence
+    ):
+        raise TypeError("multi-vector provider must return a sequence of matrices")
+    if len(raw_multi_vectors) != len(texts):
+        raise ValueError("multi-vector provider returned the wrong document count")
+    multi_vectors = [_validated_multi_vector(value) for value in raw_multi_vectors]
+    multi_dimensions = {
+        len(row) for matrix in multi_vectors for row in matrix
+    }
+    if len(multi_dimensions) != 1:
+        raise ValueError("document multi-vectors must have consistent dimensions")
+
+    raw_diversity_vectors = runtime.embedder.embed_many(texts)
+    if isinstance(raw_diversity_vectors, (str, bytes)) or not isinstance(
+        raw_diversity_vectors, Sequence
     ):
         raise TypeError("embedder must return a sequence of vectors")
-    if len(raw_vectors) != len(texts):
+    if len(raw_diversity_vectors) != len(texts):
         raise ValueError("embedder returned the wrong number of vectors")
-    vectors = [_validated_vector(vector) for vector in raw_vectors]
-    dimensions = {len(vector) for vector in vectors}
+    diversity_vectors = [
+        _validated_vector(vector) for vector in raw_diversity_vectors
+    ]
+    dimensions = {len(vector) for vector in diversity_vectors}
     if len(dimensions) != 1:
         raise ValueError("embedding vectors must have consistent dimensions")
-    return vectors
+    return multi_vectors, diversity_vectors
 
 
 def _recover_save(
@@ -447,7 +475,8 @@ def save_wizard(
                             active_runtime, unavailable_chunk_ids
                         ),
                         raw_text=chunk_text,
-                        vector=(),
+                        late_interaction=(),
+                        mmr_diversity=(),
                     )
                     staged_chunks.append(chunk)
                     pending_chunks.append(chunk)
@@ -461,13 +490,18 @@ def save_wizard(
             staged_by_union[union.paragraph_ids[0]] = staged_paragraphs
 
         failed_stage = "step_5"
-        vectors = _batch_embeddings(
+        multi_vectors, diversity_vectors = _batch_vectors(
             active_runtime,
             [chunk.raw_text for chunk in pending_chunks],
         )
         vectors_by_id = {
-            chunk.chunk_id: vector
-            for chunk, vector in zip(pending_chunks, vectors, strict=True)
+            chunk.chunk_id: (multi_vector, diversity_vector)
+            for chunk, multi_vector, diversity_vector in zip(
+                pending_chunks,
+                multi_vectors,
+                diversity_vectors,
+                strict=True,
+            )
         }
         staged_by_union = {
             first_id: [
@@ -477,7 +511,8 @@ def save_wizard(
                         _StagedChunk(
                             chunk.chunk_id,
                             chunk.raw_text,
-                            vectors_by_id[chunk.chunk_id],
+                            vectors_by_id[chunk.chunk_id][0],
+                            vectors_by_id[chunk.chunk_id][1],
                         )
                         for chunk in node.chunks
                     ),
@@ -499,7 +534,7 @@ def save_wizard(
                 nodes.extend(staged_by_union[old_paragraph.paragraph_id])
             elif old_paragraph.paragraph_id not in union_ids:
                 retained_chunks = tuple(
-                    _StagedChunk(chunk_id, "", ())
+                    _StagedChunk(chunk_id, "", (), ())
                     for chunk_id in old_chunks_by_paragraph.get(
                         old_paragraph.paragraph_id, []
                     )
@@ -545,7 +580,8 @@ def save_wizard(
                 final_paragraph_id,
                 chunk.chunk_id,
                 chunk.raw_text,
-                chunk.vector,
+                chunk.late_interaction,
+                chunk.mmr_diversity,
             )
             inserted_ids.append(chunk.chunk_id)
 

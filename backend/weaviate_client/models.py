@@ -49,7 +49,8 @@ class ChunkRecord:
     paragraph_id: int
     chunk_id: str
     raw_text: str
-    vector: tuple[float, ...]
+    late_interaction: tuple[tuple[float, ...], ...]
+    mmr_diversity: tuple[float, ...]
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,24 @@ class IncompleteDeletionError(RuntimeError):
         super().__init__(
             f"incomplete deletion for {scope}: {report.failed} failed, "
             f"{len(report.remaining_ids)} remaining"
+        )
+
+
+class ConversationWriteRecoveryError(RuntimeError):
+    """Raised when a failed segment write cannot prove full compensation."""
+
+    def __init__(
+        self,
+        attempted_segment_ids: tuple[str, ...],
+        write_error: Exception,
+        cleanup_error: Exception,
+    ) -> None:
+        self.attempted_segment_ids = attempted_segment_ids
+        self.write_error = write_error
+        self.cleanup_error = cleanup_error
+        super().__init__(
+            "conversation segment write failed and compensation could not be "
+            f"verified for {len(attempted_segment_ids)} attempted segment(s)"
         )
 
 

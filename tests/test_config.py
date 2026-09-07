@@ -240,7 +240,7 @@ assert QWEN_SGLANG.top_p == 0.75
 assert QWEN_SGLANG.top_k == 16
 assert QWEN_SGLANG.min_p == 0.1
 assert QWEN_SGLANG.presence_penalty == 1.25
-assert HYBRID_SEARCH.components == ('dense',)
+assert not hasattr(HYBRID_SEARCH, 'components')
 assert HYBRID_SEARCH.alpha == 0.4
 assert CHUNKING.paragraph_threshold == 0.6
 assert CHUNKING.min_tokens == 40
@@ -303,7 +303,6 @@ assert 'qwen-secret' not in repr(QWEN_SGLANG)
             "QWEN_TOP_K": "16",
             "QWEN_MIN_P": "0.1",
             "QWEN_PRESENCE_PENALTY": "1.25",
-            "HYBRID_COMPONENTS": "dense",
             "HYBRID_ALPHA": "0.4",
             "PARAGRAPH_SIMILARITY_THRESHOLD": "0.6",
             "MIN_CHUNK_TOKENS": "40",
@@ -351,6 +350,20 @@ assert 'qwen-secret' not in repr(QWEN_SGLANG)
     )
 
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["late_interaction,bm25", "dense", "", "bm25,late_interaction"],
+)
+def test_removed_hybrid_components_setting_is_always_rejected(value: str) -> None:
+    result = _run_python(
+        "import backend.model_config",
+        overrides={"HYBRID_COMPONENTS": value},
+    )
+
+    assert result.returncode != 0
+    assert "HYBRID_COMPONENTS is no longer supported" in result.stderr
 
 
 def test_answer_and_title_models_share_qwen_served_identity() -> None:

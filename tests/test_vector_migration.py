@@ -8,7 +8,12 @@ import pytest
 from weaviate.classes.config import DataType
 
 from backend.config import get_collection_name
-from backend.model_config import EMBEDDING_MODEL, EMBEDDING_VECTOR_PROFILE
+from backend.model_config import (
+    EMBEDDING_MODEL,
+    LATE_INTERACTION_VECTOR_NAME,
+    MMR_DIVERSITY_VECTOR_NAME,
+    RETRIEVAL_VECTOR_PROFILE,
+)
 from backend.weaviate_client.client import WeaviateManager, _collection_description
 from scripts.migrate_onnx_vectors import (
     VectorMigrationError,
@@ -39,7 +44,10 @@ def _config(name: str, description: str = "legacy") -> SimpleNamespace:
         properties = [
             _property("user_id", DataType.TEXT, True, False),
             _property("conversation_id", DataType.UUID, True, False),
-            _property("raw_text", DataType.TEXT, False, True),
+            _property("segment_id", DataType.UUID, True, False),
+            _property("segment_index", DataType.INT, True, False),
+            _property("raw_text", DataType.TEXT, False, False),
+            _property("segment_text", DataType.TEXT, False, True),
         ]
     else:
         properties = [
@@ -55,11 +63,34 @@ def _config(name: str, description: str = "legacy") -> SimpleNamespace:
         properties=properties,
         references=[],
         vector_config={
-            "default": SimpleNamespace(
-                vectorizer=SimpleNamespace(vectorizer="none", source_properties=None)
-            )
+            LATE_INTERACTION_VECTOR_NAME: SimpleNamespace(
+                vectorizer=SimpleNamespace(vectorizer="none", source_properties=None),
+                vector_index_config=SimpleNamespace(
+                    multi_vector=SimpleNamespace(aggregation="maxSim")
+                ),
+            ),
+            MMR_DIVERSITY_VECTOR_NAME: SimpleNamespace(
+                vectorizer=SimpleNamespace(vectorizer="none", source_properties=None),
+                vector_index_config=SimpleNamespace(multi_vector=None),
+            ),
         },
     )
+
+
+def _legacy_config(name: str) -> SimpleNamespace:
+    config = _config(name)
+    if name.endswith("_Conversations"):
+        config.properties = [
+            _property("user_id", DataType.TEXT, True, False),
+            _property("conversation_id", DataType.UUID, True, False),
+            _property("raw_text", DataType.TEXT, False, True),
+        ]
+    config.vector_config = {
+        "default": SimpleNamespace(
+            vectorizer=SimpleNamespace(vectorizer="none", source_properties=None)
+        )
+    }
+    return config
 
 
 class FakeConfig:
@@ -189,6 +220,8 @@ def test_populated_collection_blocks_export_before_manifest_or_mutation(
     tmp_path: Path, collection_type: str
 ) -> None:
     manager, collections = _manager(populated_collection_type=collection_type)
+    populated_name = get_collection_name(USER_ID, collection_type)
+    collections.values[populated_name].config.value = _legacy_config(populated_name)
 
     with pytest.raises(VectorMigrationError, match="populated state is unsupported"):
         _export(manager, tmp_path)
@@ -196,6 +229,21 @@ def test_populated_collection_blocks_export_before_manifest_or_mutation(
     assert not (tmp_path / "vector-migration-manifest.json").exists()
     assert collections.deleted == []
     assert all(not collection.config.updates for collection in collections.values.values())
+
+
+def test_empty_legacy_triplet_is_accepted_for_rebuild_only(tmp_path: Path) -> None:
+    manager, collections = _manager()
+    for collection_type in COLLECTION_TYPES:
+        name = get_collection_name(USER_ID, collection_type)
+        collections.values[name].config.value = _legacy_config(name)
+
+    _export(manager, tmp_path)
+    _rebuild(manager, tmp_path)
+    verify_collections(manager, tmp_path)
+
+    assert set(collections.created) == {
+        get_collection_name(USER_ID, item) for item in COLLECTION_TYPES
+    }
 
 
 def test_empty_canonical_triplets_rebuild_and_verify(tmp_path: Path) -> None:
@@ -213,7 +261,7 @@ def test_empty_canonical_triplets_rebuild_and_verify(tmp_path: Path) -> None:
         "migration_scope": "disposable-empty-prototype-state",
         "mapping_state_preserved": False,
         "embedding_model": EMBEDDING_MODEL,
-        "vector_profile": EMBEDDING_VECTOR_PROFILE,
+        "vector_profile": RETRIEVAL_VECTOR_PROFILE,
         "collections": [
             {
                 "name": name,
@@ -263,7 +311,7 @@ def test_old_populated_manifest_is_rejected_before_mutation(tmp_path: Path) -> N
             {
                 "schema_version": "1.0",
                 "embedding_model": EMBEDDING_MODEL,
-                "vector_profile": EMBEDDING_VECTOR_PROFILE,
+                "vector_profile": RETRIEVAL_VECTOR_PROFILE,
                 "collections": [{"count": 1}],
             }
         ),

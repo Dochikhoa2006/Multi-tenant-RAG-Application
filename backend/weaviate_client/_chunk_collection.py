@@ -8,10 +8,16 @@ from uuid import UUID
 
 from weaviate.classes.query import Filter
 
+from backend.model_config import (
+    LATE_INTERACTION_VECTOR_NAME,
+    MMR_DIVERSITY_VECTOR_NAME,
+)
 from backend.weaviate_client._base import (
     _CollectionBase,
+    _multi_vector_values,
     _positive_paragraph_id,
     _required_text,
+    _result_multi_vector,
     _result_vector,
     _uuid_text,
     _vector_values,
@@ -112,7 +118,8 @@ class _ChunkCollection(_CollectionBase):
         paragraph_id: int,
         chunk_id: str,
         raw_text: str,
-        vector: Sequence[float],
+        multi_vector: Sequence[Sequence[float]],
+        diversity_vector: Sequence[float],
     ) -> str:
         parent_id = _uuid_text(document_id, "document_id")
         paragraph = _positive_paragraph_id(paragraph_id)
@@ -127,9 +134,19 @@ class _ChunkCollection(_CollectionBase):
                 "raw_text": text,
             },
             uuid=object_id,
-            vector=_vector_values(vector),
+            vector={
+                LATE_INTERACTION_VECTOR_NAME: _multi_vector_values(
+                    multi_vector, "chunk multi-vector"
+                ),
+                MMR_DIVERSITY_VECTOR_NAME: _vector_values(
+                    diversity_vector, "diversity_vector"
+                ),
+            },
         )
-        return str(inserted)
+        inserted_id = _uuid_text(str(inserted), "inserted object UUID")
+        if inserted_id != object_id:
+            raise WeaviateResponseError("inserted object UUID does not match chunk_id")
+        return inserted_id
 
     def _verified_delete(self, where: Any, scope: str) -> DeletionReport:
         collection = self._collection
@@ -258,7 +275,10 @@ class _ChunkCollection(_CollectionBase):
                 paragraph_id=paragraph_id,
                 chunk_id=chunk_id,
                 raw_text=raw_text,
-                vector=_result_vector(getattr(item, "vector", None)),
+                late_interaction=_result_multi_vector(
+                    getattr(item, "vector", None)
+                ),
+                mmr_diversity=_result_vector(getattr(item, "vector", None)),
             )
             if chunk_id in records:
                 raise WeaviateResponseError("chunk snapshot contains duplicate UUIDs")
@@ -331,7 +351,19 @@ class _ChunkCollection(_CollectionBase):
                     paragraph_id=_positive_paragraph_id(record.paragraph_id),
                     chunk_id=chunk_id,
                     raw_text=_required_text(record.raw_text, "raw_text"),
-                    vector=tuple(_vector_values(record.vector)),
+                    late_interaction=tuple(
+                        tuple(row)
+                        for row in _multi_vector_values(
+                            record.late_interaction,
+                            "snapshot late-interaction multi-vector",
+                        )
+                    ),
+                    mmr_diversity=tuple(
+                        _vector_values(
+                            record.mmr_diversity,
+                            "snapshot MMR-diversity vector",
+                        )
+                    ),
                 )
             )
         expected = {record.chunk_id: record for record in validated}
@@ -353,7 +385,8 @@ class _ChunkCollection(_CollectionBase):
                 record.paragraph_id,
                 record.chunk_id,
                 record.raw_text,
-                record.vector,
+                record.late_interaction,
+                record.mmr_diversity,
             )
             restored.append(chunk_id)
 
@@ -408,7 +441,7 @@ class _ChunkCollection(_CollectionBase):
     def hybrid_search(
         self,
         query_text: str,
-        query_vector: Sequence[float],
+        query_vector: Sequence[Sequence[float]],
         top_k: int,
     ) -> list[SearchResult]:
         return self._hybrid_search(query_text, query_vector, top_k)

@@ -78,6 +78,7 @@ def test_insert_chunk_uses_chunk_id_as_uuid() -> None:
         2,
         CHUNK_ID,
         "  Exact chunk text.\n",
+        [[0.3, 0.7], [0.4, 0.6]],
         [0.1, 0.9],
     )
 
@@ -94,7 +95,10 @@ def test_insert_chunk_uses_chunk_id_as_uuid() -> None:
             "raw_text": "  Exact chunk text.\n",
         },
         uuid=CHUNK_ID,
-        vector=[0.1, 0.9],
+        vector={
+            "late_interaction": [[0.3, 0.7], [0.4, 0.6]],
+            "mmr_diversity": [0.1, 0.9],
+        },
     )
 
 
@@ -181,7 +185,9 @@ def test_policy_uses_separate_collection_with_same_interface() -> None:
     collection.data.insert.return_value = UUID(CHUNK_ID)
     policy = PolicyCollection(manager, USER_ID)
 
-    policy.insert_chunk(DOCUMENT_ID, 1, CHUNK_ID, "Policy text", [0.2, 0.8])
+    policy.insert_chunk(
+        DOCUMENT_ID, 1, CHUNK_ID, "Policy text", [[0.4, 0.6]], [0.2, 0.8]
+    )
 
     client.collections.use.assert_called_once_with(get_collection_name(USER_ID, "policy"))
     assert collection.data.insert.call_args.kwargs["properties"]["raw_text"] == (
@@ -202,7 +208,7 @@ def test_knowledge_hybrid_search_keeps_collection_result_order() -> None:
                     "chunk_id": CHUNK_ID,
                     "raw_text": "first",
                 },
-                vector=[0.1, 0.2],
+                vector={"mmr_diversity": [0.1, 0.2]},
                 metadata=SimpleNamespace(score=0.9),
             ),
             SimpleNamespace(
@@ -214,19 +220,21 @@ def test_knowledge_hybrid_search_keeps_collection_result_order() -> None:
                     "chunk_id": SECOND_CHUNK_ID,
                     "raw_text": "second",
                 },
-                vector=[0.2, 0.1],
+                vector={"mmr_diversity": [0.2, 0.1]},
                 metadata=SimpleNamespace(score=0.8),
             ),
         ]
     )
     knowledge = KnowledgeCollection(manager, USER_ID)
 
-    results = knowledge.hybrid_search("query", [0.5, 0.5], 30)
+    results = knowledge.hybrid_search("query", [[0.5, 0.5]], 50)
 
     assert [item.object_id for item in results] == [CHUNK_ID, SECOND_CHUNK_ID]
-    assert all(item.vector is None for item in results)
+    assert [item.vector for item in results] == [(0.1, 0.2), (0.2, 0.1)]
     kwargs = collection.query.hybrid.call_args.kwargs
-    assert kwargs["include_vector"] is False
+    assert kwargs["include_vector"] == ["mmr_diversity"]
+    assert kwargs["target_vector"] == "late_interaction"
+    assert kwargs["query_properties"] == ["raw_text"]
     assert "diversity_selection" not in kwargs
     assert kwargs["return_properties"] == [
         "user_id",
@@ -313,7 +321,10 @@ def _snapshot_object(chunk_id: str = CHUNK_ID, paragraph_id: int = 2) -> SimpleN
             "chunk_id": chunk_id,
             "raw_text": "exact text",
         },
-        vector=[0.2, 0.8],
+        vector={
+            "late_interaction": [[0.3, 0.7]],
+            "mmr_diversity": [0.2, 0.8],
+        },
     )
 
 
@@ -329,7 +340,14 @@ def test_snapshot_by_paragraphs_returns_complete_recoverable_records() -> None:
 
     assert records == (
         ChunkRecord(
-            CHUNK_ID, USER_ID, DOCUMENT_ID, 2, CHUNK_ID, "exact text", (0.2, 0.8)
+            CHUNK_ID,
+            USER_ID,
+            DOCUMENT_ID,
+            2,
+            CHUNK_ID,
+            "exact text",
+            ((0.3, 0.7),),
+            (0.2, 0.8),
         ),
     )
     assert collection.data.delete_many.call_args.kwargs["dry_run"] is True
@@ -353,7 +371,14 @@ def test_snapshot_discovery_accepts_real_shape_three_object_dry_run() -> None:
 def test_restore_chunks_inserts_missing_records_then_verifies_exact_state() -> None:
     manager, _, collection = _manager_and_collection()
     record = ChunkRecord(
-        CHUNK_ID, USER_ID, DOCUMENT_ID, 2, CHUNK_ID, "exact text", (0.2, 0.8)
+        CHUNK_ID,
+        USER_ID,
+        DOCUMENT_ID,
+        2,
+        CHUNK_ID,
+        "exact text",
+        ((0.3, 0.7),),
+        (0.2, 0.8),
     )
     collection.query.fetch_objects_by_ids.side_effect = [
         SimpleNamespace(objects=[]),
@@ -397,6 +422,7 @@ def test_chunk_paragraph_validation_prevents_insert(paragraph_id: object) -> Non
             paragraph_id,  # type: ignore[arg-type]
             CHUNK_ID,
             "content",
+            [[0.2]],
             [0.1],
         )
     collection.data.insert.assert_not_called()
@@ -414,7 +440,7 @@ def test_chunk_uuid_validation_prevents_insert(
     knowledge = KnowledgeCollection(manager, USER_ID)
 
     with pytest.raises(ValueError, match="UUID"):
-        knowledge.insert_chunk(document_id, 1, chunk_id, "content", [0.1])
+        knowledge.insert_chunk(document_id, 1, chunk_id, "content", [[0.2]], [0.1])
     collection.data.insert.assert_not_called()
 
 
@@ -431,7 +457,7 @@ def test_chunk_content_validation_prevents_insert(
     knowledge = KnowledgeCollection(manager, USER_ID)
 
     with pytest.raises((TypeError, ValueError)):
-        knowledge.insert_chunk(DOCUMENT_ID, 1, CHUNK_ID, raw_text, vector)
+        knowledge.insert_chunk(DOCUMENT_ID, 1, CHUNK_ID, raw_text, [[0.2]], vector)
     collection.data.insert.assert_not_called()
 
 
@@ -505,7 +531,7 @@ def test_every_chunk_operation_uses_only_its_bound_collection(
                     "chunk_id": CHUNK_ID,
                     "raw_text": "content",
                 },
-                vector=[0.1],
+                vector={"mmr_diversity": [0.1]},
                 metadata=SimpleNamespace(score=0.8),
             )
         ]
@@ -516,11 +542,11 @@ def test_every_chunk_operation_uses_only_its_bound_collection(
     client.collections.use.reset_mock()
     chunks = collection_class(manager, user_id)
 
-    chunks.insert_chunk(DOCUMENT_ID, 1, CHUNK_ID, "content", [0.1])
+    chunks.insert_chunk(DOCUMENT_ID, 1, CHUNK_ID, "content", [[0.2]], [0.1])
     chunks.delete_by_document(DOCUMENT_ID)
     chunks.delete_by_paragraphs(DOCUMENT_ID, [1])
     chunks.update_paragraph_ids({CHUNK_ID: 2})
-    chunks.hybrid_search("query", [0.1], 20)
+    chunks.hybrid_search("query", [[0.1]], 20)
 
     assert [call.args[0] for call in client.collections.use.call_args_list] == [
         expected_name,

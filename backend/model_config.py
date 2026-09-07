@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import math
 import os
 import re
 from urllib.parse import urlsplit
@@ -48,6 +49,14 @@ def _env_nonnegative_float(name: str, default: float) -> float:
     return value
 
 
+def _env_finite_float(name: str, default: float) -> float:
+    raw_value = os.getenv(name)
+    value = default if raw_value is None else float(raw_value)
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
+    return value
+
+
 def _env_choice(name: str, default: str, choices: frozenset[str]) -> str:
     value = _env_string(name, default).lower()
     if value not in choices:
@@ -62,16 +71,6 @@ def _env_probability(name: str, default: float) -> float:
     if not 0.0 <= value <= 1.0:
         raise ValueError(f"{name} must be between 0 and 1 inclusive")
     return value
-
-
-def _env_components(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return default
-    components = tuple(item.strip().lower() for item in raw_value.split(",") if item.strip())
-    if not components:
-        raise ValueError(f"{name} must contain at least one search component")
-    return components
 
 
 def _env_raw_string(name: str, default: str) -> str:
@@ -107,13 +106,10 @@ class LLMConfig:
 
 @dataclass(frozen=True)
 class HybridSearchConfig:
-    components: tuple[str, ...]
     fusion_method: str
     alpha: float
 
     def __post_init__(self) -> None:
-        if not self.components or any(not item for item in self.components):
-            raise ValueError("Hybrid search must contain at least one component")
         if not self.fusion_method.strip():
             raise ValueError("Hybrid fusion_method must not be empty")
         if not 0.0 <= self.alpha <= 1.0:
@@ -123,18 +119,24 @@ class HybridSearchConfig:
 @dataclass(frozen=True)
 class RetrievalConfig:
     candidate_count: int
-    strategy: str
+    candidate_ceiling: int
     final_count: int
-    mmr_lambda: float | None = None
+    adaptive_relevance_floor: float
+    adaptive_gap_threshold: float
+    mmr_lambda: float
 
     def __post_init__(self) -> None:
-        if self.candidate_count <= 0 or self.final_count <= 0:
+        if min(self.candidate_count, self.candidate_ceiling, self.final_count) <= 0:
             raise ValueError("Retrieval counts must be greater than zero")
+        if self.candidate_count > self.candidate_ceiling:
+            raise ValueError("Retrieval candidate_count exceeds its collection ceiling")
         if self.candidate_count < self.final_count:
             raise ValueError("Retrieval candidate_count must be at least final_count")
-        if not self.strategy.strip():
-            raise ValueError("Retrieval strategy must not be empty")
-        if self.mmr_lambda is not None and not 0.0 <= self.mmr_lambda <= 1.0:
+        if not math.isfinite(self.adaptive_relevance_floor):
+            raise ValueError("Adaptive-K relevance floor must be finite")
+        if not 0.0 <= self.adaptive_gap_threshold <= 1.0:
+            raise ValueError("Adaptive-K gap threshold must be between 0 and 1")
+        if not 0.0 <= self.mmr_lambda <= 1.0:
             raise ValueError("MMR lambda must be between 0 and 1 inclusive")
 
 
@@ -405,6 +407,13 @@ RERANKER_MODEL = _env_string("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
 EMBEDDING_MODEL_REVISION = "e7f32e3c00f91d699e8c43b53106206bcc72bb22"
 RERANKER_MODEL_REVISION = "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"
 EMBEDDING_VECTOR_PROFILE = "gte-modernbert-base-e7f32e3-fp16-cls-l2-768-v1"
+LATE_INTERACTION_VECTOR_NAME = "late_interaction"
+MMR_DIVERSITY_VECTOR_NAME = "mmr_diversity"
+RETRIEVAL_UNIT_MAX_MODEL_TOKENS = 300
+RETRIEVAL_VECTOR_PROFILE = (
+    "external-late-interaction-maxsim-unbound-v1+"
+    f"{EMBEDDING_VECTOR_PROFILE}"
+)
 SEGMENTATION_EMBEDDING_MODEL = _env_string(
     "SEGMENTATION_EMBEDDING_MODEL",
     "all-MiniLM-L6-v2",
@@ -513,27 +522,53 @@ SGLANG_QUERY_REWRITE = SGLangQueryRewriteConfig(
     ),
 )
 
+if "HYBRID_COMPONENTS" in os.environ:
+    raise ValueError(
+        "HYBRID_COMPONENTS is no longer supported; hybrid retrieval is fixed to "
+        f"{LATE_INTERACTION_VECTOR_NAME} + BM25"
+    )
+
+
 HYBRID_SEARCH = HybridSearchConfig(
-    components=_env_components("HYBRID_COMPONENTS", ("dense", "bm25")),
     fusion_method=_env_string("HYBRID_FUSION_METHOD", "relativeScoreFusion"),
     alpha=_env_probability("HYBRID_ALPHA", 0.70),
 )
 
 CONVERSATION_SEARCH = RetrievalConfig(
-    candidate_count=_env_int("CONVERSATION_CANDIDATE_COUNT", 20),
-    strategy=_env_string("CONVERSATION_RERANKING_STRATEGY", "mmr"),
+    candidate_count=_env_int("CONVERSATION_CANDIDATE_COUNT", 40),
+    candidate_ceiling=40,
     final_count=_env_int("CONVERSATION_FINAL_COUNT", 5),
+    adaptive_relevance_floor=_env_finite_float(
+        "CONVERSATION_ADAPTIVE_RELEVANCE_FLOOR", -1.0
+    ),
+    adaptive_gap_threshold=_env_probability(
+        "CONVERSATION_ADAPTIVE_GAP_THRESHOLD", 0.15
+    ),
     mmr_lambda=_env_probability("CONVERSATION_MMR_LAMBDA", 0.70),
 )
 KNOWLEDGE_SEARCH = RetrievalConfig(
-    candidate_count=_env_int("KNOWLEDGE_CANDIDATE_COUNT", 30),
-    strategy=_env_string("KNOWLEDGE_RERANKING_STRATEGY", "cross_encoder"),
+    candidate_count=_env_int("KNOWLEDGE_CANDIDATE_COUNT", 50),
+    candidate_ceiling=50,
     final_count=_env_int("KNOWLEDGE_FINAL_COUNT", 8),
+    adaptive_relevance_floor=_env_finite_float(
+        "KNOWLEDGE_ADAPTIVE_RELEVANCE_FLOOR", -1.0
+    ),
+    adaptive_gap_threshold=_env_probability(
+        "KNOWLEDGE_ADAPTIVE_GAP_THRESHOLD", 0.15
+    ),
+    mmr_lambda=_env_probability("KNOWLEDGE_MMR_LAMBDA", 0.70),
 )
 POLICY_SEARCH = RetrievalConfig(
-    candidate_count=_env_int("POLICY_CANDIDATE_COUNT", 20),
-    strategy=_env_string("POLICY_RERANKING_STRATEGY", "cross_encoder"),
+    candidate_count=_env_int("POLICY_CANDIDATE_COUNT", 40),
+    candidate_ceiling=40,
     final_count=_env_int("POLICY_FINAL_COUNT", 5),
+    adaptive_relevance_floor=_env_finite_float(
+        "POLICY_ADAPTIVE_RELEVANCE_FLOOR", -1.0
+    ),
+    adaptive_gap_threshold=_env_probability(
+        "POLICY_ADAPTIVE_GAP_THRESHOLD", 0.15
+    ),
+    mmr_lambda=_env_probability("POLICY_MMR_LAMBDA", 0.70),
 )
 
 CHUNKING = ChunkingConfig(

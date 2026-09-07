@@ -30,6 +30,16 @@ class FakeEmbedder:
         return [self.embed(text) for text in texts]
 
 
+class FakeMultiVectors:
+    def encode_query(self, text: str) -> Sequence[Sequence[float]]:
+        return [[1.0]]
+
+    def encode_documents(
+        self, texts: Sequence[str]
+    ) -> Sequence[Sequence[Sequence[float]]]:
+        return [[[1.0]] for _ in texts]
+
+
 class UUIDSequence:
     def __init__(self, *values: str) -> None:
         self._values = iter(values)
@@ -83,6 +93,7 @@ def _runtime(
     runtime = WizardRuntime(
         MagicMock(),
         embedder,
+        multi_vectors=FakeMultiVectors(),
         uuid_factory=UUIDSequence(*uuid_values),
         collection_factory=factory,
     )
@@ -245,7 +256,7 @@ def test_partial_wizard_delete_restores_storage_and_both_mappings() -> None:
     documents.update_paragraphs(DOCUMENT_ID, {1: "saved"})
     paragraphs.replace_document(DOCUMENT_ID, {1: [CHUNK_ID]})
     collection.records[CHUNK_ID] = ChunkRecord(
-        CHUNK_ID, USER_ID, DOCUMENT_ID, 1, CHUNK_ID, "saved", (0.1,)
+        CHUNK_ID, USER_ID, DOCUMENT_ID, 1, CHUNK_ID, "saved", ((1.0,),), (0.1,)
     )
 
     with pytest.raises(WizardDeleteError) as error:
@@ -270,7 +281,7 @@ def test_wizard_delete_recovery_failure_is_explicit() -> None:
     documents.update_paragraphs(DOCUMENT_ID, {1: "saved"})
     paragraphs.replace_document(DOCUMENT_ID, {1: [CHUNK_ID]})
     collection.records[CHUNK_ID] = ChunkRecord(
-        CHUNK_ID, USER_ID, DOCUMENT_ID, 1, CHUNK_ID, "saved", (0.1,)
+        CHUNK_ID, USER_ID, DOCUMENT_ID, 1, CHUNK_ID, "saved", ((1.0,),), (0.1,)
     )
 
     with pytest.raises(WizardDeleteRecoveryError) as error:

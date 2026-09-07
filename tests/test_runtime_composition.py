@@ -64,6 +64,33 @@ class RecordingReranker:
         self.events.append("reranker.close")
 
 
+class RecordingMultiVectors:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    def encode_query(self, text: str) -> Sequence[Sequence[float]]:
+        return [[1.0]]
+
+    def encode_documents(
+        self, texts: Sequence[str]
+    ) -> Sequence[Sequence[Sequence[float]]]:
+        return [[[1.0]] for _ in texts]
+
+    def close(self) -> None:
+        self.events.append("multi_vectors.close")
+
+
+class RecordingSegmenter:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    def segment_document(self, text: str) -> Sequence[str]:
+        return [text]
+
+    def close(self) -> None:
+        self.events.append("segmenter.close")
+
+
 class ModelResponse:
     def __init__(self, model: str) -> None:
         self.model = model
@@ -162,6 +189,12 @@ def _application(
         task_queue_factory=factory("queue", lambda: RecordingQueue(events)),
         embedding_factory=factory("embedding", lambda: RecordingEmbedding(events)),
         reranker_factory=factory("reranker", lambda: RecordingReranker(events)),
+        multi_vector_factory=factory(
+            "multi_vectors", lambda: RecordingMultiVectors(events)
+        ),
+        conversation_segmenter_factory=factory(
+            "segmenter", lambda: RecordingSegmenter(events)
+        ),
         granite_factory=factory("granite", lambda: RecordingGranite(events)),
         qwen_factory=factory("qwen", lambda: RecordingQwen(events)),
         tokenizer_factory=factory("tokenizer", RecordingTokenizer),
@@ -191,6 +224,8 @@ def test_runtime_composes_singletons_and_closes_owned_resources_in_order() -> No
     assert services.task_queue is created["queue"]
     assert services.rag_runtime.embeddings is created["embedding"]
     assert services.rag_runtime.reranker is created["reranker"]
+    assert services.rag_runtime.multi_vectors is created["multi_vectors"]
+    assert services.rag_runtime.conversation_segmenter is created["segmenter"]
     assert services.rag_runtime.background_queue is created["queue"]
     assert services.rag_runtime.tokenizer is created["tokenizer"]
     assert isinstance(services.rag_runtime.llm, RoleRoutingLLMClient)
@@ -213,6 +248,8 @@ def test_runtime_composes_singletons_and_closes_owned_resources_in_order() -> No
         "granite.close",
         "embedding.close",
         "reranker.close",
+        "multi_vectors.close",
+        "segmenter.close",
         "processing.cleanup",
         "manager.disconnect",
     ]
@@ -262,6 +299,8 @@ def test_startup_dependency_failure_is_fail_closed_and_cleans_up() -> None:
         "granite.close",
         "embedding.close",
         "reranker.close",
+        "multi_vectors.close",
+        "segmenter.close",
         "processing.cleanup",
         "manager.disconnect",
     ]
@@ -300,6 +339,8 @@ def test_invalid_segmentation_artifact_blocks_startup_and_never_becomes_ready() 
         "granite.close",
         "embedding.close",
         "reranker.close",
+        "multi_vectors.close",
+        "segmenter.close",
         "processing.cleanup",
         "manager.disconnect",
     ]
@@ -321,6 +362,8 @@ def test_weaviate_connection_failure_still_closes_non_storage_resources() -> Non
         "granite.close",
         "embedding.close",
         "reranker.close",
+        "multi_vectors.close",
+        "segmenter.close",
         "processing.cleanup",
     ]
 
@@ -374,6 +417,8 @@ def test_partial_construction_failure_closes_only_created_resources_in_reverse()
             task_queue_factory=lambda: RecordingQueue(events),
             embedding_factory=lambda: RecordingEmbedding(events),
             reranker_factory=fail_reranker,
+            multi_vector_factory=lambda: RecordingMultiVectors(events),
+            conversation_segmenter_factory=lambda: RecordingSegmenter(events),
         )
 
     assert error.value is original
@@ -381,6 +426,8 @@ def test_partial_construction_failure_closes_only_created_resources_in_reverse()
         "embedding.close",
         "queue.close",
         "manager.disconnect",
+        "segmenter.close",
+        "multi_vectors.close",
     ]
 
 
@@ -402,6 +449,8 @@ def test_full_construction_cleanup_preserves_original_when_cleanup_fails() -> No
             task_queue_factory=lambda: RecordingQueue(events),
             embedding_factory=lambda: RecordingEmbedding(events),
             reranker_factory=lambda: RecordingReranker(events),
+            multi_vector_factory=lambda: RecordingMultiVectors(events),
+            conversation_segmenter_factory=lambda: RecordingSegmenter(events),
             granite_factory=lambda: RecordingGranite(events),
             qwen_factory=lambda: FailingCleanupQwen(events),
             tokenizer_factory=fail_tokenizer,
@@ -416,4 +465,14 @@ def test_full_construction_cleanup_preserves_original_when_cleanup_fails() -> No
         "embedding.close",
         "queue.close",
         "manager.disconnect",
+        "segmenter.close",
+        "multi_vectors.close",
     ]
+
+
+def test_production_composition_fails_closed_without_stage2_dependencies() -> None:
+    with pytest.raises(RuntimeDependencyError, match="multi-vector provider"):
+        create_runtime_app()
+
+    with pytest.raises(RuntimeDependencyError, match="retrieval segmenter"):
+        create_runtime_app(multi_vector_factory=lambda: RecordingMultiVectors([]))

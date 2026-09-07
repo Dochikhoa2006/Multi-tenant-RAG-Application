@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock
-from uuid import UUID
+from uuid import UUID, uuid5
 
 import pytest
 from weaviate.classes.config import DataType
@@ -15,10 +15,16 @@ from backend.config import (
     WEAVIATE_URL,
     get_collection_name,
 )
-from backend.model_config import CONVERSATION_SEARCH, HYBRID_SEARCH
+from backend.model_config import (
+    CONVERSATION_SEARCH,
+    HYBRID_SEARCH,
+    LATE_INTERACTION_VECTOR_NAME,
+    MMR_DIVERSITY_VECTOR_NAME,
+)
 from backend.weaviate_client.client import WeaviateManager, _collection_description
 from backend.weaviate_client.conversation import ConversationCollection
 from backend.weaviate_client.models import (
+    ConversationWriteRecoveryError,
     DeletionReport,
     IncompatibleCollectionSchemaError,
     IncompleteDeletionError,
@@ -31,6 +37,7 @@ from backend.weaviate_client.models import (
 USER_ID = "usr_abc123"
 CONVERSATION_ID = "00000000-0000-0000-0000-000000000001"
 SECOND_CONVERSATION_ID = "00000000-0000-0000-0000-000000000002"
+SEGMENT_ID = str(uuid5(UUID(CONVERSATION_ID), "retrieval-segment:0"))
 COLLECTION_NAMES = (
     get_collection_name(USER_ID, "conversations"),
     get_collection_name(USER_ID, "knowledge_facts"),
@@ -64,7 +71,10 @@ def _compatible_config(name: str) -> SimpleNamespace:
         properties = [
             _property_config("user_id", DataType.TEXT, True, False),
             _property_config("conversation_id", DataType.UUID, True, False),
-            _property_config("raw_text", DataType.TEXT, False, True),
+            _property_config("segment_id", DataType.UUID, True, False),
+            _property_config("segment_index", DataType.INT, True, False),
+            _property_config("raw_text", DataType.TEXT, False, False),
+            _property_config("segment_text", DataType.TEXT, False, True),
         ]
     else:
         properties = [
@@ -80,12 +90,22 @@ def _compatible_config(name: str) -> SimpleNamespace:
         properties=properties,
         references=[],
         vector_config={
-            "default": SimpleNamespace(
+            LATE_INTERACTION_VECTOR_NAME: SimpleNamespace(
                 vectorizer=SimpleNamespace(
                     vectorizer="none",
                     source_properties=None,
-                )
-            )
+                ),
+                vector_index_config=SimpleNamespace(
+                    multi_vector=SimpleNamespace(aggregation="maxSim")
+                ),
+            ),
+            MMR_DIVERSITY_VECTOR_NAME: SimpleNamespace(
+                vectorizer=SimpleNamespace(
+                    vectorizer="none",
+                    source_properties=None,
+                ),
+                vector_index_config=SimpleNamespace(multi_vector=None),
+            ),
         },
     )
 
@@ -390,7 +410,10 @@ def test_ensure_user_collections_creates_exact_schemas_once() -> None:
     assert [item.name for item in conversation_properties] == [
         "user_id",
         "conversation_id",
+        "segment_id",
+        "segment_index",
         "raw_text",
+        "segment_text",
     ]
     assert [item.name for item in chunk_properties] == [
         "user_id",
@@ -402,6 +425,9 @@ def test_ensure_user_collections_creates_exact_schemas_once() -> None:
     assert [item.dataType for item in conversation_properties] == [
         DataType.TEXT,
         DataType.UUID,
+        DataType.UUID,
+        DataType.INT,
+        DataType.TEXT,
         DataType.TEXT,
     ]
     assert [item.dataType for item in chunk_properties] == [
@@ -416,9 +442,15 @@ def test_ensure_user_collections_creates_exact_schemas_once() -> None:
     assert [item.indexFilterable for item in conversation_properties] == [
         True,
         True,
+        True,
+        True,
+        False,
         False,
     ]
     assert [item.indexSearchable for item in conversation_properties] == [
+        False,
+        False,
+        False,
         False,
         False,
         True,
@@ -438,7 +470,15 @@ def test_ensure_user_collections_creates_exact_schemas_once() -> None:
         True,
     ]
     for collection_name in COLLECTION_NAMES:
-        assert calls[collection_name]["vector_config"].model_dump()["vectorizer"] == {}
+        vectors = calls[collection_name]["vector_config"]
+        assert [item.name for item in vectors] == [
+            LATE_INTERACTION_VECTOR_NAME,
+            MMR_DIVERSITY_VECTOR_NAME,
+        ]
+        assert vectors[0].model_dump()["vectorIndexConfig"]["multivector"] == {
+            "enabled": True,
+            "aggregation": "maxSim",
+        }
         assert calls[collection_name]["description"] == _collection_description()
     assert [item.name for item in calls[COLLECTION_NAMES[2]]["properties"]] == [
         item.name for item in chunk_properties
@@ -515,7 +555,7 @@ def test_vector_profile_change_cannot_reuse_cached_validation(
     manager.ensure_user_collections(USER_ID)
     monkeypatch.setattr(
         weaviate_client_module,
-        "EMBEDDING_VECTOR_PROFILE",
+        "RETRIEVAL_VECTOR_PROFILE",
         "replacement-vector-profile",
     )
     manager.ensure_user_collections(USER_ID)
@@ -548,7 +588,9 @@ def test_cached_validation_still_requires_connected_manager() -> None:
         "wrong_search_index",
         "reference",
         "missing_vector",
-        "multiple_vectors",
+        "missing_diversity_vector",
+        "late_vector_not_multivector",
+        "diversity_vector_is_multivector",
         "provider_vectorizer",
         "vector_source_property",
         "mismatched_name",
@@ -579,12 +621,18 @@ def test_existing_incompatible_schema_fails_before_any_creation(
         config.references = [SimpleNamespace(name="parent")]
     elif incompatibility == "missing_vector":
         config.vector_config = {}
-    elif incompatibility == "multiple_vectors":
-        config.vector_config["second"] = config.vector_config["default"]
+    elif incompatibility == "missing_diversity_vector":
+        config.vector_config.pop(MMR_DIVERSITY_VECTOR_NAME)
+    elif incompatibility == "late_vector_not_multivector":
+        config.vector_config[LATE_INTERACTION_VECTOR_NAME].vector_index_config.multi_vector = None
+    elif incompatibility == "diversity_vector_is_multivector":
+        config.vector_config[MMR_DIVERSITY_VECTOR_NAME].vector_index_config.multi_vector = SimpleNamespace(
+            aggregation="maxSim"
+        )
     elif incompatibility == "provider_vectorizer":
-        config.vector_config["default"].vectorizer.vectorizer = "text2vec-openai"
+        config.vector_config[LATE_INTERACTION_VECTOR_NAME].vectorizer.vectorizer = "text2vec-openai"
     elif incompatibility == "vector_source_property":
-        config.vector_config["default"].vectorizer.source_properties = ["raw_text"]
+        config.vector_config[LATE_INTERACTION_VECTOR_NAME].vectorizer.source_properties = ["raw_text"]
     elif incompatibility == "mismatched_name":
         config.name = COLLECTION_NAMES[0]
     elif incompatibility == "stale_vector_profile":
@@ -644,14 +692,16 @@ def test_collection_create_failure_is_propagated_and_retry_fills_missing() -> No
     assert client.collections.exists.call_count == 6
 
 
-def test_insert_uses_conversation_id_as_object_uuid_and_native_vector() -> None:
+def test_insert_uses_deterministic_segment_uuid_and_both_named_vectors() -> None:
     manager, client, collection = _manager_and_collection()
-    collection.data.insert.return_value = UUID(CONVERSATION_ID)
+    collection.data.insert.return_value = UUID(SEGMENT_ID)
     conversations = ConversationCollection(manager, USER_ID)
 
     inserted = conversations.insert(
         CONVERSATION_ID,
         "Question\nAnswer",
+        ["Question\nAnswer"],
+        [[[0.3, 0.7], [0.4, 0.6]]],
         [0.1, 0.2],
     )
 
@@ -661,14 +711,137 @@ def test_insert_uses_conversation_id_as_object_uuid_and_native_vector() -> None:
         properties={
             "user_id": USER_ID,
             "conversation_id": CONVERSATION_ID,
+            "segment_id": SEGMENT_ID,
+            "segment_index": 0,
             "raw_text": "Question\nAnswer",
+            "segment_text": "Question\nAnswer",
         },
-        uuid=CONVERSATION_ID,
-        vector=[0.1, 0.2],
+        uuid=SEGMENT_ID,
+        vector={
+            "late_interaction": [[0.3, 0.7], [0.4, 0.6]],
+            "mmr_diversity": [0.1, 0.2],
+        },
     )
 
 
-def test_delete_and_batch_delete_use_object_ids() -> None:
+def test_partial_segment_write_is_compensated_before_failure_surfaces() -> None:
+    manager, _, collection = _manager_and_collection()
+    second_segment_id = str(uuid5(UUID(CONVERSATION_ID), "retrieval-segment:1"))
+    collection.data.insert.side_effect = [
+        UUID(SEGMENT_ID),
+        RuntimeError("second segment failed"),
+    ]
+    collection.data.delete_many.side_effect = [
+        _delete_result([SEGMENT_ID], [True], successful=1, failed=0),
+        _dry_run_result([]),
+    ]
+    conversations = ConversationCollection(manager, USER_ID)
+
+    with pytest.raises(RuntimeError, match="second segment failed"):
+        conversations.insert(
+            CONVERSATION_ID,
+            "onetwo",
+            ["one", "two"],
+            [[[0.2]], [[0.3]]],
+            [0.1],
+        )
+
+    assert collection.data.delete_many.call_count == 2
+    deleting, verifying = collection.data.delete_many.call_args_list
+    for call in (deleting, verifying):
+        where = call.kwargs["where"]
+        assert where.target == "_id"
+        assert where.value == [SEGMENT_ID, second_segment_id]
+        assert call.kwargs["verbose"] is True
+    assert "dry_run" not in deleting.kwargs
+    assert verifying.kwargs["dry_run"] is True
+
+
+@pytest.mark.parametrize(
+    ("cleanup_results", "cleanup_error_type"),
+    [
+        (
+            [
+                _delete_result([SEGMENT_ID], [True], successful=1, failed=0),
+                _dry_run_result([SEGMENT_ID]),
+            ],
+            IncompleteDeletionError,
+        ),
+        (
+            [
+                _delete_result([SEGMENT_ID], [False], successful=0, failed=1),
+                _dry_run_result([]),
+            ],
+            IncompleteDeletionError,
+        ),
+        (
+            [SimpleNamespace(matches=1, successful=1, failed=0, objects=[])],
+            WeaviateResponseError,
+        ),
+        (
+            [
+                _delete_result([SEGMENT_ID], [True], successful=1, failed=0),
+                SimpleNamespace(matches=1, successful=0, failed=0, objects=[]),
+            ],
+            WeaviateResponseError,
+        ),
+        ([RuntimeError("cleanup transport failed")], RuntimeError),
+        (
+            [
+                _delete_result([SEGMENT_ID], [True], successful=1, failed=0),
+                RuntimeError("verification transport failed"),
+            ],
+            RuntimeError,
+        ),
+    ],
+)
+def test_unverified_segment_compensation_surfaces_explicit_recovery_error(
+    cleanup_results: list[object],
+    cleanup_error_type: type[Exception],
+) -> None:
+    manager, _, collection = _manager_and_collection()
+    write_error = RuntimeError("segment insert failed")
+    collection.data.insert.side_effect = write_error
+    collection.data.delete_many.side_effect = cleanup_results
+    conversations = ConversationCollection(manager, USER_ID)
+
+    with pytest.raises(ConversationWriteRecoveryError) as error:
+        conversations.insert(
+            CONVERSATION_ID,
+            "Question\nAnswer",
+            ["Question\nAnswer"],
+            [[[0.2]]],
+            [0.1],
+        )
+
+    assert error.value.attempted_segment_ids == (SEGMENT_ID,)
+    assert error.value.write_error is write_error
+    assert isinstance(error.value.cleanup_error, cleanup_error_type)
+    assert error.value.__cause__ is write_error
+
+
+def test_insert_uuid_mismatch_is_compensated_and_original_error_surfaces() -> None:
+    manager, _, collection = _manager_and_collection()
+    collection.data.insert.return_value = UUID(SECOND_CONVERSATION_ID)
+    collection.data.delete_many.side_effect = [
+        _delete_result([SEGMENT_ID], [True], successful=1, failed=0),
+        _dry_run_result([]),
+    ]
+    conversations = ConversationCollection(manager, USER_ID)
+
+    with pytest.raises(WeaviateResponseError, match="does not match segment_id"):
+        conversations.insert(
+            CONVERSATION_ID,
+            "Question\nAnswer",
+            ["Question\nAnswer"],
+            [[[0.2]]],
+            [0.1],
+        )
+
+    assert collection.data.delete_many.call_count == 2
+
+
+def test_delete_and_batch_delete_filter_every_segment_by_canonical_id() -> None:
     manager, _, collection = _manager_and_collection()
     conversations = ConversationCollection(manager, USER_ID)
 
@@ -677,9 +850,12 @@ def test_delete_and_batch_delete_use_object_ids() -> None:
         [CONVERSATION_ID, SECOND_CONVERSATION_ID, CONVERSATION_ID]
     )
 
-    collection.data.delete_by_id.assert_called_once_with(CONVERSATION_ID)
-    where = collection.data.delete_many.call_args.kwargs["where"]
-    assert where.target == "_id"
+    assert collection.data.delete_many.call_count == 2
+    single, batch = collection.data.delete_many.call_args_list
+    assert single.kwargs["where"].target == "conversation_id"
+    assert single.kwargs["where"].value == CONVERSATION_ID
+    where = batch.kwargs["where"]
+    assert where.target == "conversation_id"
     assert where.value == [CONVERSATION_ID, SECOND_CONVERSATION_ID]
 
 
@@ -757,7 +933,7 @@ def test_partial_verified_batch_delete_is_retryable() -> None:
     assert retry.deleted_ids == (SECOND_CONVERSATION_ID,)
 
 
-def test_verified_batch_delete_rejects_malformed_or_cross_scope_results() -> None:
+def test_verified_batch_delete_rejects_malformed_results() -> None:
     manager, _, collection = _manager_and_collection()
     conversations = ConversationCollection(manager, USER_ID)
     collection.data.delete_many.side_effect = [
@@ -771,15 +947,6 @@ def test_verified_batch_delete_rejects_malformed_or_cross_scope_results() -> Non
     ]
     with pytest.raises(WeaviateResponseError, match="one object per match"):
         conversations.delete_batch_verified([CONVERSATION_ID])
-
-    outside_id = "00000000-0000-0000-0000-000000000099"
-    collection.data.delete_many.side_effect = [
-        _delete_result([outside_id], [True], successful=1, failed=0),
-        _dry_run_result([]),
-    ]
-    with pytest.raises(WeaviateResponseError, match="scope"):
-        conversations.delete_batch_verified([CONVERSATION_ID])
-
 
 def test_verified_batch_delete_accepts_already_absent_ids_and_empty_input() -> None:
     manager, client, collection = _manager_and_collection()
@@ -801,43 +968,53 @@ def test_hybrid_search_returns_typed_results_and_expected_query() -> None:
     collection.query.hybrid.return_value = SimpleNamespace(
         objects=[
             SimpleNamespace(
-                uuid=UUID(CONVERSATION_ID),
+                uuid=UUID(SEGMENT_ID),
                 properties={
                     "user_id": USER_ID,
                     "conversation_id": CONVERSATION_ID,
+                    "segment_id": SEGMENT_ID,
+                    "segment_index": 0,
                     "raw_text": "Question\nAnswer",
+                    "segment_text": "Question\nAnswer",
                 },
+                vector={"mmr_diversity": [0.1, 0.2]},
                 metadata=SimpleNamespace(score=0.91),
             )
         ]
     )
     conversations = ConversationCollection(manager, USER_ID)
 
-    results = conversations.hybrid_search("database indexing", [0.3, 0.7], 20)
+    results = conversations.hybrid_search(
+        "database indexing", [[0.3, 0.7], [0.2, 0.8]], 40
+    )
 
     assert results == [
         SearchResult(
-            object_id=CONVERSATION_ID,
+            object_id=SEGMENT_ID,
             properties={
                 "user_id": USER_ID,
                 "conversation_id": CONVERSATION_ID,
+                "segment_id": SEGMENT_ID,
+                "segment_index": 0,
                 "raw_text": "Question\nAnswer",
+                "segment_text": "Question\nAnswer",
             },
             score=0.91,
+            vector=(0.1, 0.2),
         )
     ]
     kwargs = collection.query.hybrid.call_args.kwargs
     assert kwargs["query"] == "database indexing"
-    assert kwargs["vector"] == [0.3, 0.7]
+    assert kwargs["vector"] == [[0.3, 0.7], [0.2, 0.8]]
     assert HYBRID_SEARCH.alpha == 0.70
     assert kwargs["alpha"] == 0.70
-    assert kwargs["query_properties"] == ["raw_text"]
+    assert kwargs["query_properties"] == ["segment_text"]
     assert kwargs["fusion_type"] is HybridFusion.RELATIVE_SCORE
-    assert kwargs["limit"] == 20
-    assert kwargs["include_vector"] is False
-    assert kwargs["diversity_selection"].limit == 5
-    assert kwargs["diversity_selection"].balance == 0.70
-    assert CONVERSATION_SEARCH.candidate_count == 20
+    assert kwargs["limit"] == 40
+    assert kwargs["include_vector"] == ["mmr_diversity"]
+    assert kwargs["target_vector"] == "late_interaction"
+    assert "diversity_selection" not in kwargs
+    assert CONVERSATION_SEARCH.candidate_count == 40
     assert CONVERSATION_SEARCH.final_count == 5
     assert CONVERSATION_SEARCH.mmr_lambda == 0.70
     assert kwargs["return_metadata"].score is True
@@ -849,12 +1026,14 @@ def test_sdk_errors_are_not_swallowed() -> None:
     conversations = ConversationCollection(manager, USER_ID)
 
     with pytest.raises(RuntimeError, match="write failed"):
-        conversations.insert(CONVERSATION_ID, "content", [0.1])
+        conversations.insert(
+            CONVERSATION_ID, "content", ["content"], [[[0.2]]], [0.1]
+        )
 
 
 def test_delete_failure_is_not_swallowed() -> None:
     manager, _, collection = _manager_and_collection()
-    collection.data.delete_by_id.side_effect = RuntimeError("delete failed")
+    collection.data.delete_many.side_effect = RuntimeError("delete failed")
     conversations = ConversationCollection(manager, USER_ID)
 
     with pytest.raises(RuntimeError, match="delete failed"):
@@ -870,7 +1049,6 @@ def test_delete_uuid_validation_prevents_single_and_batch_mutation() -> None:
     with pytest.raises(ValueError, match="UUID"):
         conversations.delete_batch([CONVERSATION_ID, "not-a-uuid"])
 
-    collection.data.delete_by_id.assert_not_called()
     collection.data.delete_many.assert_not_called()
 
 
@@ -882,7 +1060,9 @@ def test_conversation_uuid_validation_prevents_insert(
     conversations = ConversationCollection(manager, USER_ID)
 
     with pytest.raises((TypeError, ValueError)):
-        conversations.insert(conversation_id, "content", [0.1])  # type: ignore[arg-type]
+        conversations.insert(
+            conversation_id, "content", ["content"], [[[0.2]]], [0.1]
+        )  # type: ignore[arg-type]
     collection.data.insert.assert_not_called()
 
 
@@ -892,7 +1072,9 @@ def test_conversation_text_validation_prevents_insert(raw_text: str) -> None:
     conversations = ConversationCollection(manager, USER_ID)
 
     with pytest.raises(ValueError, match="raw_text"):
-        conversations.insert(CONVERSATION_ID, raw_text, [0.1])
+        conversations.insert(
+            CONVERSATION_ID, raw_text, [raw_text], [[[0.2]]], [0.1]
+        )
     collection.data.insert.assert_not_called()
 
 
@@ -905,7 +1087,9 @@ def test_conversation_vector_validation_prevents_insert(vector: list[object]) ->
     conversations = ConversationCollection(manager, USER_ID)
 
     with pytest.raises((TypeError, ValueError)):
-        conversations.insert(CONVERSATION_ID, "content", vector)  # type: ignore[arg-type]
+        conversations.insert(
+            CONVERSATION_ID, "content", ["content"], [[[0.2]]], vector
+        )  # type: ignore[arg-type]
     collection.data.insert.assert_not_called()
 
 
@@ -915,36 +1099,35 @@ def test_search_top_k_validation_prevents_query(top_k: object) -> None:
     conversations = ConversationCollection(manager, USER_ID)
 
     with pytest.raises((TypeError, ValueError)):
-        conversations.hybrid_search("query", [0.1], top_k)  # type: ignore[arg-type]
+        conversations.hybrid_search("query", [[0.1]], top_k)  # type: ignore[arg-type]
     collection.query.hybrid.assert_not_called()
 
 
-def test_native_mmr_final_limit_does_not_exceed_direct_candidate_limit() -> None:
+def test_collection_search_has_no_native_mmr() -> None:
     manager, _, collection = _manager_and_collection()
     collection.query.hybrid.return_value = SimpleNamespace(objects=[])
     conversations = ConversationCollection(manager, USER_ID)
 
-    assert conversations.hybrid_search("query", [0.1], 3) == []
+    assert conversations.hybrid_search("query", [[0.1]], 3) == []
 
     kwargs = collection.query.hybrid.call_args.kwargs
     assert kwargs["limit"] == 3
-    assert kwargs["diversity_selection"].limit == 3
-    assert kwargs["diversity_selection"].balance == 0.70
+    assert "diversity_selection" not in kwargs
 
 
 @pytest.mark.parametrize(
     ("query_text", "query_vector"),
     [
-        ("", [0.1]),
-        (" \n", [0.1]),
+        ("", [[0.1]]),
+        (" \n", [[0.1]]),
         ("query", []),
-        ("query", [float("nan")]),
-        ("query", [float("-inf")]),
+        ("query", [[float("nan")]]),
+        ("query", [[float("-inf")]]),
     ],
 )
 def test_search_query_validation_prevents_sdk_call(
     query_text: str,
-    query_vector: list[float],
+    query_vector: list[object],
 ) -> None:
     manager, _, collection = _manager_and_collection()
     conversations = ConversationCollection(manager, USER_ID)
@@ -954,16 +1137,19 @@ def test_search_query_validation_prevents_sdk_call(
     collection.query.hybrid.assert_not_called()
 
 
-def test_search_ignores_unrequested_response_vector_data() -> None:
+def test_search_requires_requested_mmr_diversity_vector() -> None:
     manager, _, collection = _manager_and_collection()
     collection.query.hybrid.return_value = SimpleNamespace(
         objects=[
             SimpleNamespace(
-                uuid=UUID(CONVERSATION_ID),
+                uuid=UUID(SEGMENT_ID),
                 properties={
                     "user_id": USER_ID,
                     "conversation_id": CONVERSATION_ID,
+                    "segment_id": SEGMENT_ID,
+                    "segment_index": 0,
                     "raw_text": "content",
+                    "segment_text": "content",
                 },
                 vector={"unexpected": [float("nan")]},
                 metadata=SimpleNamespace(score=0.8),
@@ -972,10 +1158,8 @@ def test_search_ignores_unrequested_response_vector_data() -> None:
     )
     conversations = ConversationCollection(manager, USER_ID)
 
-    results = conversations.hybrid_search("query", [0.1], 20)
-
-    assert results[0].vector is None
-    assert collection.query.hybrid.call_args.kwargs["include_vector"] is False
+    with pytest.raises(WeaviateResponseError, match="MMR-diversity"):
+        conversations.hybrid_search("query", [[0.1]], 40)
 
 
 @pytest.mark.parametrize("bad_score", [None, float("nan"), float("inf"), "bad"])
@@ -984,13 +1168,16 @@ def test_missing_or_malformed_response_scores_are_rejected(bad_score: object) ->
     collection.query.hybrid.return_value = SimpleNamespace(
         objects=[
             SimpleNamespace(
-                uuid=UUID(CONVERSATION_ID),
+                uuid=UUID(SEGMENT_ID),
                 properties={
                     "user_id": USER_ID,
                     "conversation_id": CONVERSATION_ID,
+                    "segment_id": SEGMENT_ID,
+                    "segment_index": 0,
                     "raw_text": "content",
+                    "segment_text": "content",
                 },
-                vector=[0.1],
+                vector={"mmr_diversity": [0.1]},
                 metadata=SimpleNamespace(score=bad_score),
             )
         ]
@@ -998,7 +1185,7 @@ def test_missing_or_malformed_response_scores_are_rejected(bad_score: object) ->
     conversations = ConversationCollection(manager, USER_ID)
 
     with pytest.raises(WeaviateResponseError, match="score"):
-        conversations.hybrid_search("query", [0.1], 20)
+        conversations.hybrid_search("query", [[0.1]], 40)
 
 
 def test_cross_user_search_result_is_rejected() -> None:
@@ -1006,13 +1193,16 @@ def test_cross_user_search_result_is_rejected() -> None:
     collection.query.hybrid.return_value = SimpleNamespace(
         objects=[
             SimpleNamespace(
-                uuid=UUID(CONVERSATION_ID),
+                uuid=UUID(SEGMENT_ID),
                 properties={
                     "user_id": "usr_other",
                     "conversation_id": CONVERSATION_ID,
+                    "segment_id": SEGMENT_ID,
+                    "segment_index": 0,
                     "raw_text": "content",
+                    "segment_text": "content",
                 },
-                vector=[0.1],
+                vector={"mmr_diversity": [0.1]},
                 metadata=SimpleNamespace(score=0.8),
             )
         ]
@@ -1020,7 +1210,7 @@ def test_cross_user_search_result_is_rejected() -> None:
     conversations = ConversationCollection(manager, USER_ID)
 
     with pytest.raises(UserIsolationError, match="user_id"):
-        conversations.hybrid_search("query", [0.1], 20)
+        conversations.hybrid_search("query", [[0.1]], 40)
 
 
 @pytest.mark.parametrize(
@@ -1039,18 +1229,21 @@ def test_malformed_or_mismatched_result_ids_are_rejected(
                 uuid=object_id,
                 properties={
                     "user_id": USER_ID,
-                    "conversation_id": business_id,
+                    "conversation_id": CONVERSATION_ID,
+                    "segment_id": business_id,
+                    "segment_index": 0,
                     "raw_text": "content",
+                    "segment_text": "content",
                 },
-                vector=[0.1],
+                vector={"mmr_diversity": [0.1]},
                 metadata=SimpleNamespace(score=0.8),
             )
         ]
     )
     conversations = ConversationCollection(manager, USER_ID)
 
-    with pytest.raises(WeaviateResponseError, match="UUID|conversation_id"):
-        conversations.hybrid_search("query", [0.1], 20)
+    with pytest.raises(WeaviateResponseError, match="UUID|segment_id"):
+        conversations.hybrid_search("query", [[0.1]], 40)
 
 
 @pytest.mark.parametrize("properties", [None, [], "not-a-mapping"])
@@ -1061,7 +1254,7 @@ def test_malformed_result_properties_are_rejected(properties: object) -> None:
             SimpleNamespace(
                 uuid=UUID(CONVERSATION_ID),
                 properties=properties,
-                vector=[0.1],
+                vector={"mmr_diversity": [0.1]},
                 metadata=SimpleNamespace(score=0.8),
             )
         ]
@@ -1069,7 +1262,7 @@ def test_malformed_result_properties_are_rejected(properties: object) -> None:
     conversations = ConversationCollection(manager, USER_ID)
 
     with pytest.raises(WeaviateResponseError, match="properties"):
-        conversations.hybrid_search("query", [0.1], 20)
+        conversations.hybrid_search("query", [[0.1]], 40)
 
 
 @pytest.mark.parametrize(
@@ -1085,17 +1278,20 @@ def test_every_conversation_operation_uses_only_its_bound_collection(
 ) -> None:
     client = MagicMock()
     collection = MagicMock()
-    collection.data.insert.return_value = UUID(CONVERSATION_ID)
+    collection.data.insert.return_value = UUID(SEGMENT_ID)
     collection.query.hybrid.return_value = SimpleNamespace(
         objects=[
             SimpleNamespace(
-                uuid=UUID(CONVERSATION_ID),
+                uuid=UUID(SEGMENT_ID),
                 properties={
                     "user_id": user_id,
                     "conversation_id": CONVERSATION_ID,
+                    "segment_id": SEGMENT_ID,
+                    "segment_index": 0,
                     "raw_text": "content",
+                    "segment_text": "content",
                 },
-                vector=[0.1],
+                vector={"mmr_diversity": [0.1]},
                 metadata=SimpleNamespace(score=0.8),
             )
         ]
@@ -1106,10 +1302,12 @@ def test_every_conversation_operation_uses_only_its_bound_collection(
     client.collections.use.reset_mock()
     conversations = ConversationCollection(manager, user_id)
 
-    conversations.insert(CONVERSATION_ID, "content", [0.1])
+    conversations.insert(
+        CONVERSATION_ID, "content", ["content"], [[[0.2]]], [0.1]
+    )
     conversations.delete(CONVERSATION_ID)
     conversations.delete_batch([CONVERSATION_ID])
-    conversations.hybrid_search("query", [0.1], 20)
+    conversations.hybrid_search("query", [[0.1]], 40)
 
     assert [call.args[0] for call in client.collections.use.call_args_list] == [
         expected_name,

@@ -11,7 +11,7 @@ from time import perf_counter
 from typing import Any
 
 from backend.mappings._common import required_uuid, validated_user_id
-from backend.rag.embedder import embed_conversation, embed_text
+from backend.rag.embedder import embed_conversation, encode_query
 from backend.rag.generator import generate_answer_stream
 from backend.rag.query_rewriter import rewrite_query
 from backend.rag.retrieval import retrieve
@@ -120,7 +120,7 @@ async def run_rag_pipeline(
     original_vector = await _timed_sync_call(
         "original_query_embedding",
         timing_observer,
-        embed_text,
+        encode_query,
         query,
         runtime=active_runtime,
     )
@@ -144,7 +144,7 @@ async def run_rag_pipeline(
     rewritten_vector = await _timed_sync_call(
         "rewritten_query_embedding",
         timing_observer,
-        embed_text,
+        encode_query,
         rewritten_query,
         runtime=active_runtime,
     )

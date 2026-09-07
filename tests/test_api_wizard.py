@@ -44,6 +44,16 @@ class FakeEmbedder:
         return [[1.0, 0.0] for _ in texts]
 
 
+class FakeMultiVectors:
+    def encode_query(self, text: str) -> Sequence[Sequence[float]]:
+        return [[0.5, 0.5]]
+
+    def encode_documents(
+        self, texts: Sequence[str]
+    ) -> Sequence[Sequence[Sequence[float]]]:
+        return [[[0.5, 0.5]] for _ in texts]
+
+
 class MemoryChunkCollection:
     def __init__(self) -> None:
         self.records: dict[str, ChunkRecord] = {}
@@ -97,7 +107,8 @@ class MemoryChunkCollection:
         paragraph_id: int,
         chunk_id: str,
         raw_text: str,
-        vector: Sequence[float],
+        multi_vector: Sequence[Sequence[float]],
+        diversity_vector: Sequence[float],
     ) -> str:
         if self.fail_insert:
             raise RuntimeError("insert failed")
@@ -108,7 +119,10 @@ class MemoryChunkCollection:
             paragraph_id=paragraph_id,
             chunk_id=chunk_id,
             raw_text=raw_text,
-            vector=tuple(float(item) for item in vector),
+            late_interaction=tuple(
+                tuple(float(item) for item in row) for row in multi_vector
+            ),
+            mmr_diversity=tuple(float(item) for item in diversity_vector),
         )
         return chunk_id
 
@@ -122,7 +136,8 @@ class MemoryChunkCollection:
                 paragraph_id=paragraph_id,
                 chunk_id=item.chunk_id,
                 raw_text=item.raw_text,
-                vector=item.vector,
+                late_interaction=item.late_interaction,
+                mmr_diversity=item.mmr_diversity,
             )
 
 
@@ -148,6 +163,7 @@ def _harness():
     runtime = WizardRuntime(
         manager,  # type: ignore[arg-type]
         embedder,
+        multi_vectors=FakeMultiVectors(),
         paragraph_splitter=lambda text: [text] if text else [],
         paragraph_chunker=lambda text: [text] if text else [],
         uuid_factory=uuid4,

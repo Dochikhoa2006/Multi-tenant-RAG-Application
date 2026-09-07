@@ -8,10 +8,14 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 from uuid import UUID
 
-from weaviate.classes.query import Diversity, HybridFusion, MetadataQuery
+from weaviate.classes.query import HybridFusion, MetadataQuery
 
 from backend.config import get_collection_name
-from backend.model_config import HYBRID_SEARCH
+from backend.model_config import (
+    HYBRID_SEARCH,
+    LATE_INTERACTION_VECTOR_NAME,
+    MMR_DIVERSITY_VECTOR_NAME,
+)
 from backend.weaviate_client.client import WeaviateManager
 from backend.weaviate_client.models import (
     SearchResult,
@@ -71,6 +75,21 @@ def _vector_values(vector: object, name: str = "vector") -> list[float]:
     return values
 
 
+def _multi_vector_values(
+    vector: object,
+    name: str = "multi-vector",
+) -> list[list[float]]:
+    if isinstance(vector, (str, bytes)) or not isinstance(vector, Sequence):
+        raise TypeError(f"{name} must be a sequence of vectors")
+    rows = [_vector_values(row, f"{name} row") for row in vector]
+    if not rows:
+        raise ValueError(f"{name} must not be empty")
+    dimensions = {len(row) for row in rows}
+    if len(dimensions) != 1:
+        raise ValueError(f"{name} rows must have consistent dimensions")
+    return rows
+
+
 def _fusion_type() -> HybridFusion:
     normalized = re.sub(r"[^a-z]", "", HYBRID_SEARCH.fusion_method.lower())
     if normalized in {"relativescore", "relativescorefusion"}:
@@ -83,21 +102,40 @@ def _fusion_type() -> HybridFusion:
 
 
 def _result_vector(value: object) -> tuple[float, ...]:
-    """Validate a native vector for snapshot/recovery operations."""
+    """Validate the requested stored GTE MMR-diversity vector."""
 
     if value is None:
-        raise WeaviateResponseError("snapshot result is missing its native vector")
+        raise WeaviateResponseError("result is missing its MMR-diversity vector")
     selected = value
     if isinstance(value, Mapping):
-        if len(value) != 1:
+        if MMR_DIVERSITY_VECTOR_NAME not in value:
             raise WeaviateResponseError(
-                "snapshot result contains zero or multiple native vectors"
+                "result does not contain the requested MMR-diversity vector"
             )
-        selected = next(iter(value.values()))
+        selected = value[MMR_DIVERSITY_VECTOR_NAME]
     try:
-        return tuple(_vector_values(selected, "snapshot vector"))
+        return tuple(_vector_values(selected, "MMR-diversity vector"))
     except (TypeError, ValueError) as exc:
-        raise WeaviateResponseError("snapshot result contains a malformed vector") from exc
+        raise WeaviateResponseError("result contains a malformed MMR vector") from exc
+
+
+def _result_multi_vector(value: object) -> tuple[tuple[float, ...], ...]:
+    if not isinstance(value, Mapping) or LATE_INTERACTION_VECTOR_NAME not in value:
+        raise WeaviateResponseError(
+            "result does not contain the requested late-interaction multi-vector"
+        )
+    try:
+        return tuple(
+            tuple(row)
+            for row in _multi_vector_values(
+                value[LATE_INTERACTION_VECTOR_NAME],
+                "late-interaction multi-vector",
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise WeaviateResponseError(
+            "result contains a malformed late-interaction multi-vector"
+        ) from exc
 
 
 def _result_score(value: object) -> float:
@@ -123,6 +161,7 @@ class _CollectionBase:
     collection_type: str
     id_property: str
     return_properties: tuple[str, ...]
+    search_property = "raw_text"
 
     def __init__(self, manager: WeaviateManager, user_id: str) -> None:
         if not isinstance(manager, WeaviateManager):
@@ -141,32 +180,24 @@ class _CollectionBase:
     def _hybrid_search(
         self,
         query_text: str,
-        query_vector: Sequence[float],
+        query_vector: Sequence[Sequence[float]],
         top_k: int,
-        *,
-        diversity_limit: int | None = None,
-        diversity_balance: float | None = None,
     ) -> list[SearchResult]:
         query = _required_text(query_text, "query_text")
-        vector = _vector_values(query_vector, "query_vector")
+        vector = _multi_vector_values(query_vector, "query_vector")
         limit = _positive_top_k(top_k)
         query_options: dict[str, Any] = {
             "query": query,
             "vector": vector,
             "alpha": HYBRID_SEARCH.alpha,
-            "query_properties": ["raw_text"],
+            "query_properties": [self.search_property],
             "fusion_type": _fusion_type(),
             "limit": limit,
-            "include_vector": False,
+            "target_vector": LATE_INTERACTION_VECTOR_NAME,
+            "include_vector": [MMR_DIVERSITY_VECTOR_NAME],
             "return_metadata": MetadataQuery(score=True),
             "return_properties": list(self.return_properties),
         }
-        if diversity_limit is not None:
-            selected_limit = min(_positive_top_k(diversity_limit), limit)
-            query_options["diversity_selection"] = Diversity.mmr(
-                limit=selected_limit,
-                balance=diversity_balance,
-            )
         response = self._collection.query.hybrid(**query_options)
         results: list[SearchResult] = []
         for item in response.objects:
@@ -196,6 +227,7 @@ class _CollectionBase:
                     object_id=object_id,
                     properties=properties,
                     score=_result_score(score),
+                    vector=_result_vector(getattr(item, "vector", None)),
                 )
             )
         return results

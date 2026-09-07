@@ -30,10 +30,29 @@ def _uuid(index: int) -> str:
     return f"71000000-0000-0000-0000-{index:012d}"
 
 
-def _result(index: int, text: str, vector: Sequence[float], score: float) -> SearchResult:
+def _result(
+    index: int,
+    text: str,
+    vector: Sequence[float],
+    score: float,
+    collection_type: str,
+) -> SearchResult:
+    object_id = _uuid(index)
+    properties: dict[str, object] = {"user_id": USER_ID, "raw_text": text}
+    if collection_type == "conversations":
+        properties.update(
+            {
+                "segment_id": object_id,
+                "conversation_id": _uuid(index + 100),
+                "segment_index": 0,
+                "segment_text": text,
+            }
+        )
+    else:
+        properties["chunk_id"] = object_id
     return SearchResult(
-        object_id=_uuid(index),
-        properties={"raw_text": text},
+        object_id=object_id,
+        properties=properties,
         vector=tuple(vector),
         score=score,
     )
@@ -65,6 +84,28 @@ class RecordingEmbeddings:
         model: str,
     ) -> Sequence[Sequence[float]]:
         return [[0.5, 0.5] for _ in texts]
+
+
+class RecordingMultiVectors:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.calls: list[tuple[str, str, int]] = []
+
+    def encode_query(self, text: str) -> Sequence[Sequence[float]]:
+        self.calls.append(("query", text, threading.get_ident()))
+        self.events.append(f"multi:{text}")
+        return [[1.0, 0.0]] if text == ORIGINAL_QUERY else [[0.0, 1.0]]
+
+    def encode_documents(
+        self, texts: Sequence[str]
+    ) -> Sequence[Sequence[Sequence[float]]]:
+        self.calls.append(("documents", "\n".join(texts), threading.get_ident()))
+        return [[[0.2, 0.8]] for _ in texts]
+
+
+class OneSegment:
+    def segment_document(self, text: str) -> Sequence[str]:
+        return [text]
 
 
 class RecordingLLM:
@@ -143,16 +184,21 @@ class RecordingCollection:
         self.results = results
         self.events = events
         self.rendezvous = rendezvous
-        self.calls: list[tuple[str, list[float], int, int]] = []
+        self.calls: list[tuple[str, list[list[float]], int, int]] = []
 
     def hybrid_search(
         self,
         query_text: str,
-        query_vector: Sequence[float],
+        query_vector: Sequence[Sequence[float]],
         top_k: int,
     ) -> list[SearchResult]:
         self.calls.append(
-            (query_text, list(query_vector), top_k, threading.get_ident())
+            (
+                query_text,
+                [list(row) for row in query_vector],
+                top_k,
+                threading.get_ident(),
+            )
         )
         self.events.append(f"search:{self.name}")
         if self.rendezvous is not None:
@@ -165,17 +211,26 @@ class RecordingConversationWriter:
     events: list[str]
 
     def __post_init__(self) -> None:
-        self.inserts: list[tuple[str, str, list[float], int]] = []
+        self.inserts: list[tuple[object, ...]] = []
 
     def insert(
         self,
         conversation_id: str,
         raw_text: str,
-        vector: Sequence[float],
+        segment_texts: Sequence[str],
+        segment_vectors: Sequence[Sequence[Sequence[float]]],
+        diversity_vector: Sequence[float],
     ) -> str:
         self.events.append("conversation_insert")
         self.inserts.append(
-            (conversation_id, raw_text, list(vector), threading.get_ident())
+            (
+                conversation_id,
+                raw_text,
+                list(segment_texts),
+                [[list(row) for row in matrix] for matrix in segment_vectors],
+                list(diversity_vector),
+                threading.get_ident(),
+            )
         )
         return conversation_id
 
@@ -229,6 +284,7 @@ def _harness(
 ) -> Harness:
     events: list[str] = []
     embeddings = RecordingEmbeddings(events)
+    multi_vectors = RecordingMultiVectors(events)
     llm = RecordingLLM(events, chunks=chunks, stream_failure=stream_failure)
     reranker = RecordingReranker(events)
     queue = RecordingQueue(events, queue_failure)
@@ -245,26 +301,28 @@ def _harness(
         embeddings,
         reranker,
         factory,
+        multi_vectors=multi_vectors,
+        conversation_segmenter=OneSegment(),
         tokenizer=WordTokenizer(),
         background_queue=queue if include_queue else None,
     )
     conversation = RecordingCollection(
         "conversations",
         [
-            _result(1, "Earlier discussion about MMR.", [1.0, 0.0], 0.9),
-            _result(2, "Different retrieval concern.", [0.0, 1.0], 0.8),
+            _result(1, "Earlier discussion about MMR.", [1.0, 0.0], 0.9, "conversations"),
+            _result(2, "Different retrieval concern.", [0.0, 1.0], 0.8, "conversations"),
         ],
         events,
     )
     knowledge = RecordingCollection(
         "knowledge_facts",
-        [_result(3, "MMR combines relevance and novelty.", [1.0, 0.0], 0.9)],
+        [_result(3, "MMR combines relevance and novelty.", [1.0, 0.0], 0.9, "knowledge_facts")],
         events,
         rendezvous=rendezvous,
     )
     policy = RecordingCollection(
         "policy",
-        [_result(4, "Explain tradeoffs explicitly.", [0.0, 1.0], 0.8)],
+        [_result(4, "Explain tradeoffs explicitly.", [0.0, 1.0], 0.8, "policy")],
         events,
         rendezvous=rendezvous,
     )
@@ -310,33 +368,28 @@ def test_pipeline_uses_official_rewritten_query_and_enqueues_complete_answer() -
     chunks = asyncio.run(_collect(harness))
 
     assert chunks == ["MMR ", "balances diversity."]
-    assert [call[:2] for call in harness.embeddings.calls] == [
-        (ORIGINAL_QUERY, EMBEDDING_MODEL),
-        (REWRITTEN_QUERY, EMBEDDING_MODEL),
-    ]
+    assert harness.embeddings.calls == []
     assert harness.conversation.calls[0][:3] == (
         ORIGINAL_QUERY,
-        [1.0, 0.0],
+        [[1.0, 0.0]],
         CONVERSATION_SEARCH.candidate_count,
     )
     assert harness.knowledge.calls[0][:3] == (
         REWRITTEN_QUERY,
-        [0.0, 1.0],
+        [[0.0, 1.0]],
         KNOWLEDGE_SEARCH.candidate_count,
     )
     assert harness.policy.calls[0][:3] == (
         REWRITTEN_QUERY,
-        [0.0, 1.0],
+        [[0.0, 1.0]],
         POLICY_SEARCH.candidate_count,
     )
     assert {call["query"] for call in harness.reranker.calls} == {
-        REWRITTEN_QUERY
+        ORIGINAL_QUERY,
+        REWRITTEN_QUERY,
     }
     assert {call["model"] for call in harness.reranker.calls} == {RERANKER_MODEL}
-    assert {call["top_n"] for call in harness.reranker.calls} == {
-        KNOWLEDGE_SEARCH.final_count,
-        POLICY_SEARCH.final_count,
-    }
+    assert {call["top_n"] for call in harness.reranker.calls} == {1, 2}
     prompt = harness.llm.stream_calls[0][0]
     assert REWRITTEN_QUERY in prompt
     assert ORIGINAL_QUERY not in prompt
@@ -356,7 +409,7 @@ def test_pipeline_uses_official_rewritten_query_and_enqueues_complete_answer() -
     assert harness.writer.inserts[0][:3] == (
         CONVERSATION_ID,
         raw_text,
-        [0.5, 0.5],
+        [raw_text],
     )
     provider_threads = [call[2] for call in harness.embeddings.calls]
     provider_threads += [call[2] for call in harness.llm.complete_calls]
@@ -366,7 +419,10 @@ def test_pipeline_uses_official_rewritten_query_and_enqueues_complete_answer() -
     provider_threads += [call[3] for call in harness.policy.calls]
     provider_threads += [int(call["thread"]) for call in harness.reranker.calls]
     provider_threads += harness.factory_threads
-    provider_threads.append(harness.writer.inserts[0][3])
+    provider_threads += [
+        call[2] for call in harness.runtime.multi_vectors.calls  # type: ignore[attr-defined]
+    ]
+    provider_threads.append(harness.writer.inserts[0][5])
     assert provider_threads and all(thread != main_thread for thread in provider_threads)
 
 
