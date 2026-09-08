@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 import threading
 from typing import Any
+from uuid import UUID, uuid5
 
 import pytest
 
@@ -13,6 +14,7 @@ from backend.model_config import (
     EMBEDDING_MODEL,
     KNOWLEDGE_SEARCH,
     LATEON_EMBEDDING_DIMENSION,
+    MMR_DIVERSITY_VECTOR_DIMENSION,
     POLICY_SEARCH,
     RERANKER_MODEL,
 )
@@ -53,6 +55,11 @@ def _result(
     canonical_id = (
         _uuid(index + 100) if collection_type == "conversations" else object_id
     )
+    if collection_type == "conversations":
+        object_id = str(uuid5(UUID(canonical_id), "retrieval-segment:0"))
+    stored_vector = tuple(vector) + (0.0,) * (
+        MMR_DIVERSITY_VECTOR_DIMENSION - len(vector)
+    )
     return _FixtureResult(
         search=SearchResult(
             object_id=object_id,
@@ -61,7 +68,7 @@ def _result(
             segment_index=0 if collection_type == "conversations" else None,
         ),
         raw_text=text,
-        vector=tuple(vector),
+        vector=stored_vector,
     )
 
 

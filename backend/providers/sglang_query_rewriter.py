@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-import json
 import logging
 from pathlib import Path
 import threading
@@ -22,7 +21,9 @@ from backend.model_config import (
 from backend.providers.granite_query_rewriter import (
     GraniteCheckpointError,
     GraniteInferenceError,
+    GraniteRewriteFormatError,
     GraniteRewriteDiagnostics,
+    parse_granite_rewrite,
     validate_granite_checkpoint,
 )
 from backend.rag.query_rewrite_contract import QueryRewritePrompt
@@ -41,6 +42,13 @@ class SGLangTransport(Protocol):
 
 class SGLangQueryRewriteError(GraniteInferenceError):
     """The SGLang worker could not produce a trustworthy rewrite response."""
+
+
+class _TransientSGLangQueryRewriteError(SGLangQueryRewriteError):
+    """A request failed before any rewrite was exposed and may be retried once."""
+
+
+_TRANSIENT_HTTP_STATUSES = frozenset({408, 429, 502, 503, 504})
 
 
 def _project_root() -> Path:
@@ -233,7 +241,19 @@ class SGLangGraniteQueryRewriter:
             response.raise_for_status()
             payload = response.json()
         except httpx.TimeoutException as exc:
-            raise SGLangQueryRewriteError("SGLang query rewriting timed out") from exc
+            raise _TransientSGLangQueryRewriteError(
+                "SGLang query rewriting timed out"
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in _TRANSIENT_HTTP_STATUSES:
+                raise _TransientSGLangQueryRewriteError(
+                    "SGLang query rewriting request failed transiently"
+                ) from exc
+            raise SGLangQueryRewriteError("SGLang query rewriting request failed") from exc
+        except httpx.TransportError as exc:
+            raise _TransientSGLangQueryRewriteError(
+                "SGLang query rewriting request failed transiently"
+            ) from exc
         except httpx.HTTPError as exc:
             raise SGLangQueryRewriteError("SGLang query rewriting request failed") from exc
         except (TypeError, ValueError) as exc:
@@ -265,8 +285,6 @@ class SGLangGraniteQueryRewriter:
         if not isinstance(message, Mapping) or not isinstance(message.get("content"), str):
             raise SGLangQueryRewriteError("SGLang returned non-text completion content")
         continuation = message["content"]
-        if continuation.startswith(self.granite_config.response_prefill):
-            raise SGLangQueryRewriteError("SGLang ambiguously repeated the response prefill")
         if choice.get("finish_reason") not in {"stop", "length"}:
             raise SGLangQueryRewriteError("SGLang returned an invalid finish reason")
 
@@ -303,17 +321,19 @@ class SGLangGraniteQueryRewriter:
         cached_tokens: int | None = None
         details = usage.get("prompt_tokens_details")
         if details is not None:
-            if not isinstance(details, Mapping):
-                raise SGLangQueryRewriteError("SGLang returned malformed cache usage")
-            raw_cached = details.get("cached_tokens")
-            if raw_cached is not None:
-                if (
-                    not isinstance(raw_cached, int)
-                    or isinstance(raw_cached, bool)
-                    or not 0 <= raw_cached <= prompt_tokens
-                ):
-                    raise SGLangQueryRewriteError("SGLang returned invalid cache usage")
+            raw_cached = details.get("cached_tokens") if isinstance(details, Mapping) else None
+            if (
+                raw_cached is not None
+                and isinstance(raw_cached, int)
+                and not isinstance(raw_cached, bool)
+                and 0 <= raw_cached <= prompt_tokens
+            ):
                 cached_tokens = raw_cached
+            elif not isinstance(details, Mapping) or raw_cached is not None:
+                logger.warning(
+                    "Ignored malformed optional Granite cache diagnostics",
+                    extra={"model": self.sglang_config.served_model},
+                )
         return continuation, prompt_tokens, completion_tokens, cached_tokens
 
     def _parse_continuation(
@@ -327,31 +347,10 @@ class SGLangGraniteQueryRewriter:
         total_pairs: int,
         latency_ms: float,
     ) -> str:
-        full_output = self.granite_config.response_prefill + continuation
-        strict_json = False
-        try:
-            parsed = json.loads(full_output)
-            if not isinstance(parsed, dict) or set(parsed) != {"rewritten_question"}:
-                raise ValueError("response must contain exactly rewritten_question")
-            rewritten = parsed["rewritten_question"]
-            if not isinstance(rewritten, str) or not rewritten.strip():
-                raise ValueError("rewritten_question must be a nonempty string")
-            strict_json = True
-            result = rewritten.strip()
-        except (json.JSONDecodeError, TypeError, ValueError) as exc:
-            if not any(character.isalnum() for character in continuation):
-                raise SGLangQueryRewriteError(
-                    "Granite generated no meaningful continuation"
-                ) from exc
-            logger.warning(
-                "SGLang Granite rewrite did not satisfy the strict JSON contract",
-                extra={
-                    "model": self.sglang_config.served_model,
-                    "generated_tokens": completion_tokens,
-                    "parse_error": type(exc).__name__,
-                },
-            )
-            result = full_output
+        result, strict_json = parse_granite_rewrite(
+            self.granite_config.response_prefill,
+            continuation,
+        )
         diagnostics = GraniteRewriteDiagnostics(
             rendered_input_tokens=input_tokens,
             generated_tokens=completion_tokens,
@@ -379,21 +378,46 @@ class SGLangGraniteQueryRewriter:
         if not isinstance(prompt, QueryRewritePrompt):
             raise TypeError("Granite query rewriting requires a structured QueryRewritePrompt")
         messages, input_tokens, retained_pairs = self._bounded_messages(prompt)
-        started = perf_counter()
-        payload = self._send(self._request_body(messages))
-        latency_ms = (perf_counter() - started) * 1000.0
-        continuation, prompt_tokens, completion_tokens, cached_tokens = (
-            self._response_content(payload, expected_prompt_tokens=input_tokens)
-        )
-        return self._parse_continuation(
-            continuation,
-            input_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            cached_tokens=cached_tokens,
-            retained_pairs=retained_pairs,
-            total_pairs=len(prompt.conversation_pairs),
-            latency_ms=latency_ms,
-        )
+        body = self._request_body(messages)
+        total_latency_ms = 0.0
+        for attempt in range(2):
+            started = perf_counter()
+            try:
+                payload = self._send(body)
+            except _TransientSGLangQueryRewriteError as exc:
+                total_latency_ms += (perf_counter() - started) * 1000.0
+                if attempt == 0:
+                    logger.warning(
+                        "Retrying transient Granite query-rewrite request",
+                        extra={"model": self.sglang_config.served_model},
+                    )
+                    continue
+                raise SGLangQueryRewriteError(str(exc)) from exc
+            total_latency_ms += (perf_counter() - started) * 1000.0
+            continuation, prompt_tokens, completion_tokens, cached_tokens = (
+                self._response_content(payload, expected_prompt_tokens=input_tokens)
+            )
+            try:
+                return self._parse_continuation(
+                    continuation,
+                    input_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    cached_tokens=cached_tokens,
+                    retained_pairs=retained_pairs,
+                    total_pairs=len(prompt.conversation_pairs),
+                    latency_ms=total_latency_ms,
+                )
+            except GraniteRewriteFormatError as exc:
+                if attempt == 0:
+                    logger.warning(
+                        "Retrying unrepairable Granite formatting defect",
+                        extra={"model": self.sglang_config.served_model},
+                    )
+                    continue
+                raise SGLangQueryRewriteError(
+                    "SGLang Granite rewrite did not satisfy the JSON contract"
+                ) from exc
+        raise AssertionError("Granite retry loop exhausted unexpectedly")
 
 
 __all__ = [

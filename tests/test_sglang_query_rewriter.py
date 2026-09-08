@@ -252,29 +252,77 @@ def test_constraint_can_be_explicitly_disabled_for_compatibility_diagnosis() -> 
 @pytest.mark.parametrize(
     "continuation",
     [
-        GRANITE_QUERY_REWRITE.response_prefill + 'duplicate"}',
-        "",
         '"}',
+        'query","extra":"field"}',
+        'query"} trailing prose',
     ],
 )
-def test_ambiguous_or_empty_continuations_are_rejected(continuation: str) -> None:
+def test_unrepairable_or_empty_continuations_retry_once_then_fail(
+    continuation: str,
+) -> None:
     tokenizer = FakeTokenizer()
     client = RecordingClient(tokenizer, continuation=continuation)
     adapter, _, _ = _adapter(tokenizer=tokenizer, client=client)
     with pytest.raises(SGLangQueryRewriteError):
         adapter.complete(_prompt(), model=QUERY_REWRITER.model)
+    assert len(client.calls) == 2
 
 
-def test_malformed_json_fallback_does_not_log_generated_text(
+def test_empty_content_usage_violation_is_not_retried() -> None:
+    tokenizer = FakeTokenizer()
+    client = RecordingClient(tokenizer, continuation="")
+    adapter, _, _ = _adapter(tokenizer=tokenizer, client=client)
+
+    with pytest.raises(SGLangQueryRewriteError, match="inconsistent"):
+        adapter.complete(_prompt(), model=QUERY_REWRITER.model)
+    assert len(client.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("continuation", "expected"),
+    [
+        ("sensitive malformed continuation", "sensitive malformed continuation"),
+        ('Missing brace"', "Missing brace"),
+        ('{"rewritten_question":"Repeated full object"}', "Repeated full object"),
+    ],
+)
+def test_deterministic_structural_repair_does_not_log_generated_text(
+    continuation: str,
+    expected: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    continuation = "sensitive malformed continuation"
     tokenizer = FakeTokenizer()
     client = RecordingClient(tokenizer, continuation=continuation)
     adapter, _, _ = _adapter(tokenizer=tokenizer, client=client)
     result = adapter.complete(_prompt(), model=QUERY_REWRITER.model)
-    assert result == GRANITE_QUERY_REWRITE.response_prefill + continuation
+    assert result == expected
+    assert adapter.last_diagnostics is not None
+    assert adapter.last_diagnostics.strict_json is False
+    assert len(client.calls) == 1
     assert continuation not in caplog.text
+
+
+def test_unrepairable_format_can_succeed_on_the_single_retry() -> None:
+    tokenizer = FakeTokenizer()
+
+    def response(_: Mapping[str, object]) -> object:
+        continuation = 'query",}' if len(client.calls) == 1 else 'Recovered query"}'
+        return {
+            "model": SGLANG_QUERY_REWRITE.served_model,
+            "choices": [
+                {"message": {"content": continuation}, "finish_reason": "stop"}
+            ],
+            "usage": {
+                "prompt_tokens": tokenizer.last_count,
+                "completion_tokens": 3,
+            },
+        }
+
+    client = RecordingClient(tokenizer, response_factory=response)
+    adapter, _, _ = _adapter(tokenizer=tokenizer, client=client)
+
+    assert adapter.complete(_prompt(), model=QUERY_REWRITER.model) == "Recovered query"
+    assert len(client.calls) == 2
 
 
 def test_timeout_is_translated_to_safe_granite_error() -> None:
@@ -287,7 +335,70 @@ def test_timeout_is_translated_to_safe_granite_error() -> None:
     adapter, _, _ = _adapter(tokenizer=tokenizer, client=client)
     with pytest.raises(SGLangQueryRewriteError, match="timed out") as caught:
         adapter.complete(_prompt(), model=QUERY_REWRITER.model)
+    assert len(client.calls) == 2
     assert "provider detail" not in str(caught.value)
+
+
+@pytest.mark.parametrize("status_code", [408, 429, 502, 503, 504])
+def test_transient_http_statuses_retry_once(status_code: int) -> None:
+    tokenizer = FakeTokenizer()
+    request = httpx.Request("POST", "https://worker.invalid")
+    response = httpx.Response(status_code, request=request)
+    error = httpx.HTTPStatusError("provider detail", request=request, response=response)
+    client = RecordingClient(tokenizer, post_error=error)
+    adapter, _, _ = _adapter(tokenizer=tokenizer, client=client)
+
+    with pytest.raises(SGLangQueryRewriteError, match="transiently"):
+        adapter.complete(_prompt(), model=QUERY_REWRITER.model)
+    assert len(client.calls) == 2
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403, 404, 500])
+def test_non_transient_http_statuses_are_not_retried(status_code: int) -> None:
+    tokenizer = FakeTokenizer()
+    request = httpx.Request("POST", "https://worker.invalid")
+    response = httpx.Response(status_code, request=request)
+    error = httpx.HTTPStatusError("provider detail", request=request, response=response)
+    client = RecordingClient(tokenizer, post_error=error)
+    adapter, _, _ = _adapter(tokenizer=tokenizer, client=client)
+
+    with pytest.raises(SGLangQueryRewriteError, match="request failed"):
+        adapter.complete(_prompt(), model=QUERY_REWRITER.model)
+    assert len(client.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "details",
+    ["malformed", {"cached_tokens": "three"}, {"cached_tokens": -1}],
+)
+def test_optional_cache_diagnostics_do_not_reject_valid_rewrite(
+    details: object,
+) -> None:
+    tokenizer = FakeTokenizer()
+
+    def response(_: Mapping[str, object]) -> object:
+        return {
+            "model": SGLANG_QUERY_REWRITE.served_model,
+            "choices": [
+                {
+                    "message": {"content": 'Standalone query"}'},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": tokenizer.last_count,
+                "completion_tokens": 3,
+                "prompt_tokens_details": details,
+            },
+        }
+
+    client = RecordingClient(tokenizer, response_factory=response)
+    adapter, _, _ = _adapter(tokenizer=tokenizer, client=client)
+
+    assert adapter.complete(_prompt(), model=QUERY_REWRITER.model) == "Standalone query"
+    assert adapter.last_diagnostics is not None
+    assert adapter.last_diagnostics.cached_prompt_tokens is None
+    assert len(client.calls) == 1
 
 
 def test_tokenizer_server_count_mismatch_blocks_rollout() -> None:

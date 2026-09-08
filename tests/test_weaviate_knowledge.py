@@ -286,9 +286,9 @@ def test_knowledge_hydrates_mmr_head_in_one_ordered_batch() -> None:
 
 
 @pytest.mark.parametrize(
-    ("objects", "match"),
+    ("objects", "quarantine_reason"),
     [
-        ([], "incomplete"),
+        ([], "missing_hydration_object"),
         (
             [
                 SimpleNamespace(
@@ -297,17 +297,25 @@ def test_knowledge_hydrates_mmr_head_in_one_ordered_batch() -> None:
                     vector={"mmr_diversity": [1.0]},
                 )
             ],
-            "768 dimensions",
+            None,
         ),
     ],
 )
-def test_knowledge_hydration_fails_closed(objects: list[object], match: str) -> None:
+def test_knowledge_hydration_localizes_missing_objects_and_bad_vectors(
+    objects: list[object],
+    quarantine_reason: str | None,
+) -> None:
     manager, _, collection = _manager_and_collection()
     collection.query.fetch_objects_by_ids.return_value = SimpleNamespace(objects=objects)
     knowledge = KnowledgeCollection(manager, USER_ID)
 
-    with pytest.raises(WeaviateResponseError, match=match):
-        knowledge.hydrate_mmr_head([SearchResult(CHUNK_ID, CHUNK_ID, "text")])
+    hydrated = knowledge.hydrate_mmr_head(
+        [SearchResult(CHUNK_ID, CHUNK_ID, "text")]
+    )
+
+    assert len(hydrated) == 1
+    assert hydrated[0].diversity_vector is None
+    assert hydrated[0].quarantine_reason == quarantine_reason
 
 
 def test_knowledge_empty_hydration_makes_no_sdk_call() -> None:

@@ -180,6 +180,16 @@ fail that request. User ownership, object/business UUID correspondence, winning
 segment identity, vector shape, and consumed canonical-text validation remain
 fail-closed.
 
+Malformed retrieval objects are quarantined at the smallest safe scope after
+their collection ownership boundary is checked. A conflicting Conversation
+segment identity quarantines the complete canonical conversation rather than
+selecting a sibling arbitrarily. If one bounded-head stored GTE vector is
+unusable, that collection returns the existing Adaptive-K head in authoritative
+BGE order for that request; it does not fall back to hybrid ranking or issue an
+additional query. Explicit cross-user data, stale vector profiles, malformed
+response envelopes, provider/model-space mismatches, and non-finite BGE output
+remain request-fatal.
+
 **Top-K Configuration:**
 
 | Collection | Hybrid candidate ceiling | Unified ranking | Final maximum |
@@ -485,6 +495,10 @@ The frontend uses an optimistic UI pattern — every button action immediately u
 - Failed tasks do **not** automatically retry — the user must resubmit the
   original operation; there is no generic task-ID retry endpoint.
 - Task-status responses expose only stable safe error codes/messages, never raw provider or storage exceptions.
+- Conversation persistence must be accepted by the observable queue before the
+  chat stream can emit successful telemetry and `done`. Title scheduling and
+  title-task failures are cosmetic: they are logged/recorded and leave the
+  existing title unchanged without invalidating an already accepted answer.
 
 ### 7.4 Production Composition
 
@@ -499,6 +513,14 @@ delegates title completion and answer streaming to the Qwen worker. Production
 uses `SGLangGraniteQueryRewriter` for the separate always-warm Granite Modal
 CUDA service. The explicit `transformers` engine is a
 redeploy-only CUDA rollback and is never selected automatically after failure.
+Granite accepts only its exact JSON rewrite contract, plus deterministic repair
+of a repeated complete object or an unambiguously missing closing suffix. An
+unrepairable formatting defect or approved transient pre-output transport
+failure receives at most one identical retry; malformed wrapper text and the
+original query are never substituted. Qwen likewise retries approved transient
+transport failures at most once and only before streamed content is exposed.
+After the first answer chunk, generation is never restarted, and reasoning,
+identity, finish, or incomplete-stream violations remain fatal.
 The two SGLang workers do not alter the seven-step RAG flow. The integrated
 factory calls `create_app(services)` and owns readiness validation and cleanup.
 `backend.main:app` remains an importable providerless bootstrap and returns

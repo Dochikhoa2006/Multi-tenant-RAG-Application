@@ -164,6 +164,24 @@ def test_rewrite_query_propagates_provider_failure() -> None:
         )
 
 
+def test_rewrite_failure_with_history_never_substitutes_original_query() -> None:
+    llm = FakeLLM(RuntimeError("provider failed"))
+    conversations = [
+        {
+            "object_id": "00000000-0000-0000-0000-000000000001",
+            "raw_text": "Question:\nEarlier?\n\nAnswer:\nEarlier answer.",
+        }
+    ]
+
+    with pytest.raises(RuntimeError, match="provider failed"):
+        rewrite_query(
+            "ambiguous follow-up",
+            conversations,
+            runtime=_runtime(llm),
+        )
+    assert len(llm.calls) == 1
+
+
 def test_query_rewrite_prompt_exposes_documented_contract() -> None:
     assert "{original_query}" in QUERY_REWRITE_PROMPT
     assert "{conversation_context}" in QUERY_REWRITE_PROMPT

@@ -19,7 +19,10 @@ Successful chat streams emit SSE events in the fixed order
 `token* → telemetry → done`. Failed streams emit any tokens already delivered
 followed by one safe `error` event and never emit telemetry or `done`.
 Conversation embedding and title generation are scheduled only after complete
-generation. Session deletion is queued and removes the process-local session
+generation. Acceptance of Conversation persistence is mandatory before
+successful telemetry and `done`; optional title scheduling or title-task failure
+leaves the completed answer successful and the existing title unchanged.
+Session deletion is queued and removes the process-local session
 only after a verbose deletion plus dry-run check confirms that no mapped
 conversation objects remain; a partial failure retains the session for retry.
 An active response stream causes deletion to return `409 SESSION_ACTIVE`.

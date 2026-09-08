@@ -359,11 +359,22 @@ async def query(
                     title,
                 )
 
-            await services.task_queue.enqueue(
-                body.user_id,
-                "generate_session_title",
-                title_work,
-            )
+            try:
+                await services.task_queue.enqueue(
+                    body.user_id,
+                    "generate_session_title",
+                    title_work,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log_internal_error(
+                    "Could not schedule optional session title generation",
+                    correlation_id,
+                    user_id=body.user_id,
+                    session_id=body.session_id,
+                    conversation_id=conversation_id,
+                )
             telemetry.set("total_request", (perf_counter() - request_started) * 1000.0)
             yield _sse("telemetry", telemetry.payload(correlation_id))
             yield _sse(

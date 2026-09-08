@@ -34,6 +34,10 @@ class GraniteInferenceError(RuntimeError):
     """Granite could not produce a usable query rewrite."""
 
 
+class GraniteRewriteFormatError(GraniteInferenceError):
+    """Granite output could not be parsed or repaired unambiguously."""
+
+
 class QueryRewriteCompletionClient(Protocol):
     """Minimal role-router contract implemented by either Granite engine."""
 
@@ -56,6 +60,50 @@ class GraniteRewriteDiagnostics:
     strict_json: bool
     cached_prompt_tokens: int | None = None
     service_latency_ms: float | None = None
+
+
+def _exact_rewritten_question(value: object) -> str:
+    if not isinstance(value, dict) or set(value) != {"rewritten_question"}:
+        raise ValueError("response must contain exactly rewritten_question")
+    rewritten = value["rewritten_question"]
+    if (
+        not isinstance(rewritten, str)
+        or not rewritten.strip()
+        or not any(character.isalnum() for character in rewritten)
+    ):
+        raise ValueError("rewritten_question must be a nonempty string")
+    return rewritten.strip()
+
+
+def parse_granite_rewrite(
+    response_prefill: str,
+    continuation: str,
+) -> tuple[str, bool]:
+    """Strictly parse, or deterministically repair, one Granite continuation."""
+
+    full_output = response_prefill + continuation
+    try:
+        return _exact_rewritten_question(json.loads(full_output)), True
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+
+    repaired: set[str] = set()
+    stripped = continuation.rstrip()
+    repair_inputs = (
+        continuation,
+        f'{response_prefill}{stripped}"}}',
+        f"{response_prefill}{stripped}}}",
+    )
+    for candidate in repair_inputs:
+        try:
+            repaired.add(_exact_rewritten_question(json.loads(candidate)))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+    if len(repaired) == 1:
+        return repaired.pop(), False
+    raise GraniteRewriteFormatError(
+        "Granite rewrite did not satisfy the strict or repairable JSON contract"
+    )
 
 
 def _project_root() -> Path:
@@ -200,16 +248,29 @@ class GraniteQueryRewriter:
         if not isinstance(prompt, QueryRewritePrompt):
             raise TypeError("Granite query rewriting requires a structured QueryRewritePrompt")
         with self._lock:
-            continuation, input_tokens, generated_tokens, retained_pairs = self._generate(
-                prompt
-            )
-            return self._parse_response(
-                continuation,
-                input_tokens=input_tokens,
-                generated_tokens=generated_tokens,
-                retained_pairs=retained_pairs,
-                total_pairs=len(prompt.conversation_pairs),
-            )
+            for attempt in range(2):
+                continuation, input_tokens, generated_tokens, retained_pairs = (
+                    self._generate(prompt)
+                )
+                try:
+                    return self._parse_response(
+                        continuation,
+                        input_tokens=input_tokens,
+                        generated_tokens=generated_tokens,
+                        retained_pairs=retained_pairs,
+                        total_pairs=len(prompt.conversation_pairs),
+                    )
+                except GraniteRewriteFormatError:
+                    logger.warning(
+                        "Granite query rewrite formatting could not be repaired",
+                        extra={
+                            "model": QUERY_REWRITER.model,
+                            "attempt": attempt + 1,
+                        },
+                    )
+                    if attempt == 1:
+                        raise
+        raise AssertionError("Granite retry loop exhausted unexpectedly")
 
     def _messages(
         self,
@@ -325,29 +386,10 @@ class GraniteQueryRewriter:
         retained_pairs: int,
         total_pairs: int,
     ) -> str:
-        full_output = self.config.response_prefill + continuation
-        strict_json = False
-        try:
-            parsed = json.loads(full_output)
-            if not isinstance(parsed, dict) or set(parsed) != {"rewritten_question"}:
-                raise ValueError("response must contain exactly rewritten_question")
-            rewritten = parsed["rewritten_question"]
-            if not isinstance(rewritten, str) or not rewritten.strip():
-                raise ValueError("rewritten_question must be a nonempty string")
-            strict_json = True
-            result = rewritten.strip()
-        except (json.JSONDecodeError, TypeError, ValueError) as exc:
-            if not any(character.isalnum() for character in continuation):
-                raise GraniteInferenceError("Granite generated no meaningful continuation") from exc
-            logger.warning(
-                "Granite query rewrite did not satisfy the strict JSON contract",
-                extra={
-                    "model": QUERY_REWRITER.model,
-                    "generated_tokens": generated_tokens,
-                    "parse_error": type(exc).__name__,
-                },
-            )
-            result = full_output
+        result, strict_json = parse_granite_rewrite(
+            self.config.response_prefill,
+            continuation,
+        )
         self.last_diagnostics = GraniteRewriteDiagnostics(
             rendered_input_tokens=input_tokens,
             generated_tokens=generated_tokens,
@@ -425,8 +467,10 @@ __all__ = [
     "GraniteCheckpointError",
     "GraniteInferenceError",
     "GraniteQueryRewriter",
+    "GraniteRewriteFormatError",
     "GraniteRewriteDiagnostics",
     "QueryRewriteCompletionClient",
     "RoleRoutingLLMClient",
+    "parse_granite_rewrite",
     "validate_granite_checkpoint",
 ]

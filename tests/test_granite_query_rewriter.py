@@ -21,6 +21,7 @@ from backend.providers.granite_query_rewriter import (
     GraniteCheckpointError,
     GraniteInferenceError,
     GraniteQueryRewriter,
+    GraniteRewriteFormatError,
     RoleRoutingLLMClient,
     validate_granite_checkpoint,
 )
@@ -49,8 +50,18 @@ class FakeTokenizer:
     eos_token_id = 2
     pad_token_id = 0
 
-    def __init__(self, continuation: str, *, token_mode: str = "words") -> None:
-        self.continuation = continuation
+    def __init__(
+        self,
+        continuation: str | list[str],
+        *,
+        token_mode: str = "words",
+    ) -> None:
+        self.continuations = (
+            [continuation] if isinstance(continuation, str) else list(continuation)
+        )
+        if not self.continuations:
+            raise ValueError("continuation sequence must not be empty")
+        self.decode_calls = 0
         self.token_mode = token_mode
         self.template_calls: list[list[dict[str, str]]] = []
         self.encoded_texts: list[str] = []
@@ -82,7 +93,9 @@ class FakeTokenizer:
             "skip_special_tokens": True,
             "clean_up_tokenization_spaces": False,
         }
-        return self.continuation
+        index = min(self.decode_calls, len(self.continuations) - 1)
+        self.decode_calls += 1
+        return self.continuations[index]
 
 
 class FakeModel:
@@ -123,7 +136,7 @@ def _prompt(*pairs: ConversationPair, query: str = "What about it?") -> QueryRew
     )
 
 
-def _rewriter(continuation: str, **config_changes: object):
+def _rewriter(continuation: str | list[str], **config_changes: object):
     tokenizer = FakeTokenizer(continuation)
     model = FakeModel()
     adapter = GraniteQueryRewriter(
@@ -214,27 +227,57 @@ def test_strict_json_returns_only_rewritten_question(
     [
         'query","extra":"field"}',
         'query"} trailing',
-        "unfinished query",
         'query",}',
         'query","wrong_key":"value"}',
     ],
 )
-def test_contract_failures_return_complete_prefilled_output(
+def test_unrepairable_contract_failures_retry_once_then_fail(
     continuation: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    adapter, _, _ = _rewriter(continuation)
-    result = adapter.complete(_prompt(), model=QUERY_REWRITER.model)
-    assert result == GRANITE_QUERY_REWRITE.response_prefill + continuation
+    adapter, _, model = _rewriter(continuation)
+    with pytest.raises(GraniteRewriteFormatError, match="JSON contract"):
+        adapter.complete(_prompt(), model=QUERY_REWRITER.model)
+    assert len(model.calls) == 2
     assert continuation not in caplog.text
-    assert "strict JSON contract" in caplog.text
+    assert caplog.text.count("formatting could not be repaired") == 2
+
+
+@pytest.mark.parametrize(
+    ("continuation", "expected"),
+    [
+        ("unfinished query", "unfinished query"),
+        ('Missing brace"', "Missing brace"),
+        ('{"rewritten_question":"Repeated full object"}', "Repeated full object"),
+    ],
+)
+def test_deterministic_structural_repairs_are_accepted(
+    continuation: str,
+    expected: str,
+) -> None:
+    adapter, _, model = _rewriter(continuation)
+
+    assert adapter.complete(_prompt(), model=QUERY_REWRITER.model) == expected
+    assert len(model.calls) == 1
+    assert adapter.last_diagnostics is not None
+    assert adapter.last_diagnostics.strict_json is False
+
+
+def test_unrepairable_format_can_succeed_on_the_single_retry() -> None:
+    adapter, _, model = _rewriter(['query",}', 'Recovered query"}'])
+
+    assert adapter.complete(_prompt(), model=QUERY_REWRITER.model) == "Recovered query"
+    assert len(model.calls) == 2
+    assert adapter.last_diagnostics is not None
+    assert adapter.last_diagnostics.strict_json is True
 
 
 @pytest.mark.parametrize("continuation", ["", "   ", '"}', "}\n"])
 def test_empty_or_scaffold_only_continuation_fails(continuation: str) -> None:
-    adapter, _, _ = _rewriter(continuation)
-    with pytest.raises(GraniteInferenceError, match="meaningful continuation"):
+    adapter, _, model = _rewriter(continuation)
+    with pytest.raises(GraniteRewriteFormatError, match="JSON contract"):
         adapter.complete(_prompt(), model=QUERY_REWRITER.model)
+    assert len(model.calls) == 2
 
 
 def test_inference_is_serialized_by_process_local_lock() -> None:

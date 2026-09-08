@@ -16,6 +16,24 @@ class SGLangQwenError(RuntimeError):
     """The Qwen SGLang worker violated the answer/title provider contract."""
 
 
+_TRANSIENT_HTTP_STATUSES = frozenset({408, 429, 502, 503, 504})
+
+
+def _is_transient_http_error(error: httpx.HTTPError) -> bool:
+    if isinstance(error, httpx.TransportError):
+        return True
+    return (
+        isinstance(error, httpx.HTTPStatusError)
+        and error.response.status_code in _TRANSIENT_HTTP_STATUSES
+    )
+
+
+def _provider_error_message(error: httpx.HTTPError, operation: str) -> str:
+    if isinstance(error, httpx.TimeoutException):
+        return f"Qwen SGLang {operation} timed out"
+    return f"Qwen SGLang {operation} request failed"
+
+
 class QwenSyncTransport(Protocol):
     def post(self, url: str, **kwargs: object) -> Any: ...
 
@@ -158,21 +176,25 @@ class SGLangQwenLLMClient:
             max_output_tokens=max_output_tokens,
             stream=False,
         )
-        try:
-            response = self.sync_client.post(
-                self._url,
-                json=payload,
-                headers=self._headers(),
-            )
-            response.raise_for_status()
-            data = response.json()
-        except httpx.TimeoutException as exc:
-            raise SGLangQwenError("Qwen SGLang completion timed out") from exc
-        except httpx.HTTPError as exc:
-            raise SGLangQwenError("Qwen SGLang completion request failed") from exc
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise SGLangQwenError("Qwen SGLang returned malformed JSON") from exc
-        return self._validated_response(data)
+        for attempt in range(2):
+            try:
+                response = self.sync_client.post(
+                    self._url,
+                    json=payload,
+                    headers=self._headers(),
+                )
+                response.raise_for_status()
+                data = response.json()
+            except httpx.HTTPError as exc:
+                if attempt == 0 and _is_transient_http_error(exc):
+                    continue
+                raise SGLangQwenError(
+                    _provider_error_message(exc, "completion")
+                ) from exc
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise SGLangQwenError("Qwen SGLang returned malformed JSON") from exc
+            return self._validated_response(data)
+        raise AssertionError("Qwen completion retry loop exhausted unexpectedly")
 
     def stream(
         self,
@@ -192,55 +214,70 @@ class SGLangQwenLLMClient:
         return self._stream_response(payload)
 
     async def _stream_response(self, payload: Mapping[str, object]) -> AsyncIterator[str]:
-        saw_content = False
-        saw_finish = False
-        saw_done = False
-        try:
-            async with self.async_client.stream(
-                "POST",
-                self._url,
-                json=dict(payload),
-                headers=self._headers(),
-            ) as response:
-                response.raise_for_status()
-                async for raw_line in response.aiter_lines():
-                    if not isinstance(raw_line, str):
-                        raise SGLangQwenError("Qwen SGLang returned a non-text SSE line")
-                    line = raw_line.strip()
-                    if not line or line.startswith(":"):
-                        continue
-                    if not line.startswith("data:"):
-                        raise SGLangQwenError("Qwen SGLang returned malformed SSE")
-                    data_text = line[5:].strip()
-                    if data_text == "[DONE]":
-                        if saw_done:
-                            raise SGLangQwenError("Qwen SGLang repeated the SSE terminator")
-                        saw_done = True
-                        continue
-                    if saw_done:
-                        raise SGLangQwenError("Qwen SGLang sent data after SSE termination")
-                    try:
-                        event = json.loads(data_text)
-                    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                        raise SGLangQwenError("Qwen SGLang returned malformed SSE JSON") from exc
-                    content, finish_reason = self._stream_event(event)
-                    if content:
-                        saw_content = True
-                        yield content
-                    if finish_reason is not None:
-                        if saw_finish or finish_reason not in {"stop", "length"}:
+        for attempt in range(2):
+            saw_content = False
+            saw_finish = False
+            saw_done = False
+            try:
+                async with self.async_client.stream(
+                    "POST",
+                    self._url,
+                    json=dict(payload),
+                    headers=self._headers(),
+                ) as response:
+                    response.raise_for_status()
+                    async for raw_line in response.aiter_lines():
+                        if not isinstance(raw_line, str):
                             raise SGLangQwenError(
-                                "Qwen SGLang returned an invalid stream finish reason"
+                                "Qwen SGLang returned a non-text SSE line"
                             )
-                        saw_finish = True
-        except httpx.TimeoutException as exc:
-            raise SGLangQwenError("Qwen SGLang answer stream timed out") from exc
-        except httpx.HTTPError as exc:
-            raise SGLangQwenError("Qwen SGLang answer stream request failed") from exc
-        if not saw_content:
-            raise SGLangQwenError("Qwen answer stream completed without content")
-        if not saw_finish or not saw_done:
-            raise SGLangQwenError("Qwen answer stream ended without confirmed completion")
+                        line = raw_line.strip()
+                        if not line or line.startswith(":"):
+                            continue
+                        if not line.startswith("data:"):
+                            raise SGLangQwenError("Qwen SGLang returned malformed SSE")
+                        data_text = line[5:].strip()
+                        if data_text == "[DONE]":
+                            if saw_done:
+                                raise SGLangQwenError(
+                                    "Qwen SGLang repeated the SSE terminator"
+                                )
+                            saw_done = True
+                            continue
+                        if saw_done:
+                            raise SGLangQwenError(
+                                "Qwen SGLang sent data after SSE termination"
+                            )
+                        try:
+                            event = json.loads(data_text)
+                        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                            raise SGLangQwenError(
+                                "Qwen SGLang returned malformed SSE JSON"
+                            ) from exc
+                        content, finish_reason = self._stream_event(event)
+                        if content:
+                            saw_content = True
+                            yield content
+                        if finish_reason is not None:
+                            if saw_finish or finish_reason not in {"stop", "length"}:
+                                raise SGLangQwenError(
+                                    "Qwen SGLang returned an invalid stream finish reason"
+                                )
+                            saw_finish = True
+            except httpx.HTTPError as exc:
+                if attempt == 0 and not saw_content and _is_transient_http_error(exc):
+                    continue
+                raise SGLangQwenError(
+                    _provider_error_message(exc, "answer stream")
+                ) from exc
+            if not saw_content:
+                raise SGLangQwenError("Qwen answer stream completed without content")
+            if not saw_finish or not saw_done:
+                raise SGLangQwenError(
+                    "Qwen answer stream ended without confirmed completion"
+                )
+            return
+        raise AssertionError("Qwen stream retry loop exhausted unexpectedly")
 
     def _stream_event(self, value: object) -> tuple[str, object]:
         if not isinstance(value, Mapping):

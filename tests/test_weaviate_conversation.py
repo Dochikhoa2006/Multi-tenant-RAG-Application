@@ -1209,16 +1209,15 @@ def test_conversation_hydration_fetches_canonical_text_and_vector_together() -> 
 
 
 @pytest.mark.parametrize(
-    ("vector", "match"),
+    "vector",
     [
-        ({"unexpected": _gte_vector()}, "MMR-diversity"),
-        ({"mmr_diversity": [float("nan")] * 768}, "malformed"),
-        ({"mmr_diversity": [1.0]}, "768 dimensions"),
+        {"unexpected": _gte_vector()},
+        {"mmr_diversity": [float("nan")] * 768},
+        {"mmr_diversity": [1.0]},
     ],
 )
-def test_missing_or_malformed_hydration_vectors_are_rejected(
+def test_missing_or_malformed_hydration_vectors_are_localized(
     vector: object,
-    match: str,
 ) -> None:
     manager, _, collection = _manager_and_collection()
     collection.query.fetch_objects_by_ids.return_value = SimpleNamespace(
@@ -1238,21 +1237,73 @@ def test_missing_or_malformed_hydration_vectors_are_rejected(
     )
     conversations = ConversationCollection(manager, USER_ID)
 
-    with pytest.raises(WeaviateResponseError, match=match):
-        conversations.hydrate_mmr_head(
-            [SearchResult(SEGMENT_ID, CONVERSATION_ID, "segment", 0)]
-        )
+    hydrated = conversations.hydrate_mmr_head(
+        [SearchResult(SEGMENT_ID, CONVERSATION_ID, "segment", 0)]
+    )
+
+    assert len(hydrated) == 1
+    assert hydrated[0].raw_text == "content"
+    assert hydrated[0].diversity_vector is None
+    assert hydrated[0].quarantine_reason is None
+
+
+@pytest.mark.parametrize(
+    ("objects", "reason"),
+    [
+        ([], "missing_hydration_object"),
+        (
+            [_hydration_object(), _hydration_object()],
+            "duplicate_hydration_object",
+        ),
+        (
+            [_hydration_object(segment_id=SECOND_SEGMENT_ID)],
+            "hydration_business_uuid_mismatch",
+        ),
+        (
+            [_hydration_object(conversation_id=SECOND_CONVERSATION_ID)],
+            "hydration_canonical_uuid_mismatch",
+        ),
+        (
+            [_hydration_object(segment_index=1)],
+            "hydration_segment_index_mismatch",
+        ),
+        (
+            [_hydration_object(raw_text="")],
+            "malformed_canonical_text",
+        ),
+        (
+            [
+                SimpleNamespace(
+                    uuid=UUID(SEGMENT_ID),
+                    properties=None,
+                    vector={"mmr_diversity": _gte_vector()},
+                )
+            ],
+            "hydration_properties_not_mapping",
+        ),
+    ],
+)
+def test_conversation_hydration_quarantines_local_corruption(
+    objects: list[object],
+    reason: str,
+) -> None:
+    manager, _, collection = _manager_and_collection()
+    collection.query.fetch_objects_by_ids.return_value = SimpleNamespace(
+        objects=objects
+    )
+    conversations = ConversationCollection(manager, USER_ID)
+
+    hydrated = conversations.hydrate_mmr_head(
+        [SearchResult(SEGMENT_ID, CONVERSATION_ID, "segment", 0)]
+    )
+
+    assert len(hydrated) == 1
+    assert hydrated[0].quarantine_reason == reason
 
 
 @pytest.mark.parametrize(
     ("objects", "error_type", "match"),
     [
-        ([], WeaviateResponseError, "incomplete"),
-        (
-            [_hydration_object(), _hydration_object()],
-            WeaviateResponseError,
-            "duplicate",
-        ),
         (
             [
                 _hydration_object(
@@ -1274,40 +1325,9 @@ def test_missing_or_malformed_hydration_vectors_are_rejected(
             WeaviateResponseError,
             "invalid object UUID",
         ),
-        (
-            [_hydration_object(segment_id=SECOND_SEGMENT_ID)],
-            WeaviateResponseError,
-            "segment_id",
-        ),
-        (
-            [_hydration_object(conversation_id=SECOND_CONVERSATION_ID)],
-            WeaviateResponseError,
-            "canonical UUID",
-        ),
-        (
-            [_hydration_object(segment_index=1)],
-            WeaviateResponseError,
-            "segment_index",
-        ),
-        (
-            [_hydration_object(raw_text="")],
-            WeaviateResponseError,
-            "canonical text",
-        ),
-        (
-            [
-                SimpleNamespace(
-                    uuid=UUID(SEGMENT_ID),
-                    properties=None,
-                    vector={"mmr_diversity": _gte_vector()},
-                )
-            ],
-            WeaviateResponseError,
-            "properties",
-        ),
     ],
 )
-def test_conversation_hydration_rejects_incomplete_or_corrupt_results(
+def test_conversation_hydration_keeps_security_and_scope_failures_hard(
     objects: list[object],
     error_type: type[Exception],
     match: str,
@@ -1354,7 +1374,7 @@ def test_cross_user_search_result_is_rejected() -> None:
     [("not-a-uuid", CONVERSATION_ID), (CONVERSATION_ID, "not-a-uuid"),
      (CONVERSATION_ID, SECOND_CONVERSATION_ID)],
 )
-def test_malformed_or_mismatched_result_ids_are_rejected(
+def test_malformed_or_mismatched_result_ids_are_quarantined(
     object_id: str,
     business_id: str,
 ) -> None:
@@ -1378,12 +1398,44 @@ def test_malformed_or_mismatched_result_ids_are_rejected(
     )
     conversations = ConversationCollection(manager, USER_ID)
 
-    with pytest.raises(WeaviateResponseError, match="UUID|segment_id"):
-        conversations.hybrid_search("query", [_lateon_row(0.1)], 50)
+    assert conversations.hybrid_search("query", [_lateon_row(0.1)], 50) == []
+
+
+def test_segment_identity_corruption_quarantines_retrieved_siblings() -> None:
+    valid_second_segment_id = str(
+        uuid5(UUID(CONVERSATION_ID), "retrieval-segment:1")
+    )
+    collection_objects = [
+        SimpleNamespace(
+            uuid=UUID(SEGMENT_ID),
+            properties={
+                "user_id": USER_ID,
+                "conversation_id": CONVERSATION_ID,
+                "segment_id": SECOND_SEGMENT_ID,
+                "segment_index": 0,
+                "segment_text": "corrupt first sibling",
+            },
+        ),
+        SimpleNamespace(
+            uuid=UUID(valid_second_segment_id),
+            properties={
+                "user_id": USER_ID,
+                "conversation_id": CONVERSATION_ID,
+                "segment_id": valid_second_segment_id,
+                "segment_index": 1,
+                "segment_text": "otherwise valid sibling",
+            },
+        ),
+    ]
+    manager, _, collection = _manager_and_collection()
+    collection.query.hybrid.return_value = SimpleNamespace(objects=collection_objects)
+    conversations = ConversationCollection(manager, USER_ID)
+
+    assert conversations.hybrid_search("query", [_lateon_row(0.1)], 50) == []
 
 
 @pytest.mark.parametrize("properties", [None, [], "not-a-mapping"])
-def test_malformed_result_properties_are_rejected(properties: object) -> None:
+def test_malformed_result_properties_are_quarantined(properties: object) -> None:
     manager, _, collection = _manager_and_collection()
     collection.query.hybrid.return_value = SimpleNamespace(
         objects=[
@@ -1397,8 +1449,7 @@ def test_malformed_result_properties_are_rejected(properties: object) -> None:
     )
     conversations = ConversationCollection(manager, USER_ID)
 
-    with pytest.raises(WeaviateResponseError, match="properties"):
-        conversations.hybrid_search("query", [_lateon_row(0.1)], 50)
+    assert conversations.hybrid_search("query", [_lateon_row(0.1)], 50) == []
 
 
 @pytest.mark.parametrize(

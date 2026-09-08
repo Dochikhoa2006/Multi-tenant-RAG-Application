@@ -5,7 +5,7 @@ import json
 import math
 import time
 from collections.abc import AsyncIterator, Sequence
-from uuid import uuid4
+from uuid import UUID, uuid4, uuid5
 
 import pytest
 from fastapi import HTTPException, Request
@@ -16,10 +16,14 @@ from backend.api.telemetry import TELEMETRY_SCHEMA_VERSION, TIMING_KEYS
 from backend.api.chat import delete_session as delete_session_endpoint
 from backend.api.chat import query as query_endpoint
 from backend.main import create_app
-from backend.model_config import LATEON_EMBEDDING_DIMENSION
+from backend.model_config import (
+    LATEON_EMBEDDING_DIMENSION,
+    MMR_DIVERSITY_VECTOR_DIMENSION,
+)
 from backend.rag.pipeline import UserRetrievalCollections
 from backend.rag.runtime import RAGRuntime, RerankResult
 from backend.services import AppServices
+from backend.task_queue import InMemoryTaskQueue
 from backend.weaviate_client.models import (
     DeletionReport,
     HydratedSearchResult,
@@ -73,6 +77,8 @@ class FakeCollection:
         canonical_id = (
             str(uuid4()) if self.collection_type == "conversations" else object_id
         )
+        if self.collection_type == "conversations":
+            object_id = str(uuid5(UUID(canonical_id), "retrieval-segment:0"))
         return [
             SearchResult(
                 object_id=object_id,
@@ -90,7 +96,7 @@ class FakeCollection:
             HydratedSearchResult(
                 candidate.object_id,
                 candidate.canonical_id,
-                (1.0, 0.0),
+                (1.0, 0.0, *([0.0] * (MMR_DIVERSITY_VECTOR_DIMENSION - 2))),
                 self.text,
                 candidate.segment_index,
             )
@@ -158,15 +164,19 @@ class FakeLLM:
         fail_stream: bool = False,
         chunks: Sequence[str] = ("first ", "second"),
         stream_error: str = "generation failed",
+        fail_title: bool = False,
     ) -> None:
         self.events = events
         self.fail_stream = fail_stream
         self.chunks = list(chunks)
         self.stream_error = stream_error
+        self.fail_title = fail_title
 
     def complete(self, prompt: str, **kwargs: object) -> str:
         if "<conversation_list>" in prompt:
             self.events.append("title")
+            if self.fail_title:
+                raise RuntimeError("title provider failed")
             return "Useful Retrieval Session"
         return "official rewritten query"
 
@@ -241,6 +251,8 @@ def _services(
     fail_stream: bool = False,
     chunks: Sequence[str] = ("first ", "second"),
     stream_error: str = "generation failed",
+    fail_title: bool = False,
+    task_queue: InMemoryTaskQueue | None = None,
 ):
     events: list[str] = []
     manager = FakeManager()
@@ -251,6 +263,7 @@ def _services(
         fail_stream=fail_stream,
         chunks=chunks,
         stream_error=stream_error,
+        fail_title=fail_title,
     )
     writer = FakeConversationWriter(events)
     runtime = RAGRuntime(
@@ -270,11 +283,23 @@ def _services(
     )
     services = AppServices(
         manager=manager,
+        task_queue=task_queue,
         rag_runtime=runtime,
         retrieval_collections_factory=lambda user_id: bundle,
         conversation_collection_factory=lambda user_id: writer,
     )
     return services, manager, embeddings, writer, events, bundle
+
+
+class SelectiveEnqueueFailureQueue(InMemoryTaskQueue):
+    def __init__(self, failed_operation: str) -> None:
+        super().__init__()
+        self.failed_operation = failed_operation
+
+    async def enqueue(self, user_id: str, operation: str, work_factory):
+        if operation == self.failed_operation:
+            raise RuntimeError(f"{operation} enqueue failed")
+        return await super().enqueue(user_id, operation, work_factory)
 
 
 def _wait_for_task(client: TestClient, task_id: str) -> dict[str, object]:
@@ -356,6 +381,123 @@ def test_chat_query_streams_json_sse_and_persists_only_complete_answer() -> None
     assert services.chat_registry.get_session(USER_ID, session_id).title == (
         "Useful Retrieval Session"
     )
+
+
+def test_title_enqueue_failure_does_not_invalidate_completed_answer(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    queue = SelectiveEnqueueFailureQueue("generate_session_title")
+    services, _, embeddings, writer, _, _ = _services(task_queue=queue)
+    with TestClient(create_app(services)) as client:
+        session_id = client.post(
+            "/api/chat/sessions", json={"user_id": USER_ID}
+        ).json()["session_id"]
+        response = client.post(
+            "/api/chat/query",
+            json={
+                "user_id": USER_ID,
+                "session_id": session_id,
+                "question": "original question",
+            },
+        )
+        parsed = _events(response.text)
+        snapshot = services.chat_registry.get_session(USER_ID, session_id)
+
+    assert [event for event, _ in parsed] == [
+        "token",
+        "token",
+        "telemetry",
+        "done",
+    ]
+    assert len(snapshot.conversations) == 1
+    assert snapshot.title == "New Chat"
+    assert len(writer.inserted) == 1
+    assert len(embeddings.calls) == 1
+    assert "Could not schedule optional session title generation" in caplog.text
+
+
+def test_title_generation_failure_is_observable_but_answer_stays_complete(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    services, _, embeddings, writer, events, _ = _services(fail_title=True)
+    with TestClient(create_app(services)) as client:
+        session_id = client.post(
+            "/api/chat/sessions", json={"user_id": USER_ID}
+        ).json()["session_id"]
+        response = client.post(
+            "/api/chat/query",
+            json={
+                "user_id": USER_ID,
+                "session_id": session_id,
+                "question": "original question",
+            },
+        )
+        parsed = _events(response.text)
+    snapshot = services.chat_registry.get_session(USER_ID, session_id)
+
+    assert [event for event, _ in parsed][-2:] == ["telemetry", "done"]
+    assert len(snapshot.conversations) == 1
+    assert snapshot.title == "New Chat"
+    assert len(writer.inserted) == 1
+    assert len(embeddings.calls) == 1
+    assert "title" in events
+    assert "Background task failed" in caplog.text
+
+
+def test_title_update_failure_is_observable_but_answer_stays_complete(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    services, _, _, writer, _, _ = _services()
+
+    def fail_update(*args: object, **kwargs: object) -> str:
+        raise RuntimeError("title update failed")
+
+    monkeypatch.setattr(services.chat_registry, "update_title", fail_update)
+    with TestClient(create_app(services)) as client:
+        session_id = client.post(
+            "/api/chat/sessions", json={"user_id": USER_ID}
+        ).json()["session_id"]
+        response = client.post(
+            "/api/chat/query",
+            json={
+                "user_id": USER_ID,
+                "session_id": session_id,
+                "question": "original question",
+            },
+        )
+        parsed = _events(response.text)
+    snapshot = services.chat_registry.get_session(USER_ID, session_id)
+
+    assert [event for event, _ in parsed][-2:] == ["telemetry", "done"]
+    assert len(snapshot.conversations) == 1
+    assert snapshot.title == "New Chat"
+    assert len(writer.inserted) == 1
+    assert "Background task failed" in caplog.text
+
+
+def test_conversation_persistence_enqueue_failure_remains_request_fatal() -> None:
+    queue = SelectiveEnqueueFailureQueue("embed_conversation")
+    services, _, embeddings, writer, _, _ = _services(task_queue=queue)
+    with TestClient(create_app(services)) as client:
+        session_id = client.post(
+            "/api/chat/sessions", json={"user_id": USER_ID}
+        ).json()["session_id"]
+        response = client.post(
+            "/api/chat/query",
+            json={
+                "user_id": USER_ID,
+                "session_id": session_id,
+                "question": "original question",
+            },
+        )
+        parsed = _events(response.text)
+        snapshot = services.chat_registry.get_session(USER_ID, session_id)
+
+    assert [event for event, _ in parsed] == ["token", "token", "error"]
+    assert snapshot.conversations == ()
+    assert writer.inserted == []
+    assert embeddings.calls == []
 
 
 def test_failed_generation_emits_error_without_partial_transcript_or_embedding() -> None:

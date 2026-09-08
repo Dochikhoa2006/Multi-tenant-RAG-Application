@@ -113,6 +113,7 @@ class HydratedSearchResult:
 
     object_id: str
     canonical_id: str
-    diversity_vector: tuple[float, ...]
+    diversity_vector: tuple[float, ...] | None
     raw_text: str | None = None
     segment_index: int | None = None
+    quarantine_reason: str | None = None

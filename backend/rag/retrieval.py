@@ -7,12 +7,14 @@ import logging
 import math
 from time import perf_counter
 from typing import Any
+from uuid import UUID, uuid5
 
 import tiktoken
 
 from backend.model_config import (
     CONVERSATION_SEARCH,
     KNOWLEDGE_SEARCH,
+    MMR_DIVERSITY_VECTOR_DIMENSION,
     POLICY_SEARCH,
     RERANKER_MODEL,
     TEXT_PROCESSING,
@@ -91,18 +93,136 @@ def _multi_vector(value: object, name: str) -> tuple[tuple[float, ...], ...]:
 
 def _normalized_candidates(
     results: object,
+    collection_type: str,
 ) -> list[SearchResult]:
     if not isinstance(results, list):
         raise TypeError("hybrid_search must return a list")
     normalized: list[SearchResult] = []
+    seen_object_ids: set[str] = set()
+    quarantined_object_ids: set[str] = set()
+    quarantined_conversations: set[str] = set()
+    conversation_indices: dict[str, dict[int, str]] = {}
     for result in results:
         if not isinstance(result, SearchResult):
-            raise TypeError("hybrid_search results must be SearchResult values")
-        _required_text(result.object_id, "object_id")
-        _required_text(result.canonical_id, "canonical_id")
-        _required_text(result.retrieval_text, "retrieval_text")
-        normalized.append(result)
-    return normalized
+            _LOGGER.warning(
+                "Quarantined malformed retrieval candidate",
+                extra={
+                    "collection_type": collection_type,
+                    "object_id": "unavailable",
+                    "reason": "invalid_result_type",
+                },
+            )
+            continue
+        object_id = result.object_id
+        canonical_id = result.canonical_id
+        try:
+            object_id = str(UUID(_required_text(object_id, "object_id")))
+            canonical_id = str(UUID(_required_text(canonical_id, "canonical_id")))
+            _required_text(result.retrieval_text, "retrieval_text")
+        except (TypeError, ValueError):
+            try:
+                safe_id = str(UUID(str(result.object_id)))
+            except (TypeError, ValueError, AttributeError):
+                safe_id = "unavailable"
+            try:
+                recoverable_conversation = str(UUID(str(result.canonical_id)))
+            except (TypeError, ValueError, AttributeError):
+                recoverable_conversation = None
+            if collection_type == "conversations" and recoverable_conversation:
+                quarantined_conversations.add(recoverable_conversation)
+            _LOGGER.warning(
+                "Quarantined malformed retrieval candidate",
+                extra={
+                    "collection_type": collection_type,
+                    "object_id": safe_id,
+                    "reason": "invalid_candidate_fields",
+                },
+            )
+            continue
+        if object_id in seen_object_ids:
+            quarantined_object_ids.add(object_id)
+            if collection_type == "conversations":
+                quarantined_conversations.add(canonical_id)
+                quarantined_conversations.update(
+                    item.canonical_id
+                    for item in normalized
+                    if item.object_id == object_id
+                )
+            _LOGGER.warning(
+                "Quarantined malformed retrieval candidate",
+                extra={
+                    "collection_type": collection_type,
+                    "object_id": object_id,
+                    "reason": "duplicate_object_uuid",
+                },
+            )
+            continue
+        seen_object_ids.add(object_id)
+        if collection_type != "conversations" and canonical_id != object_id:
+            quarantined_object_ids.add(object_id)
+            _LOGGER.warning(
+                "Quarantined malformed retrieval candidate",
+                extra={
+                    "collection_type": collection_type,
+                    "object_id": object_id,
+                    "reason": "canonical_uuid_mismatch",
+                },
+            )
+            continue
+        if collection_type == "conversations":
+            segment_index = result.segment_index
+            if (
+                isinstance(segment_index, bool)
+                or not isinstance(segment_index, int)
+                or segment_index < 0
+                or object_id
+                != str(
+                    uuid5(
+                        UUID(canonical_id),
+                        f"retrieval-segment:{segment_index}",
+                    )
+                )
+            ):
+                quarantined_conversations.add(canonical_id)
+                _LOGGER.warning(
+                    "Quarantined malformed Conversation group",
+                    extra={
+                        "collection_type": collection_type,
+                        "object_id": object_id,
+                        "conversation_id": canonical_id,
+                        "reason": "invalid_segment_identity",
+                    },
+                )
+                continue
+            indices = conversation_indices.setdefault(canonical_id, {})
+            existing = indices.get(segment_index)
+            if existing is not None and existing != object_id:
+                quarantined_conversations.add(canonical_id)
+                _LOGGER.warning(
+                    "Quarantined malformed Conversation group",
+                    extra={
+                        "collection_type": collection_type,
+                        "object_id": object_id,
+                        "conversation_id": canonical_id,
+                        "reason": "conflicting_segment_index",
+                    },
+                )
+                continue
+            indices[segment_index] = object_id
+        normalized.append(
+            SearchResult(
+                object_id=object_id,
+                canonical_id=canonical_id,
+                retrieval_text=result.retrieval_text,
+                segment_index=result.segment_index,
+            )
+        )
+    return [
+        item
+        for item in normalized
+        if item.object_id not in quarantined_object_ids
+        and item.canonical_id not in quarantined_conversations
+    ]
 
 
 def _cross_encoder(
@@ -302,13 +422,15 @@ def _hybrid_candidates(
     query: str,
     vector: tuple[tuple[float, ...], ...],
     config: RetrievalConfig,
+    collection_type: str,
 ) -> list[SearchResult]:
     return _normalized_candidates(
         hybrid_search(
             query,
             [list(row) for row in vector],
             config.candidate_count,
-        )
+        ),
+        collection_type,
     )
 
 
@@ -351,9 +473,9 @@ def _hydrate_mmr_head(
     eligible: Sequence[dict[str, Any]],
     k: int,
     collection_type: str,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], bool]:
     if k == 0:
-        return []
+        return [], True
     head = list(eligible[: min(2 * k, len(eligible))])
     hydrate = getattr(collection_client, "hydrate_mmr_head", None)
     if not callable(hydrate):
@@ -363,6 +485,7 @@ def _hydrate_mmr_head(
     if not isinstance(raw_hydrated, list) or len(raw_hydrated) != len(head):
         raise TypeError("hydrate_mmr_head must return one ordered result per candidate")
     hydrated_head: list[dict[str, Any]] = []
+    mmr_usable = True
     for candidate, request, hydrated in zip(
         head,
         requested,
@@ -370,28 +493,88 @@ def _hydrate_mmr_head(
         strict=True,
     ):
         if not isinstance(hydrated, HydratedSearchResult):
-            raise TypeError(
-                "hydrate_mmr_head results must be HydratedSearchResult values"
+            _LOGGER.warning(
+                "Quarantined malformed hydrated candidate",
+                extra={
+                    "collection_type": collection_type,
+                    "object_id": request.object_id,
+                    "reason": "invalid_hydration_result_type",
+                },
             )
+            continue
         if (
             hydrated.object_id != request.object_id
             or hydrated.canonical_id != request.canonical_id
             or hydrated.segment_index != request.segment_index
         ):
-            raise ValueError(
-                "hydrated result identity or order does not match its candidate"
+            _LOGGER.warning(
+                "Quarantined malformed hydrated candidate",
+                extra={
+                    "collection_type": collection_type,
+                    "object_id": request.object_id,
+                    "reason": "hydration_identity_mismatch",
+                },
             )
+            continue
+        if hydrated.quarantine_reason is not None:
+            _LOGGER.warning(
+                "Quarantined malformed hydrated candidate",
+                extra={
+                    "collection_type": collection_type,
+                    "object_id": request.object_id,
+                    "reason": hydrated.quarantine_reason,
+                },
+            )
+            continue
         copied = dict(candidate)
-        copied["diversity_vector"] = _vector(
-            hydrated.diversity_vector,
-            "diversity vector",
-        )
         if collection_type == "conversations":
-            copied["raw_text"] = _required_text(hydrated.raw_text, "raw_text")
+            try:
+                raw_text = _required_text(hydrated.raw_text, "raw_text")
+            except (TypeError, ValueError):
+                _LOGGER.warning(
+                    "Quarantined malformed Conversation group",
+                    extra={
+                        "collection_type": collection_type,
+                        "object_id": request.object_id,
+                        "conversation_id": request.canonical_id,
+                        "reason": "malformed_canonical_text",
+                    },
+                )
+                continue
+            if request.retrieval_text not in raw_text:
+                _LOGGER.warning(
+                    "Quarantined malformed Conversation group",
+                    extra={
+                        "collection_type": collection_type,
+                        "object_id": request.object_id,
+                        "conversation_id": request.canonical_id,
+                        "reason": "segment_not_in_canonical_text",
+                    },
+                )
+                continue
+            copied["raw_text"] = raw_text
         else:
             copied["raw_text"] = copied["retrieval_text"]
+        try:
+            vector = _vector(hydrated.diversity_vector, "diversity vector")
+            if len(vector) != MMR_DIVERSITY_VECTOR_DIMENSION:
+                raise ValueError("diversity vector has the wrong dimension")
+            if math.sqrt(sum(item * item for item in vector)) <= 0.0:
+                raise ValueError("diversity vector has a non-positive norm")
+        except (TypeError, ValueError):
+            mmr_usable = False
+            _LOGGER.warning(
+                "Using BGE order because a stored MMR vector is unusable",
+                extra={
+                    "collection_type": collection_type,
+                    "object_id": request.object_id,
+                    "reason": "unusable_mmr_vector",
+                },
+            )
+        else:
+            copied["diversity_vector"] = vector
         hydrated_head.append(copied)
-    return hydrated_head
+    return hydrated_head, mmr_usable
 
 
 def _final_results(
@@ -477,6 +660,7 @@ def retrieve(
         query,
         vector,
         config,
+        collection_type,
     )
     search_elapsed = (perf_counter() - search_started) * 1000.0
     if timing_observer is not None:
@@ -496,14 +680,18 @@ def retrieve(
         if candidate["rerank_score"] >= config.adaptive_relevance_floor
     ]
     k = _adaptive_k(eligible, config)
-    hydrated_head = _hydrate_mmr_head(
+    hydrated_head, mmr_usable = _hydrate_mmr_head(
         collection_client,
         eligible,
         k,
         collection_type,
     )
     mmr_started = perf_counter()
-    selected = _mmr(hydrated_head, k, config)
+    selected = (
+        _mmr(hydrated_head, min(k, len(hydrated_head)), config)
+        if mmr_usable
+        else hydrated_head[:k]
+    )
     mmr_elapsed = (perf_counter() - mmr_started) * 1000.0
     if timing_observer is not None and collection_type == "conversations":
         timing_observer("conversation_mmr_rerank", mmr_elapsed)
@@ -515,6 +703,7 @@ def retrieve(
             "eligible_candidates": len(eligible),
             "adaptive_k": k,
             "mmr_head": len(hydrated_head),
+            "mmr_fallback": not mmr_usable,
         },
     )
     selected = _final_results(selected, collection_type)

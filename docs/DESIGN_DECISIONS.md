@@ -114,13 +114,19 @@ it entirely offline in FP16 through SGLang 0.5.18 on a Modal NVIDIA CUDA worker.
 SGLang owns CUDA graphs, continuous batching, overlap scheduling, RadixAttention,
 prefix caching, and XGrammar-constrained continuation. The application no longer
 serializes rewrites with a local inference lock. Missing weights, checkpoint hash
-mismatches, incompatible chat templates, or SGLang failures are request failures:
-there is no download, CPU, MPS, remote-model, or original-query fallback.
+mismatches and incompatible chat templates remain request failures. Granite may
+deterministically repair only an exact repeated JSON object or one unambiguously
+missing closing suffix, and may retry one unrepairable formatting or approved
+transient pre-output failure once. It never uses malformed wrapper text or the
+original query as a fallback. There is no download, CPU, MPS, remote-model, or
+alternate-query fallback.
 
 Answer and title calls are delegated to one pooled Qwen SGLang client. The Qwen
 worker is separate because one SGLang server process hosts one model; it loads
 the AWQ checkpoint once and explicitly disables thinking for every request.
-There is no alternate-model or remote-provider fallback. `QUERY_REWRITE_ENGINE`
+An approved transient Qwen request can retry once only before answer content is
+exposed; an emitted stream is never restarted. There is no alternate-model or
+remote-provider fallback. `QUERY_REWRITE_ENGINE`
 supports an explicit redeploy-only Transformers/CUDA rollback for Granite; it
 is never an automatic per-request fallback. IBM reports and evaluates Granite
 rewriting for English; other languages remain outside the supported contract.

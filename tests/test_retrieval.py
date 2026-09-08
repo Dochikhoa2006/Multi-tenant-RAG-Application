@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from types import SimpleNamespace
+from uuid import UUID, uuid5
 
 import pytest
 
@@ -12,6 +13,7 @@ from backend.model_config import (
     FIXED_KNOWLEDGE_CANDIDATE_COUNT,
     FIXED_POLICY_CANDIDATE_COUNT,
     KNOWLEDGE_SEARCH,
+    MMR_DIVERSITY_VECTOR_DIMENSION,
     POLICY_SEARCH,
     RERANKER_MODEL,
     TOKEN_BUDGETS,
@@ -20,10 +22,17 @@ from backend.model_config import (
 from backend.rag.retrieval import _adaptive_k, _mmr, retrieve
 from backend.rag.runtime import RAGRuntime, RerankResult
 from backend.weaviate_client.models import HydratedSearchResult, SearchResult
+from backend.weaviate_client.models import IncompatibleCollectionSchemaError
 
 
 def _uuid(index: int) -> str:
     return f"90000000-0000-0000-0000-{index:012d}"
+
+
+def _stored_gte_vector(values: Sequence[float]) -> tuple[float, ...]:
+    supplied = tuple(values)
+    assert len(supplied) <= MMR_DIVERSITY_VECTOR_DIMENSION
+    return supplied + (0.0,) * (MMR_DIVERSITY_VECTOR_DIMENSION - len(supplied))
 
 
 @dataclass(frozen=True)
@@ -43,7 +52,7 @@ def _chunk(
     return _FixtureResult(
         search=SearchResult(object_id, object_id, text),
         raw_text=text,
-        vector=tuple(vector),
+        vector=_stored_gte_vector(vector),
     )
 
 
@@ -53,18 +62,23 @@ def _conversation_segment(
     segment_index: int,
     *,
     raw_text: str | None = None,
+    retrieval_text: str | None = None,
     vector: Sequence[float] = (1.0, 0.0),
     score: float = 0.5,
 ) -> _FixtureResult:
+    canonical_id = _uuid(conversation)
+    segment = retrieval_text or f"segment-{segment_id}"
     return _FixtureResult(
         search=SearchResult(
-            object_id=_uuid(segment_id),
-            canonical_id=_uuid(conversation),
-            retrieval_text=f"segment-{segment_id}",
+            object_id=str(
+                uuid5(UUID(canonical_id), f"retrieval-segment:{segment_index}")
+            ),
+            canonical_id=canonical_id,
+            retrieval_text=segment,
             segment_index=segment_index,
         ),
-        raw_text=raw_text or f"canonical-{conversation}",
-        vector=tuple(vector),
+        raw_text=raw_text or f"canonical-{conversation}\n{segment}",
+        vector=_stored_gte_vector(vector),
     )
 
 
@@ -350,8 +364,20 @@ def test_conversation_short_page_does_not_retry() -> None:
 def test_conversation_collapses_segments_by_highest_bge_and_keeps_canonical_text() -> None:
     conversation_id = _uuid(10)
     hits = [
-        _conversation_segment(1, 10, 0, raw_text="Question: Q\n\nAnswer: A"),
-        _conversation_segment(2, 10, 1, raw_text="Question: Q\n\nAnswer: A"),
+        _conversation_segment(
+            1,
+            10,
+            0,
+            raw_text="Question: Q\n\nAnswer: A",
+            retrieval_text="Question: Q",
+        ),
+        _conversation_segment(
+            2,
+            10,
+            1,
+            raw_text="Question: Q\n\nAnswer: A",
+            retrieval_text="Answer: A",
+        ),
     ]
     results = retrieve(
         FakeCollection(hits),
@@ -366,9 +392,10 @@ def test_conversation_collapses_segments_by_highest_bge_and_keeps_canonical_text
 
 
 def test_conversation_defers_integrity_checks_to_winning_head_representative() -> None:
+    canonical = "segment-1 segment-2"
     hits = [
-        _conversation_segment(1, 10, 0, vector=(1.0, 0.0)),
-        _conversation_segment(2, 10, 1, vector=(0.0, 1.0)),
+        _conversation_segment(1, 10, 0, raw_text=canonical, vector=(1.0, 0.0)),
+        _conversation_segment(2, 10, 1, raw_text=canonical, vector=(0.0, 1.0)),
     ]
     collection = FakeCollection(hits)
     results = retrieve(
@@ -378,8 +405,10 @@ def test_conversation_defers_integrity_checks_to_winning_head_representative() -
         "conversations",
         runtime=_runtime(FakeReranker()),
     )
-    assert results == [{"object_id": _uuid(10), "raw_text": "canonical-10"}]
-    assert [item.object_id for item in collection.hydration_calls[0]] == [_uuid(1)]
+    assert results == [{"object_id": _uuid(10), "raw_text": canonical}]
+    assert [item.object_id for item in collection.hydration_calls[0]] == [
+        hits[0].search.object_id
+    ]
 
 
 def test_policy_context_budget_keeps_only_complete_mmr_results() -> None:
@@ -461,3 +490,206 @@ def test_cross_encoder_rejects_malformed_provider_results(
             "knowledge_facts",
             runtime=_runtime(FakeReranker(rerank_results)),
         )
+
+
+def test_malformed_candidate_is_quarantined_without_reordering_valid_work(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    first = _chunk(1, "first", [1.0, 0.0], 0.8)
+    second = _chunk(2, "second", [0.0, 1.0], 0.7)
+    secret_text = "sensitive malformed object contents"
+
+    class MixedCollection(FakeCollection):
+        def hybrid_search(
+            self,
+            query: str,
+            vector: list[list[float]],
+            top_k: int,
+        ) -> list[object]:
+            valid = super().hybrid_search(query, vector, top_k)
+            return [valid[0], {"raw_text": secret_text}, valid[1]]
+
+    collection = MixedCollection([first, second])
+    results = retrieve(
+        collection,
+        "query",
+        [[1.0]],
+        "knowledge_facts",
+        runtime=_runtime(FakeReranker()),
+    )
+
+    assert [item["object_id"] for item in results] == [_uuid(1), _uuid(2)]
+    assert any(
+        getattr(record, "reason", None) == "invalid_result_type"
+        for record in caplog.records
+    )
+    assert secret_text not in caplog.text
+
+
+def test_conversation_segment_identity_conflict_quarantines_whole_group() -> None:
+    corrupt = _conversation_segment(1, 10, 0)
+    valid = _conversation_segment(2, 20, 0)
+    conflicting = SearchResult(
+        object_id=_uuid(999),
+        canonical_id=corrupt.search.canonical_id,
+        retrieval_text="conflicting segment",
+        segment_index=0,
+    )
+
+    class ConflictingCollection(FakeCollection):
+        def hybrid_search(
+            self,
+            query: str,
+            vector: list[list[float]],
+            top_k: int,
+        ) -> list[SearchResult]:
+            super().hybrid_search(query, vector, top_k)
+            return [corrupt.search, conflicting, valid.search]
+
+    reranker = FakeReranker()
+    results = retrieve(
+        ConflictingCollection([corrupt, valid]),
+        "query",
+        [[1.0]],
+        "conversations",
+        runtime=_runtime(reranker),
+    )
+
+    assert [item["object_id"] for item in results] == [valid.search.canonical_id]
+    assert reranker.calls[0]["documents"] == [valid.search.retrieval_text]
+
+
+def test_isolated_unusable_mmr_vector_falls_back_to_bge_order() -> None:
+    fixtures = [
+        _chunk(1, "first", [1.0, 0.0], 0.9),
+        _chunk(2, "similar", [1.0, 0.0], 0.8),
+        _chunk(3, "diverse", [0.0, 1.0], 0.7),
+    ]
+
+    class CorruptVectorCollection(FakeCollection):
+        def hydrate_mmr_head(
+            self,
+            candidates: Sequence[SearchResult],
+        ) -> list[HydratedSearchResult]:
+            hydrated = super().hydrate_mmr_head(candidates)
+            first = hydrated[0]
+            hydrated[0] = HydratedSearchResult(
+                first.object_id,
+                first.canonical_id,
+                None,
+                first.raw_text,
+                first.segment_index,
+            )
+            return hydrated
+
+    collection = CorruptVectorCollection(fixtures)
+    results = retrieve(
+        collection,
+        "query",
+        [[1.0]],
+        "knowledge_facts",
+        runtime=_runtime(
+            FakeReranker(
+                [
+                    RerankResult(0, 3.0),
+                    RerankResult(1, 2.9),
+                    RerankResult(2, -0.9),
+                ]
+            )
+        ),
+    )
+
+    assert [item["object_id"] for item in results] == [_uuid(1), _uuid(2)]
+
+
+def test_corrupt_hydrated_candidate_is_removed_without_extra_fetch() -> None:
+    fixtures = [
+        _chunk(1, "first", [1.0, 0.0], 0.9),
+        _chunk(2, "second", [0.0, 1.0], 0.8),
+    ]
+
+    class QuarantineCollection(FakeCollection):
+        def hydrate_mmr_head(
+            self,
+            candidates: Sequence[SearchResult],
+        ) -> list[HydratedSearchResult]:
+            hydrated = super().hydrate_mmr_head(candidates)
+            first = hydrated[0]
+            hydrated[0] = HydratedSearchResult(
+                first.object_id,
+                first.canonical_id,
+                None,
+                quarantine_reason="malformed_candidate",
+            )
+            return hydrated
+
+    collection = QuarantineCollection(fixtures)
+    results = retrieve(
+        collection,
+        "query",
+        [[1.0]],
+        "knowledge_facts",
+        runtime=_runtime(FakeReranker()),
+    )
+
+    assert [item["object_id"] for item in results] == [_uuid(2)]
+    assert len(collection.hydration_calls) == 1
+
+
+def test_corrupt_conversation_representative_is_quarantined() -> None:
+    collection = FakeCollection(
+        [
+            _conversation_segment(
+                1,
+                10,
+                0,
+                raw_text="canonical text without the selected segment",
+                retrieval_text="different segment",
+            )
+        ]
+    )
+
+    assert retrieve(
+        collection,
+        "query",
+        [[1.0]],
+        "conversations",
+        runtime=_runtime(FakeReranker()),
+    ) == []
+
+
+def test_systemic_schema_mismatch_remains_fatal() -> None:
+    class StaleCollection(FakeCollection):
+        def hybrid_search(
+            self,
+            query: str,
+            vector: list[list[float]],
+            top_k: int,
+        ) -> list[SearchResult]:
+            raise IncompatibleCollectionSchemaError("KnowledgeFacts_test", "stale")
+
+    with pytest.raises(IncompatibleCollectionSchemaError, match="stale"):
+        retrieve(
+            StaleCollection([]),
+            "query",
+            [[1.0]],
+            "knowledge_facts",
+            runtime=_runtime(FakeReranker()),
+        )
+
+
+def test_bge_failure_remains_fatal_without_hydration_or_hybrid_fallback() -> None:
+    class FailedReranker(FakeReranker):
+        def rerank(self, *args: object, **kwargs: object) -> Sequence[RerankResult]:
+            raise RuntimeError("BGE unavailable")
+
+    collection = FakeCollection([_chunk(1, "first", [1.0], 0.8)])
+    with pytest.raises(RuntimeError, match="BGE unavailable"):
+        retrieve(
+            collection,
+            "query",
+            [[1.0]],
+            "knowledge_facts",
+            runtime=_runtime(FailedReranker()),
+        )
+    assert collection.hydration_calls == []
