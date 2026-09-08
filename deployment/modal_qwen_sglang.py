@@ -22,6 +22,9 @@ MODEL_VOLUME_ROOT = Path("/models")
 MODEL_PATH = MODEL_VOLUME_ROOT / os.getenv("QWEN_MODEL_PATH", "qwen3-4b-awq")
 MANIFEST_PATH = MODEL_PATH / "qwen-manifest.json"
 PORT = int(os.getenv("QWEN_MODAL_SGLANG_PORT", "30001"))
+STARTUP_TIMEOUT_SECONDS = int(
+    os.getenv("QWEN_MODAL_SGLANG_STARTUP_TIMEOUT", "1200")
+)
 GPU = os.getenv("QWEN_MODAL_SGLANG_GPU", "L40S")
 COMPUTE_REGION = os.getenv("QWEN_MODAL_SGLANG_COMPUTE_REGION", "us")
 ROUTING_REGION = os.getenv("QWEN_MODAL_SGLANG_ROUTING_REGION", "us-east")
@@ -37,6 +40,7 @@ VOLUME_NAME = os.getenv("QWEN_MODAL_MODEL_VOLUME", "rag-qwen-models")
 
 for name, value in (
     ("QWEN_MODAL_SGLANG_PORT", PORT),
+    ("QWEN_MODAL_SGLANG_STARTUP_TIMEOUT", STARTUP_TIMEOUT_SECONDS),
     ("QWEN_MODAL_SGLANG_MIN_CONTAINERS", MIN_CONTAINERS),
     ("QWEN_MODAL_SGLANG_MAX_CONTAINERS", MAX_CONTAINERS),
     ("QWEN_MODAL_SGLANG_TARGET_CONCURRENCY", TARGET_CONCURRENCY),
@@ -155,7 +159,10 @@ def _request_body(prompt: str, *, stream: bool, max_tokens: int) -> dict[str, ob
     }
 
 
-def _wait_and_warm(process: subprocess.Popen[Any], timeout_seconds: int = 1200) -> None:
+def _wait_and_warm(
+    process: subprocess.Popen[Any],
+    timeout_seconds: int = STARTUP_TIMEOUT_SECONDS,
+) -> None:
     import requests
 
     deadline = time.monotonic() + timeout_seconds
@@ -221,7 +228,7 @@ def _wait_and_warm(process: subprocess.Popen[Any], timeout_seconds: int = 1200) 
     min_containers=MIN_CONTAINERS,
     max_containers=MAX_CONTAINERS,
     target_concurrency=TARGET_CONCURRENCY,
-    startup_timeout=20 * 60,
+    startup_timeout=STARTUP_TIMEOUT_SECONDS,
     exit_grace_period=30,
     port=PORT,
     unauthenticated=False,

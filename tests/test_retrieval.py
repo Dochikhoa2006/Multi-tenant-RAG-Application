@@ -8,6 +8,9 @@ import pytest
 
 from backend.model_config import (
     CONVERSATION_SEARCH,
+    FIXED_CONVERSATION_CANDIDATE_COUNT,
+    FIXED_KNOWLEDGE_CANDIDATE_COUNT,
+    FIXED_POLICY_CANDIDATE_COUNT,
     KNOWLEDGE_SEARCH,
     POLICY_SEARCH,
     RERANKER_MODEL,
@@ -181,9 +184,23 @@ def _candidate(index: int, score: float, vector: Sequence[float]) -> dict[str, o
 
 
 def test_collection_candidate_ceilings_and_final_maxima_are_exact() -> None:
-    assert (CONVERSATION_SEARCH.candidate_count, CONVERSATION_SEARCH.candidate_ceiling) == (50, 50)
-    assert (KNOWLEDGE_SEARCH.candidate_count, KNOWLEDGE_SEARCH.candidate_ceiling) == (50, 50)
-    assert (POLICY_SEARCH.candidate_count, POLICY_SEARCH.candidate_ceiling) == (40, 40)
+    assert (
+        FIXED_CONVERSATION_CANDIDATE_COUNT,
+        FIXED_KNOWLEDGE_CANDIDATE_COUNT,
+        FIXED_POLICY_CANDIDATE_COUNT,
+    ) == (50, 50, 40)
+    assert (
+        CONVERSATION_SEARCH.candidate_count,
+        CONVERSATION_SEARCH.candidate_ceiling,
+    ) == (FIXED_CONVERSATION_CANDIDATE_COUNT,) * 2
+    assert (
+        KNOWLEDGE_SEARCH.candidate_count,
+        KNOWLEDGE_SEARCH.candidate_ceiling,
+    ) == (FIXED_KNOWLEDGE_CANDIDATE_COUNT,) * 2
+    assert (
+        POLICY_SEARCH.candidate_count,
+        POLICY_SEARCH.candidate_ceiling,
+    ) == (FIXED_POLICY_CANDIDATE_COUNT,) * 2
     assert (
         CONVERSATION_SEARCH.final_count,
         KNOWLEDGE_SEARCH.final_count,

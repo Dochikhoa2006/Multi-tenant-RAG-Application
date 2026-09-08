@@ -8,6 +8,7 @@ import subprocess
 
 import pytest
 
+from backend.api.telemetry import TIMING_KEYS
 from deployment import ragctl
 
 
@@ -103,6 +104,13 @@ def test_command_runner_verifies_modal_target_and_propagates_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _config()
+    config.update(
+        {
+            "MODAL_SGLANG_GPU": "H100",
+            "MODAL_SGLANG_COMPUTE_REGION": "eu",
+            "MODAL_SGLANG_ROUTING_REGION": "eu-west",
+        }
+    )
     events: list[str] = []
     captured_environment: dict[str, str] = {}
 
@@ -122,6 +130,9 @@ def test_command_runner_verifies_modal_target_and_propagates_environment(
     assert events == ["test-workspace"]
     assert captured_environment["MODAL_PROFILE"] == "test-workspace"
     assert captured_environment["MODAL_ENVIRONMENT"] == "main"
+    assert captured_environment["MODAL_SGLANG_GPU"] == "H100"
+    assert captured_environment["MODAL_SGLANG_COMPUTE_REGION"] == "eu"
+    assert captured_environment["MODAL_SGLANG_ROUTING_REGION"] == "eu-west"
 
 
 def test_non_modal_command_does_not_run_modal_target_probe(
@@ -306,7 +317,7 @@ def test_config_rejects_unapproved_operational_gpu(value: str) -> None:
         ragctl.validate_config(config)
 
 
-def test_deployments_use_configured_gpu_requests(
+def test_deployments_use_the_existing_subprocess_environment_without_overrides(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _config()
@@ -324,9 +335,10 @@ def test_deployments_use_configured_gpu_requests(
     ragctl.deploy_qwen(config, runner)  # type: ignore[arg-type]
     ragctl.deploy_runtime(config, runner)  # type: ignore[arg-type]
 
-    assert runner.options[0]["overrides"]["MODAL_SGLANG_GPU"] == "H100"  # type: ignore[index]
-    assert runner.options[1]["overrides"]["QWEN_MODAL_SGLANG_GPU"] == "H100"  # type: ignore[index]
-    assert runner.options[2]["overrides"]["MODAL_RAG_GPU"] == "L40S"  # type: ignore[index]
+    assert all("overrides" not in options for options in runner.options)
+    assert ragctl.gpu_request(config, "MODAL_SGLANG_GPU") == "H100"
+    assert ragctl.gpu_request(config, "QWEN_MODAL_SGLANG_GPU") == "H100"
+    assert ragctl.gpu_request(config, "MODAL_RAG_GPU") == "L40S"
 
 
 def test_waiting_progress_is_redacted_and_actionable() -> None:
@@ -413,6 +425,10 @@ def test_sse_parser_and_result_validation_accept_contract_order() -> None:
     assert timings["ttft"] == 1.5
 
 
+def test_launcher_uses_the_public_telemetry_key_owner() -> None:
+    assert ragctl.CHAT_TIMING_KEYS is TIMING_KEYS
+
+
 @pytest.mark.parametrize(
     "events",
     [
@@ -432,7 +448,7 @@ def test_result_validation_rejects_bad_terminal_contract(events: list[str]) -> N
         )
 
 
-def test_launcher_keeps_gpu_overrides_and_source_defaults() -> None:
+def test_launcher_keeps_one_gpu_default_and_independent_source_defaults() -> None:
     granite = (ragctl.PROJECT_ROOT / "deployment" / "modal_sglang.py").read_text(
         encoding="utf-8"
     )
@@ -448,6 +464,14 @@ def test_launcher_keeps_gpu_overrides_and_source_defaults() -> None:
         "QWEN_MODAL_SGLANG_GPU": "L40S",
         "MODAL_RAG_GPU": "L40S",
     }
+    assert set(ragctl.GPU_DEFAULTS.values()) == {ragctl.DEFAULT_OPERATIONAL_GPU}
     assert 'GPU = os.getenv("MODAL_SGLANG_GPU", "L40S")' in granite
     assert 'GPU = os.getenv("QWEN_MODAL_SGLANG_GPU", "L40S")' in qwen
     assert 'GPU = os.getenv("MODAL_RAG_GPU", "L40S")' in runtime
+
+
+def test_launcher_secure_tunnel_topology_has_single_in_process_owners() -> None:
+    assert ragctl.LOCAL_WEAVIATE_REST_URL == "http://127.0.0.1:8080"
+    assert ragctl.LOCAL_WEAVIATE_GRPC_TLS_TARGET == "127.0.0.1:5443"
+    assert ragctl.REST_FUNNEL_PORT == 443
+    assert ragctl.GRPC_FUNNEL_PORT == 8443

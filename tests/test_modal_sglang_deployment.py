@@ -11,6 +11,18 @@ DEPLOYMENTS = (
     ("modal_sglang.py", "GraniteSGLangServer"),
     ("modal_qwen_sglang.py", "QwenSGLangServer"),
 )
+STARTUP_TIMEOUT_ENVIRONMENTS = (
+    (
+        "modal_sglang.py",
+        "GraniteSGLangServer",
+        "MODAL_SGLANG_STARTUP_TIMEOUT",
+    ),
+    (
+        "modal_qwen_sglang.py",
+        "QwenSGLangServer",
+        "QWEN_MODAL_SGLANG_STARTUP_TIMEOUT",
+    ),
+)
 
 
 def _server_keywords(path: Path, class_name: str) -> dict[str, ast.expr]:
@@ -67,3 +79,40 @@ def test_sglang_deployments_preserve_model_and_inference_contracts() -> None:
     assert '"--reasoning-parser",\n            "qwen3"' in qwen
     assert '"chat_template_kwargs": {"enable_thinking": False}' in qwen
     assert '"temperature": 0.7' in qwen
+
+
+@pytest.mark.parametrize(
+    ("filename", "class_name", "environment_name"),
+    STARTUP_TIMEOUT_ENVIRONMENTS,
+)
+def test_sglang_startup_timeout_has_one_import_time_owner(
+    filename: str,
+    class_name: str,
+    environment_name: str,
+) -> None:
+    path = PROJECT_ROOT / "deployment" / filename
+    source = path.read_text(encoding="utf-8")
+    startup_timeout = _server_keywords(path, class_name)["startup_timeout"]
+
+    assert isinstance(startup_timeout, ast.Name)
+    assert startup_timeout.id == "STARTUP_TIMEOUT_SECONDS"
+    assert f'os.getenv("{environment_name}", "1200")' in source
+    assert "timeout_seconds: int = STARTUP_TIMEOUT_SECONDS" in source
+    assert "startup_timeout=20 * 60" not in source
+    assert "timeout_seconds: int = 1200" not in source
+
+
+def test_example_environment_documents_modal_placement_and_startup_timeouts() -> None:
+    example = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8")
+
+    for assignment in (
+        "MODAL_SGLANG_COMPUTE_REGION=us",
+        "MODAL_SGLANG_ROUTING_REGION=us-east",
+        "MODAL_SGLANG_STARTUP_TIMEOUT=1200",
+        "QWEN_MODAL_SGLANG_COMPUTE_REGION=us",
+        "QWEN_MODAL_SGLANG_ROUTING_REGION=us-east",
+        "QWEN_MODAL_SGLANG_STARTUP_TIMEOUT=1200",
+        "MODAL_RAG_COMPUTE_REGION=us",
+        "MODAL_RAG_ROUTING_REGION=us-east",
+    ):
+        assert assignment in example

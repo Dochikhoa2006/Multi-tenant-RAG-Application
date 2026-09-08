@@ -29,6 +29,9 @@ MODEL_VOLUME_ROOT = Path("/models")
 MODEL_PATH = MODEL_VOLUME_ROOT / MODEL_NAME
 MANIFEST_PATH = MODEL_PATH / "granite-manifest.json"
 PORT = int(os.getenv("MODAL_SGLANG_PORT", "30000"))
+STARTUP_TIMEOUT_SECONDS = int(
+    os.getenv("MODAL_SGLANG_STARTUP_TIMEOUT", "1200")
+)
 GPU = os.getenv("MODAL_SGLANG_GPU", "L40S")
 COMPUTE_REGION = os.getenv("MODAL_SGLANG_COMPUTE_REGION", "us")
 ROUTING_REGION = os.getenv("MODAL_SGLANG_ROUTING_REGION", "us-east")
@@ -44,6 +47,7 @@ VOLUME_NAME = os.getenv("MODAL_SGLANG_MODEL_VOLUME", "rag-granite-models")
 
 for name, value in (
     ("MODAL_SGLANG_PORT", PORT),
+    ("MODAL_SGLANG_STARTUP_TIMEOUT", STARTUP_TIMEOUT_SECONDS),
     ("MODAL_SGLANG_MIN_CONTAINERS", MIN_CONTAINERS),
     ("MODAL_SGLANG_MAX_CONTAINERS", MAX_CONTAINERS),
     ("MODAL_SGLANG_TARGET_CONCURRENCY", TARGET_CONCURRENCY),
@@ -141,7 +145,10 @@ def _check_running(process: subprocess.Popen[Any]) -> None:
         raise RuntimeError(f"SGLang terminated during startup with status {return_code}")
 
 
-def _wait_and_warm(process: subprocess.Popen[Any], timeout_seconds: int = 1200) -> None:
+def _wait_and_warm(
+    process: subprocess.Popen[Any],
+    timeout_seconds: int = STARTUP_TIMEOUT_SECONDS,
+) -> None:
     import requests
 
     deadline = time.monotonic() + timeout_seconds
@@ -204,7 +211,7 @@ def _wait_and_warm(process: subprocess.Popen[Any], timeout_seconds: int = 1200) 
     min_containers=MIN_CONTAINERS,
     max_containers=MAX_CONTAINERS,
     target_concurrency=TARGET_CONCURRENCY,
-    startup_timeout=20 * 60,
+    startup_timeout=STARTUP_TIMEOUT_SECONDS,
     exit_grace_period=30,
     port=PORT,
     unauthenticated=False,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import os
 from pathlib import Path
 import re
@@ -10,6 +11,77 @@ import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_model_integrity_profiles_derive_from_authoritative_dimensions() -> None:
+    from backend.model_config import (
+        EMBEDDING_VECTOR_PROFILE,
+        GTE_EMBEDDING_DIMENSION,
+        LATEON_DOCUMENT_MAX_MODEL_TOKENS,
+        LATEON_EMBEDDING_DIMENSION,
+        LATEON_QUERY_MAX_MODEL_TOKENS,
+        MMR_DIVERSITY_VECTOR_DIMENSION,
+        RETRIEVAL_VECTOR_PROFILE,
+    )
+
+    assert GTE_EMBEDDING_DIMENSION == 768
+    assert MMR_DIVERSITY_VECTOR_DIMENSION == GTE_EMBEDDING_DIMENSION
+    assert EMBEDDING_VECTOR_PROFILE == (
+        "gte-modernbert-base-e7f32e3-fp16-cls-l2-768-v1"
+    )
+    assert (LATEON_QUERY_MAX_MODEL_TOKENS, LATEON_DOCUMENT_MAX_MODEL_TOKENS) == (
+        32,
+        300,
+    )
+    assert LATEON_EMBEDDING_DIMENSION == 128
+    assert RETRIEVAL_VECTOR_PROFILE == (
+        "lateon-62911e1050-fp16-colbert-maxsim-q32-d300-128-v1+"
+        "gte-modernbert-base-e7f32e3-fp16-cls-l2-768-v1"
+    )
+
+
+def test_request_path_modules_do_not_read_environment_directly() -> None:
+    excluded = {
+        PROJECT_ROOT / "backend" / "config.py",
+        PROJECT_ROOT / "backend" / "model_config.py",
+    }
+    violations: list[str] = []
+    for path in (PROJECT_ROOT / "backend").rglob("*.py"):
+        if path in excluded:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "os"
+                and node.func.attr == "getenv"
+            ):
+                violations.append(f"{path.relative_to(PROJECT_ROOT)}:{node.lineno}")
+            if (
+                isinstance(node, ast.Subscript)
+                and isinstance(node.value, ast.Attribute)
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id == "os"
+                and node.value.attr == "environ"
+            ):
+                violations.append(f"{path.relative_to(PROJECT_ROOT)}:{node.lineno}")
+
+    assert violations == []
+
+
+def test_production_source_contains_no_modal_proxy_token_literals() -> None:
+    token_pattern = re.compile(r"\b(?:wk|ws)-[A-Za-z0-9]{20,}\b")
+    findings: list[str] = []
+    for root_name in ("backend", "deployment", "scripts"):
+        for path in (PROJECT_ROOT / root_name).rglob("*"):
+            if not path.is_file() or path.suffix not in {".py", ".yaml", ".cfg"}:
+                continue
+            if token_pattern.search(path.read_text(encoding="utf-8")):
+                findings.append(str(path.relative_to(PROJECT_ROOT)))
+
+    assert findings == []
 
 
 def _run_python(code: str, *, overrides: dict[str, str]) -> subprocess.CompletedProcess[str]:

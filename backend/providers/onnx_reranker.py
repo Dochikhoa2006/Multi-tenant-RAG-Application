@@ -14,6 +14,7 @@ import numpy as np
 
 from backend.model_config import ONNX_RERANKER, RERANKER_MODEL, ONNXModelConfig
 from backend.providers.onnx_cuda import (
+    CUDA_PROVIDER,
     enable_assignment_recording,
     validate_cuda_placement,
 )
@@ -153,7 +154,7 @@ class ONNXCrossEncoderReranker:
                 options = ort.SessionOptions()
                 if (
                     config.disable_cpu_fallback
-                    and config.execution_provider == "CUDAExecutionProvider"
+                    and config.execution_provider == CUDA_PROVIDER
                 ):
                     enable_assignment_recording(options)
             if config.execution_provider not in available_providers:
@@ -161,7 +162,7 @@ class ONNXCrossEncoderReranker:
                     f"required execution provider {config.execution_provider!r} is unavailable"
                 )
             provider: str | tuple[str, dict[str, str]] = config.execution_provider
-            if config.execution_provider == "CUDAExecutionProvider":
+            if config.execution_provider == CUDA_PROVIDER:
                 provider = (
                     config.execution_provider,
                     {"device_id": str(config.device_id)},
@@ -187,7 +188,7 @@ class ONNXCrossEncoderReranker:
         providers = list(get_providers())
         if not providers or providers[0] != config.execution_provider:
             raise ONNXRerankerError("reranker session did not activate the required provider")
-        if options is not None and config.execution_provider == "CUDAExecutionProvider":
+        if options is not None and config.execution_provider == CUDA_PROVIDER:
             summary = validate_cuda_placement(
                 session,
                 expected_cpu_digest=_EXPECTED_CPU_ASSIGNMENT_SHA256,

@@ -23,6 +23,8 @@ import warnings
 
 import httpx
 
+from backend.api.telemetry import TIMING_KEYS
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = PROJECT_ROOT / ".env"
@@ -49,28 +51,21 @@ DEFAULT_USER_ID = "e2e_20260901_0cd6147d7fd3"
 STARTUP_TIMEOUT_SECONDS = 1_500
 POLL_SECONDS = 5.0
 PROGRESS_SECONDS = 30.0
+LOCAL_WEAVIATE_REST_URL = "http://127.0.0.1:8080"
+LOCAL_WEAVIATE_GRPC_TLS_TARGET = "127.0.0.1:5443"
+REST_FUNNEL_PORT = 443
+GRPC_FUNNEL_PORT = 8443
 
-GPU_DEFAULTS = {
-    "MODAL_SGLANG_GPU": "L40S",
-    "QWEN_MODAL_SGLANG_GPU": "L40S",
-    "MODAL_RAG_GPU": "L40S",
-}
-ALLOWED_OPERATIONAL_GPUS = frozenset({"L40S", "H100"})
-CHAT_TIMING_KEYS = (
-    "original_query_embedding",
-    "conversation_hybrid_search",
-    "conversation_mmr_rerank",
-    "query_rewrite",
-    "rewritten_query_embedding",
-    "knowledge_hybrid_search",
-    "knowledge_cross_encoder_rerank",
-    "policy_hybrid_search",
-    "policy_cross_encoder_rerank",
-    "prompt_construction",
-    "ttft",
-    "generation",
-    "total_request",
+DEFAULT_OPERATIONAL_GPU = "L40S"
+OPERATIONAL_GPU_KEYS = (
+    "MODAL_SGLANG_GPU",
+    "QWEN_MODAL_SGLANG_GPU",
+    "MODAL_RAG_GPU",
 )
+GPU_DEFAULTS = dict.fromkeys(OPERATIONAL_GPU_KEYS, DEFAULT_OPERATIONAL_GPU)
+ALLOWED_OPERATIONAL_GPUS = frozenset({"L40S", "H100"})
+# Compatibility name for launcher callers; the API telemetry module owns the tuple.
+CHAT_TIMING_KEYS = TIMING_KEYS
 
 RUNTIME_SECRET_KEYS = (
     "WEAVIATE_URL",
@@ -162,8 +157,10 @@ def validate_config(config: Mapping[str, str]) -> None:
         grpc_port = int(config["WEAVIATE_GRPC_PORT"])
     except ValueError as exc:
         raise RagCtlError("WEAVIATE_GRPC_PORT must be an integer") from exc
-    if grpc_port != 8443:
-        raise RagCtlError("WEAVIATE_GRPC_PORT must remain 8443 for the secure Funnel")
+    if grpc_port != GRPC_FUNNEL_PORT:
+        raise RagCtlError(
+            f"WEAVIATE_GRPC_PORT must remain {GRPC_FUNNEL_PORT} for the secure Funnel"
+        )
 
     modal_target(config)
     if any(
@@ -423,7 +420,7 @@ def compose_up(runner: CommandRunner) -> None:
 
 def configure_funnels(hostname: str, runner: CommandRunner) -> None:
     runner.run(
-        [TAILSCALE, "funnel", "--https=443", "off"],
+        [TAILSCALE, "funnel", f"--https={REST_FUNNEL_PORT}", "off"],
         check=False,
         capture=True,
         quiet=True,
@@ -434,12 +431,12 @@ def configure_funnels(hostname: str, runner: CommandRunner) -> None:
             "funnel",
             "--yes",
             "--bg",
-            "--https=443",
-            "http://127.0.0.1:8080",
+            f"--https={REST_FUNNEL_PORT}",
+            LOCAL_WEAVIATE_REST_URL,
         ]
     )
     runner.run(
-        [TAILSCALE, "funnel", "--tcp=8443", "off"],
+        [TAILSCALE, "funnel", f"--tcp={GRPC_FUNNEL_PORT}", "off"],
         check=False,
         capture=True,
         quiet=True,
@@ -450,20 +447,24 @@ def configure_funnels(hostname: str, runner: CommandRunner) -> None:
             "funnel",
             "--yes",
             "--bg",
-            "--tcp=8443",
-            "tcp://127.0.0.1:5443",
+            f"--tcp={GRPC_FUNNEL_PORT}",
+            f"tcp://{LOCAL_WEAVIATE_GRPC_TLS_TARGET}",
         ]
     )
     status = _json_command(runner, [TAILSCALE, "funnel", "status", "--json"])
-    web = status.get("Web", {}).get(f"{hostname}:443", {}).get("Handlers", {})
+    web = status.get("Web", {}).get(
+        f"{hostname}:{REST_FUNNEL_PORT}", {}
+    ).get("Handlers", {})
     rest_proxy = web.get("/", {}).get("Proxy")
-    tcp_forward = status.get("TCP", {}).get("8443", {}).get("TCPForward")
+    tcp_forward = status.get("TCP", {}).get(
+        str(GRPC_FUNNEL_PORT), {}
+    ).get("TCPForward")
     allowed = status.get("AllowFunnel", {})
     if (
-        rest_proxy != "http://127.0.0.1:8080"
-        or tcp_forward != "127.0.0.1:5443"
-        or allowed.get(f"{hostname}:443") is not True
-        or allowed.get(f"{hostname}:8443") is not True
+        rest_proxy != LOCAL_WEAVIATE_REST_URL
+        or tcp_forward != LOCAL_WEAVIATE_GRPC_TLS_TARGET
+        or allowed.get(f"{hostname}:{REST_FUNNEL_PORT}") is not True
+        or allowed.get(f"{hostname}:{GRPC_FUNNEL_PORT}") is not True
     ):
         raise RagCtlError("Tailscale did not register both Funnels on the active node")
 
@@ -474,7 +475,7 @@ def _http_headers(api_key: str) -> dict[str, str]:
 
 def verify_weaviate(config: Mapping[str, str]) -> None:
     key = config["WEAVIATE_API_KEY"]
-    local = "http://127.0.0.1:8080"
+    local = LOCAL_WEAVIATE_REST_URL
     external = config["WEAVIATE_URL"].rstrip("/")
     timeout = httpx.Timeout(30.0, read=60.0)
     with httpx.Client(timeout=timeout, follow_redirects=False) as client:
@@ -569,11 +570,6 @@ def gpu_request(config: Mapping[str, str], name: str) -> str:
 def deploy_granite(config: Mapping[str, str], runner: CommandRunner) -> str:
     runner.run(
         [MODAL, "deploy", PROJECT_ROOT / "deployment" / "modal_sglang.py"],
-        overrides={
-            "MODAL_SGLANG_GPU": gpu_request(config, "MODAL_SGLANG_GPU"),
-            "MODAL_SGLANG_COMPUTE_REGION": "us",
-            "MODAL_SGLANG_ROUTING_REGION": "us-east",
-        },
     )
     return resolve_server_url(GRANITE_APP, GRANITE_CLASS, config) + "/v1"
 
@@ -581,13 +577,6 @@ def deploy_granite(config: Mapping[str, str], runner: CommandRunner) -> str:
 def deploy_qwen(config: Mapping[str, str], runner: CommandRunner) -> str:
     runner.run(
         [MODAL, "deploy", PROJECT_ROOT / "deployment" / "modal_qwen_sglang.py"],
-        overrides={
-            "QWEN_MODAL_SGLANG_GPU": gpu_request(
-                config, "QWEN_MODAL_SGLANG_GPU"
-            ),
-            "QWEN_MODAL_SGLANG_COMPUTE_REGION": "us",
-            "QWEN_MODAL_SGLANG_ROUTING_REGION": "us-east",
-        },
     )
     return resolve_server_url(QWEN_APP, QWEN_CLASS, config) + "/v1"
 
@@ -834,11 +823,6 @@ def deploy_runtime_secret(secret: Mapping[str, str], runner: CommandRunner) -> N
 def deploy_runtime(config: Mapping[str, str], runner: CommandRunner) -> str:
     runner.run(
         [MODAL, "deploy", PROJECT_ROOT / "deployment" / "modal_runtime.py"],
-        overrides={
-            "MODAL_RAG_GPU": gpu_request(config, "MODAL_RAG_GPU"),
-            "MODAL_RAG_COMPUTE_REGION": "us",
-            "MODAL_RAG_ROUTING_REGION": "us-east",
-        },
     )
     return resolve_server_url(RUNTIME_APP, RUNTIME_CLASS, config)
 
@@ -1033,13 +1017,13 @@ def disable_funnels(runner: CommandRunner) -> None:
     if not TAILSCALE.is_file():
         return
     runner.run(
-        [TAILSCALE, "funnel", "--https=443", "off"],
+        [TAILSCALE, "funnel", f"--https={REST_FUNNEL_PORT}", "off"],
         check=False,
         capture=True,
         quiet=True,
     )
     runner.run(
-        [TAILSCALE, "funnel", "--tcp=8443", "off"],
+        [TAILSCALE, "funnel", f"--tcp={GRPC_FUNNEL_PORT}", "off"],
         check=False,
         capture=True,
         quiet=True,
@@ -1287,7 +1271,10 @@ def status(config: Mapping[str, str], runner: CommandRunner) -> None:
         try:
             payload = json.loads(funnel.stdout)
             forwards = payload.get("TCP", {})
-            funnels_ready = "443" in forwards and "8443" in forwards
+            funnels_ready = (
+                str(REST_FUNNEL_PORT) in forwards
+                and str(GRPC_FUNNEL_PORT) in forwards
+            )
         except (TypeError, ValueError, json.JSONDecodeError):
             pass
     print(f"  Tailscale Funnels: {'configured' if funnels_ready else 'off'}")

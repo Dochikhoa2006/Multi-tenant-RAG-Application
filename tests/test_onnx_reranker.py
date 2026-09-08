@@ -11,10 +11,15 @@ import pytest
 
 import backend.providers.onnx_reranker as onnx_reranker
 from backend.model_config import ONNXModelConfig, RERANKER_MODEL, RERANKER_MODEL_REVISION
+from backend.providers.onnx_cuda import CUDA_PROVIDER
 from backend.providers.onnx_reranker import (
     ONNXCrossEncoderReranker,
     ONNXRerankerError,
 )
+
+
+def test_reranker_uses_authoritative_cuda_provider_name() -> None:
+    assert onnx_reranker.CUDA_PROVIDER == CUDA_PROVIDER
 
 
 def _artifacts(root: Path) -> None:

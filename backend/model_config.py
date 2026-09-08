@@ -406,8 +406,13 @@ EMBEDDING_MODEL = _env_string(
 RERANKER_MODEL = _env_string("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
 EMBEDDING_MODEL_REVISION = "e7f32e3c00f91d699e8c43b53106206bcc72bb22"
 RERANKER_MODEL_REVISION = "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"
-EMBEDDING_VECTOR_PROFILE = "gte-modernbert-base-e7f32e3-fp16-cls-l2-768-v1"
-MMR_DIVERSITY_VECTOR_DIMENSION = 768
+GTE_EMBEDDING_DIMENSION = 768
+MMR_DIVERSITY_VECTOR_DIMENSION = GTE_EMBEDDING_DIMENSION
+EMBEDDING_VECTOR_PROFILE = (
+    "gte-modernbert-base-"
+    f"{EMBEDDING_MODEL_REVISION[:7]}-fp16-cls-l2-"
+    f"{GTE_EMBEDDING_DIMENSION}-v1"
+)
 LATEON_MODEL = "lightonai/LateOn"
 LATEON_MODEL_REVISION = "62911e105059585d244384c7d17826e35f669c17"
 LATEON_QUERY_MAX_MODEL_TOKENS = 32
@@ -417,7 +422,10 @@ LATE_INTERACTION_VECTOR_NAME = "late_interaction"
 MMR_DIVERSITY_VECTOR_NAME = "mmr_diversity"
 RETRIEVAL_UNIT_MAX_MODEL_TOKENS = LATEON_DOCUMENT_MAX_MODEL_TOKENS
 RETRIEVAL_VECTOR_PROFILE = (
-    "lateon-62911e1050-fp16-colbert-maxsim-q32-d300-128-v1+"
+    f"lateon-{LATEON_MODEL_REVISION[:10]}-fp16-colbert-maxsim-"
+    f"q{LATEON_QUERY_MAX_MODEL_TOKENS}-"
+    f"d{LATEON_DOCUMENT_MAX_MODEL_TOKENS}-"
+    f"{LATEON_EMBEDDING_DIMENSION}-v1+"
     f"{EMBEDDING_VECTOR_PROFILE}"
 )
 SEGMENTATION_EMBEDDING_MODEL = _env_string(
@@ -561,13 +569,21 @@ _OBSOLETE_CANDIDATE_COUNT_VARIABLES = (
     "KNOWLEDGE_CANDIDATE_COUNT",
     "POLICY_CANDIDATE_COUNT",
 )
+FIXED_CONVERSATION_CANDIDATE_COUNT = 50
+FIXED_KNOWLEDGE_CANDIDATE_COUNT = 50
+FIXED_POLICY_CANDIDATE_COUNT = 40
+_DEFAULT_ADAPTIVE_RELEVANCE_FLOOR = -1.0
+_DEFAULT_ADAPTIVE_GAP_THRESHOLD = 0.15
+_DEFAULT_MMR_LAMBDA = 0.70
 _configured_candidate_counts = tuple(
     name for name in _OBSOLETE_CANDIDATE_COUNT_VARIABLES if name in os.environ
 )
 if _configured_candidate_counts:
     raise ValueError(
         f"{', '.join(_configured_candidate_counts)} no longer supported; "
-        "first-stage retrieval is fixed to C50 / K50 / P40. Remove the "
+        f"first-stage retrieval is fixed to C{FIXED_CONVERSATION_CANDIDATE_COUNT} / "
+        f"K{FIXED_KNOWLEDGE_CANDIDATE_COUNT} / "
+        f"P{FIXED_POLICY_CANDIDATE_COUNT}. Remove the "
         "obsolete environment variable(s)."
     )
 
@@ -578,40 +594,46 @@ HYBRID_SEARCH = HybridSearchConfig(
 )
 
 CONVERSATION_SEARCH = RetrievalConfig(
-    candidate_count=50,
-    candidate_ceiling=50,
+    candidate_count=FIXED_CONVERSATION_CANDIDATE_COUNT,
+    candidate_ceiling=FIXED_CONVERSATION_CANDIDATE_COUNT,
     final_count=_env_int("CONVERSATION_FINAL_COUNT", 5),
     adaptive_relevance_floor=_env_finite_float(
-        "CONVERSATION_ADAPTIVE_RELEVANCE_FLOOR", -1.0
+        "CONVERSATION_ADAPTIVE_RELEVANCE_FLOOR",
+        _DEFAULT_ADAPTIVE_RELEVANCE_FLOOR,
     ),
     adaptive_gap_threshold=_env_probability(
-        "CONVERSATION_ADAPTIVE_GAP_THRESHOLD", 0.15
+        "CONVERSATION_ADAPTIVE_GAP_THRESHOLD",
+        _DEFAULT_ADAPTIVE_GAP_THRESHOLD,
     ),
-    mmr_lambda=_env_probability("CONVERSATION_MMR_LAMBDA", 0.70),
+    mmr_lambda=_env_probability("CONVERSATION_MMR_LAMBDA", _DEFAULT_MMR_LAMBDA),
 )
 KNOWLEDGE_SEARCH = RetrievalConfig(
-    candidate_count=50,
-    candidate_ceiling=50,
+    candidate_count=FIXED_KNOWLEDGE_CANDIDATE_COUNT,
+    candidate_ceiling=FIXED_KNOWLEDGE_CANDIDATE_COUNT,
     final_count=_env_int("KNOWLEDGE_FINAL_COUNT", 8),
     adaptive_relevance_floor=_env_finite_float(
-        "KNOWLEDGE_ADAPTIVE_RELEVANCE_FLOOR", -1.0
+        "KNOWLEDGE_ADAPTIVE_RELEVANCE_FLOOR",
+        _DEFAULT_ADAPTIVE_RELEVANCE_FLOOR,
     ),
     adaptive_gap_threshold=_env_probability(
-        "KNOWLEDGE_ADAPTIVE_GAP_THRESHOLD", 0.15
+        "KNOWLEDGE_ADAPTIVE_GAP_THRESHOLD",
+        _DEFAULT_ADAPTIVE_GAP_THRESHOLD,
     ),
-    mmr_lambda=_env_probability("KNOWLEDGE_MMR_LAMBDA", 0.70),
+    mmr_lambda=_env_probability("KNOWLEDGE_MMR_LAMBDA", _DEFAULT_MMR_LAMBDA),
 )
 POLICY_SEARCH = RetrievalConfig(
-    candidate_count=40,
-    candidate_ceiling=40,
+    candidate_count=FIXED_POLICY_CANDIDATE_COUNT,
+    candidate_ceiling=FIXED_POLICY_CANDIDATE_COUNT,
     final_count=_env_int("POLICY_FINAL_COUNT", 5),
     adaptive_relevance_floor=_env_finite_float(
-        "POLICY_ADAPTIVE_RELEVANCE_FLOOR", -1.0
+        "POLICY_ADAPTIVE_RELEVANCE_FLOOR",
+        _DEFAULT_ADAPTIVE_RELEVANCE_FLOOR,
     ),
     adaptive_gap_threshold=_env_probability(
-        "POLICY_ADAPTIVE_GAP_THRESHOLD", 0.15
+        "POLICY_ADAPTIVE_GAP_THRESHOLD",
+        _DEFAULT_ADAPTIVE_GAP_THRESHOLD,
     ),
-    mmr_lambda=_env_probability("POLICY_MMR_LAMBDA", 0.70),
+    mmr_lambda=_env_probability("POLICY_MMR_LAMBDA", _DEFAULT_MMR_LAMBDA),
 )
 
 CHUNKING = ChunkingConfig(

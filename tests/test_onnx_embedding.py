@@ -14,11 +14,13 @@ import scripts.create_onnx_manifest as onnx_manifest
 from backend.model_config import (
     EMBEDDING_MODEL,
     EMBEDDING_MODEL_REVISION,
+    GTE_EMBEDDING_DIMENSION,
     LATEON_EMBEDDING_DIMENSION,
     LATEON_MODEL,
     LATEON_MODEL_REVISION,
     ONNXModelConfig,
 )
+from backend.providers.onnx_cuda import CUDA_PROVIDER
 from backend.providers.onnx_embedding import (
     EMBEDDING_DIMENSION,
     ONNXEmbeddingClient,
@@ -26,6 +28,16 @@ from backend.providers.onnx_embedding import (
     ONNXLateOnError,
     ONNXLateOnProvider,
 )
+
+
+def test_embedding_provider_uses_authoritative_dimension_and_cuda_name() -> None:
+    assert EMBEDDING_DIMENSION == GTE_EMBEDDING_DIMENSION
+    assert onnx_embedding.CUDA_PROVIDER == CUDA_PROVIDER
+
+
+def test_lateon_provisioning_and_runtime_share_frozen_identity() -> None:
+    assert onnx_manifest._LATEON_MODEL_ID == LATEON_MODEL
+    assert onnx_manifest._LATEON_REVISION == LATEON_MODEL_REVISION
 
 
 def _artifacts(root: Path) -> None:

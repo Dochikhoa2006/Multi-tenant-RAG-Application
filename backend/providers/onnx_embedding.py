@@ -13,6 +13,7 @@ import numpy as np
 
 from backend.model_config import (
     EMBEDDING_MODEL,
+    GTE_EMBEDDING_DIMENSION,
     LATEON_DOCUMENT_MAX_MODEL_TOKENS,
     LATEON_EMBEDDING_DIMENSION,
     LATEON_MODEL,
@@ -22,12 +23,14 @@ from backend.model_config import (
     ONNXModelConfig,
 )
 from backend.providers.onnx_cuda import (
+    CUDA_PROVIDER,
     enable_assignment_recording,
     validate_cuda_placement,
 )
 
 
-EMBEDDING_DIMENSION = 768
+# Backward-compatible provider export; the model contract owns the dimension.
+EMBEDDING_DIMENSION = GTE_EMBEDDING_DIMENSION
 _MANIFEST_SCHEMA_VERSION = "1.0"
 _TOKENIZER_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json")
 _EXPECTED_CPU_ASSIGNMENT_SHA256 = (
@@ -302,7 +305,7 @@ class ONNXEmbeddingClient:
                 options = ort.SessionOptions()
                 if (
                     config.disable_cpu_fallback
-                    and config.execution_provider == "CUDAExecutionProvider"
+                    and config.execution_provider == CUDA_PROVIDER
                 ):
                     enable_assignment_recording(options)
             if config.execution_provider not in available_providers:
@@ -310,7 +313,7 @@ class ONNXEmbeddingClient:
                     f"required execution provider {config.execution_provider!r} is unavailable"
                 )
             provider: str | tuple[str, dict[str, str]] = config.execution_provider
-            if config.execution_provider == "CUDAExecutionProvider":
+            if config.execution_provider == CUDA_PROVIDER:
                 provider = (
                     config.execution_provider,
                     {"device_id": str(config.device_id)},
@@ -336,7 +339,7 @@ class ONNXEmbeddingClient:
         providers = list(get_providers())
         if not providers or providers[0] != config.execution_provider:
             raise ONNXEmbeddingError("embedding session did not activate the required provider")
-        if options is not None and config.execution_provider == "CUDAExecutionProvider":
+        if options is not None and config.execution_provider == CUDA_PROVIDER:
             summary = validate_cuda_placement(
                 session,
                 expected_cpu_digest=_EXPECTED_CPU_ASSIGNMENT_SHA256,
@@ -454,7 +457,7 @@ class ONNXLateOnProvider:
     ) -> None:
         if not isinstance(config, ONNXModelConfig):
             raise TypeError("config must be an ONNXModelConfig")
-        if config.execution_provider != "CUDAExecutionProvider":
+        if config.execution_provider != CUDA_PROVIDER:
             raise ONNXLateOnError("LateOn requires CUDAExecutionProvider")
         if config.max_tokens != LATEON_DOCUMENT_MAX_MODEL_TOKENS:
             raise ONNXLateOnError("LateOn document length must remain 300 tokens")
@@ -494,14 +497,14 @@ class ONNXLateOnProvider:
                 available_providers = available_providers or ort.get_available_providers()
                 options = ort.SessionOptions()
                 enable_assignment_recording(options)
-            if "CUDAExecutionProvider" not in available_providers:
+            if CUDA_PROVIDER not in available_providers:
                 raise ONNXLateOnError("CUDAExecutionProvider is unavailable for LateOn")
             session = session_factory(
                 str(model_path),
                 sess_options=options,
                 providers=[
                     (
-                        "CUDAExecutionProvider",
+                        CUDA_PROVIDER,
                         {"device_id": str(config.device_id)},
                     )
                 ],
@@ -520,7 +523,7 @@ class ONNXLateOnProvider:
             raise TypeError("session does not implement the ONNX inference contract")
         disable_fallback()
         providers = list(get_providers())
-        if not providers or providers[0] != "CUDAExecutionProvider":
+        if not providers or providers[0] != CUDA_PROVIDER:
             raise ONNXLateOnError("LateOn session did not activate CUDAExecutionProvider")
         if options is not None:
             if not _EXPECTED_LATEON_CPU_ASSIGNMENT_SHA256:
