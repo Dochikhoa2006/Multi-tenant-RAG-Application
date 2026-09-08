@@ -98,18 +98,17 @@ Context
 
 | Collection | Candidate ceiling | Ranking | Adaptive defaults | Final maximum |
 |---|---|---|---|---|
-| **Conversation** | `50` segment/object hits | BGE → collapse → Adaptive-K → bounded MMR | floor `-1.0`, gap `0.15`, lambda `0.70` | `5` |
-| **Knowledge Facts** | `50` chunks | BGE → Adaptive-K → bounded MMR | floor `-1.0`, gap `0.15`, lambda `0.70` | `8` |
-| **Policy** | `40` chunks | BGE → Adaptive-K → bounded MMR | floor `-1.0`, gap `0.15`, lambda `0.70` | `5` |
+| **Conversation** | `50` segment/object hits | BGE → collapse → Adaptive-K → exact-pool MMR | floor `-1.0`, gap `0.15`, lambda `0.70` | `5` |
+| **Knowledge Facts** | `50` chunks | BGE → Adaptive-K → exact-pool MMR | floor `-1.0`, gap `0.15`, lambda `0.70` | `8` |
+| **Policy** | `40` chunks | BGE → Adaptive-K → exact-pool MMR | floor `-1.0`, gap `0.15`, lambda `0.70` | `5` |
 
-Adaptive-K considers only the first `min(eligible_count, final maximum)`
-floor-eligible BGE results and can return zero. It applies a sigmoid to each raw
-BGE logit independently before comparing adjacent gaps, so the configured gap
-threshold is not distorted by the inspected window's minimum and maximum. MMR
-then considers the first
-`min(2*k, total_eligible_count)` results from the full BGE-sorted eligible pool.
-Each lambda, raw-logit score floor, and sigmoid-gap threshold is independently
-configurable per collection.
+Adaptive-K considers every floor-eligible BGE result and can return zero. It
+applies a sigmoid to each raw BGE logit independently before comparing adjacent
+gaps, so the configured gap threshold is not distorted by the inspected list's
+minimum and maximum. Its result `t` retains exactly the first `t` candidates.
+MMR evaluates that complete retained prefix and greedily selects at most the
+collection's final maximum. Each lambda, raw-logit score floor, and sigmoid-gap
+threshold is independently configurable per collection.
 
 The first-stage counts are fixed at Conversation `50`, Knowledge `50`, and
 Policy `40`; candidate-count environment overrides are rejected. Conversation
@@ -117,10 +116,10 @@ performs one hybrid query for at most 50 segment/object hits, BGE-scores every
 returned hit once, and only then collapses by canonical `conversation_id`. It
 does not retry to reach a target number of unique conversations.
 
-Hybrid queries return no GTE vectors. Each nonempty bounded MMR head is hydrated
+Hybrid queries return no GTE vectors. Each nonempty Adaptive-K prefix is hydrated
 with one application-level `fetch_objects_by_ids()` call, and the returned
 768-dimensional `mmr_diversity` vectors are restored to BGE order before MMR.
-Conversation canonical text is included in that same bounded hydration read.
+Conversation canonical text is included in that same hydration read.
 
 Every late-interaction retrieval unit is measured by the pinned LateOn tokenizer
 and must be at most 300 model tokens with no silent truncation. Knowledge/Policy

@@ -222,7 +222,7 @@ def test_collection_candidate_ceilings_and_final_maxima_are_exact() -> None:
     ) == (5, 8, 5)
 
 
-def test_knowledge_runs_bge_then_adaptive_k_then_bounded_mmr() -> None:
+def test_knowledge_runs_bge_then_adaptive_k_then_exact_pool_mmr() -> None:
     collection = FakeCollection(
         [
             _chunk(1, "first", [1.0, 0.0], 0.9),
@@ -255,20 +255,31 @@ def test_knowledge_runs_bge_then_adaptive_k_then_bounded_mmr() -> None:
         {"object_id": _uuid(2), "raw_text": "second", "rerank_score": 2.9},
     ]
     assert len(collection.hydration_calls) == 1
-    assert len(collection.hydration_calls[0]) == 3
+    assert len(collection.hydration_calls[0]) == 2
 
 
-def test_adaptive_k_uses_exact_decision_window_and_can_return_zero() -> None:
+def test_adaptive_k_uses_all_eligible_candidates_and_can_return_zero() -> None:
     config = RetrievalConfig(50, 50, 3, -1.0, 0.15, 0.70)
     eligible = [
-        _candidate(1, 10.0, [1.0]),
-        _candidate(2, 9.9, [1.0]),
-        _candidate(3, 1.0, [1.0]),
-        _candidate(4, -100.0, [1.0]),
+        _candidate(1, 5.0, [1.0]),
+        _candidate(2, 4.9, [1.0]),
+        _candidate(3, 4.8, [1.0]),
+        _candidate(4, 4.7, [1.0]),
+        _candidate(5, 0.0, [1.0]),
     ]
     assert _adaptive_k([], config) == 0
-    assert _adaptive_k(eligible, config) == 2
+    assert _adaptive_k(eligible, config) == 4
     assert _adaptive_k([_candidate(index, 2.0, [1.0]) for index in range(3)], config) == 3
+
+
+def test_adaptive_k_analyzes_all_fifty_candidates_when_no_gap_qualifies() -> None:
+    config = RetrievalConfig(50, 50, 5, -1.0, 0.15, 0.70)
+    eligible = [
+        _candidate(index, 0.5, [1.0])
+        for index in range(1, 51)
+    ]
+
+    assert _adaptive_k(eligible, config) == 50
 
 
 def test_adaptive_k_does_not_artificially_cut_nearly_equal_logits() -> None:
@@ -292,19 +303,122 @@ def test_adaptive_k_sigmoid_is_stable_for_extreme_logits() -> None:
     assert _adaptive_k(eligible, config) == 2
 
 
-def test_mmr_uses_normalized_bge_relevance_and_exact_two_k_head() -> None:
+def test_mmr_uses_normalized_bge_relevance_across_exact_adaptive_pool() -> None:
     config = RetrievalConfig(50, 50, 5, -1.0, 0.15, 0.50)
-    eligible = [
+    adaptive_pool = [
         _candidate(1, 10.0, [1.0, 0.0]),
         _candidate(2, 9.0, [1.0, 0.0]),
-        _candidate(3, 8.0, [0.0, 1.0]),
-        _candidate(4, 7.0, [0.0, 1.0]),
-        _candidate(5, 1000.0, [1.0, 1.0]),
+        _candidate(3, 8.0, [1.0, 0.0]),
+        _candidate(4, 7.0, [1.0, 0.0]),
+        _candidate(5, 6.0, [0.0, 1.0]),
     ]
-    selected = _mmr(eligible, 2, config)
-    assert [item["object_id"] for item in selected] == [_uuid(1), _uuid(3)]
-    assert _uuid(5) not in {item["object_id"] for item in selected}
+    selected = _mmr(adaptive_pool, 2, config)
+    assert [item["object_id"] for item in selected] == [_uuid(1), _uuid(5)]
     assert all("normalized_rerank_score" not in item for item in selected)
+
+
+def test_mmr_greedily_selects_one_unique_item_per_round_up_to_final_limit() -> None:
+    config = RetrievalConfig(50, 50, 5, -1.0, 0.15, 0.70)
+    adaptive_pool = [
+        _candidate(index, float(20 - index), [1.0, float(index)])
+        for index in range(1, 11)
+    ]
+
+    selected = _mmr(adaptive_pool, config.final_count, config)
+    assert len(selected) == config.final_count
+    assert len({item["object_id"] for item in selected}) == config.final_count
+    assert len(_mmr(adaptive_pool[:3], config.final_count, config)) == 3
+
+
+def test_retrieve_hydrates_exact_dynamic_adaptive_pool_then_caps_final_count() -> None:
+    fixtures = [
+        _chunk(index, f"chunk-{index}", [1.0, float(index)], 1.0)
+        for index in range(1, 13)
+    ]
+    scores = [5.0 - index / 10 for index in range(9)] + [0.0, -0.1, -0.2]
+    collection = FakeCollection(fixtures)
+
+    results = retrieve(
+        collection,
+        "query",
+        [[1.0]],
+        "knowledge_facts",
+        runtime=_runtime(
+            FakeReranker(
+                [RerankResult(index, score) for index, score in enumerate(scores)]
+            )
+        ),
+    )
+
+    assert len(collection.hydration_calls) == 1
+    assert len(collection.hydration_calls[0]) == 9
+    assert len(results) == KNOWLEDGE_SEARCH.final_count
+
+
+def test_retrieve_hydrates_all_fifty_when_adaptive_k_keeps_all() -> None:
+    fixtures = [
+        _chunk(index, f"chunk-{index}", [1.0, float(index)], 1.0)
+        for index in range(1, 51)
+    ]
+    collection = FakeCollection(fixtures)
+
+    results = retrieve(
+        collection,
+        "query",
+        [[1.0]],
+        "knowledge_facts",
+        runtime=_runtime(
+            FakeReranker([RerankResult(index, 0.5) for index in range(50)])
+        ),
+    )
+
+    assert len(collection.hydration_calls) == 1
+    assert len(collection.hydration_calls[0]) == 50
+    assert len(results) == KNOWLEDGE_SEARCH.final_count
+
+
+def test_vector_recovery_stays_in_adaptive_pool_and_obeys_final_limit() -> None:
+    fixtures = [
+        _chunk(index, f"chunk-{index}", [1.0, float(index)], 1.0)
+        for index in range(1, 13)
+    ]
+    scores = [5.0 - index / 10 for index in range(9)] + [0.0, -0.1, -0.2]
+
+    class CorruptAdaptivePoolVector(FakeCollection):
+        def hydrate_mmr_head(
+            self,
+            candidates: Sequence[SearchResult],
+        ) -> list[HydratedSearchResult]:
+            hydrated = super().hydrate_mmr_head(candidates)
+            first = hydrated[0]
+            hydrated[0] = HydratedSearchResult(
+                first.object_id,
+                first.canonical_id,
+                None,
+                first.raw_text,
+                first.segment_index,
+            )
+            return hydrated
+
+    collection = CorruptAdaptivePoolVector(fixtures)
+    results = retrieve(
+        collection,
+        "query",
+        [[1.0]],
+        "knowledge_facts",
+        runtime=_runtime(
+            FakeReranker(
+                [RerankResult(index, score) for index, score in enumerate(scores)]
+            )
+        ),
+    )
+
+    assert [item.object_id for item in collection.hydration_calls[0]] == [
+        _uuid(index) for index in range(1, 10)
+    ]
+    assert [item["object_id"] for item in results] == [
+        _uuid(index) for index in range(1, 9)
+    ]
 
 
 def test_mmr_lambda_is_independently_configured_per_collection() -> None:
@@ -340,7 +454,7 @@ def test_conversation_searches_fifty_segment_hits_once_and_runs_bge_once() -> No
     assert len(set(item["object_id"] for item in results)) == len(results)
     assert len(results) <= CONVERSATION_SEARCH.final_count
     assert len(collection.hydration_calls) == 1
-    assert len(collection.hydration_calls[0]) <= 2 * CONVERSATION_SEARCH.final_count
+    assert len(collection.hydration_calls[0]) == 17
 
 
 def test_conversation_short_page_does_not_retry() -> None:

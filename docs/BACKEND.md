@@ -130,7 +130,7 @@ All three collections follow the same retrieval and ranking structure.
               ┌────────────────────────┐
               │ BGE Cross-Encoder      │
               │ → Adaptive-K           │
-              │ → bounded-head MMR     │
+              │ → exact-pool MMR       │
               └────────────┬───────────┘
                            │
                    Reranked Top-K
@@ -147,18 +147,19 @@ It returns high-recall candidates; no manual hybrid fusion or native Weaviate MM
 is used.
 
 **Unified ranking:** The existing local ONNX BGE cross-encoder scores every final
-candidate once. A deterministic score-distribution Adaptive-K chooses `k`, then
-application MMR selects exactly `k` from the first `min(2*k, eligible_count)`
-BGE-ranked candidates. MMR relevance is normalized BGE score and diversity is
-cosine similarity over the stored GTE `mmr_diversity` vectors. Existing context
-token guards run after MMR. Adaptive-K measures adjacent gaps after applying a
-window-independent sigmoid to each raw BGE logit; only MMR performs head-local
+candidate once. A deterministic score-distribution Adaptive-K analyzes the full
+floor-eligible BGE list and retains its top `t` prefix. Application MMR evaluates
+exactly those `t` candidates and greedily selects at most the collection's final
+maximum. MMR relevance is normalized BGE score and diversity is cosine
+similarity over the stored GTE `mmr_diversity` vectors. Existing context token
+guards run after MMR. Adaptive-K measures adjacent gaps after applying a
+window-independent sigmoid to each raw BGE logit; only MMR performs pool-local
 min-max normalization.
 
 Initial hybrid responses project only the identity and text needed for BGE;
-they do not return `mmr_diversity`. After Adaptive-K fixes the bounded MMR head,
+they do not return `mmr_diversity`. After Adaptive-K fixes the retained prefix,
 the application performs one application-level `fetch_objects_by_ids()` call
-for that nonempty head and restores the persisted GTE vectors in BGE order. The
+for that nonempty prefix and restores the persisted GTE vectors in BGE order. The
 implementation does not assume how the pinned SDK maps that call to transport
 RPCs. Knowledge/Policy lifecycle-only IDs remain stored but are not transferred
 during retrieval.
@@ -166,10 +167,11 @@ Conversation canonical text is fetched with the vector only for representative
 head segments, avoiding one full Q+A copy per first-stage segment hit.
 
 At the fixed `C50 / K50 / P40` ceilings, the initial responses contain at most
-140 objects and zero GTE-vector floats. The former eager response shape would
-have returned 107,520 vector floats; bounded hydration returns at most 36
-objects, or 27,648 floats, and at most 10 Conversation canonical-text copies.
-These are logical payload bounds, not measured wire bytes or a latency claim.
+140 objects and zero GTE-vector floats. Hydration returns exactly the Adaptive-K
+prefixes: from zero through 140 objects across all collections, or at most
+107,520 vector floats, with at most 50 Conversation canonical-text copies. These
+are logical worst-case bounds, not measured wire bytes or a payload/latency
+improvement claim.
 
 This deferred Conversation hydration deliberately narrows one defensive check.
 Canonical text and GTE-vector integrity are verified for every representative
@@ -183,7 +185,7 @@ fail-closed.
 Malformed retrieval objects are quarantined at the smallest safe scope after
 their collection ownership boundary is checked. A conflicting Conversation
 segment identity quarantines the complete canonical conversation rather than
-selecting a sibling arbitrarily. If one bounded-head stored GTE vector is
+selecting a sibling arbitrarily. If one retained-pool stored GTE vector is
 unusable, that collection returns the existing Adaptive-K head in authoritative
 BGE order for that request; it does not fall back to hybrid ranking or issue an
 additional query. Explicit cross-user data, stale vector profiles, malformed

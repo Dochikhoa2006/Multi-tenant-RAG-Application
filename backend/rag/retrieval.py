@@ -344,7 +344,7 @@ def _adaptive_k(
     eligible: Sequence[Mapping[str, Any]],
     config: RetrievalConfig,
 ) -> int:
-    decision = list(eligible[: config.final_count])
+    decision = list(eligible)
     if not decision:
         return 0
     normalized = [
@@ -383,19 +383,20 @@ def _mmr(
 ) -> list[dict[str, Any]]:
     if k == 0:
         return []
-    head = list(eligible[: min(2 * k, len(eligible))])
-    normalized = _normalize_scores(head)
-    remaining = list(range(len(head)))
+    pool = list(eligible)
+    normalized = _normalize_scores(pool)
+    remaining = list(range(len(pool)))
     selected_indices: list[int] = []
-    while remaining and len(selected_indices) < k:
+    selection_limit = min(k, len(pool))
+    while remaining and len(selected_indices) < selection_limit:
         best_index = remaining[0]
         best_objective = -math.inf
         for index in remaining:
             redundancy = (
                 max(
                     _cosine_similarity(
-                        head[index]["diversity_vector"],
-                        head[chosen]["diversity_vector"],
+                        pool[index]["diversity_vector"],
+                        pool[chosen]["diversity_vector"],
                     )
                     for chosen in selected_indices
                 )
@@ -413,7 +414,7 @@ def _mmr(
         remaining.remove(best_index)
     results: list[dict[str, Any]] = []
     for index in selected_indices:
-        results.append(head[index])
+        results.append(pool[index])
     return results
 
 
@@ -470,24 +471,23 @@ def _hydration_requests(
 
 def _hydrate_mmr_head(
     collection_client: object,
-    eligible: Sequence[dict[str, Any]],
-    k: int,
+    adaptive_pool: Sequence[dict[str, Any]],
     collection_type: str,
 ) -> tuple[list[dict[str, Any]], bool]:
-    if k == 0:
+    if not adaptive_pool:
         return [], True
-    head = list(eligible[: min(2 * k, len(eligible))])
+    pool = list(adaptive_pool)
     hydrate = getattr(collection_client, "hydrate_mmr_head", None)
     if not callable(hydrate):
         raise TypeError("collection_client must provide hydrate_mmr_head()")
-    requested = _hydration_requests(head, collection_type)
+    requested = _hydration_requests(pool, collection_type)
     raw_hydrated = hydrate(requested)
-    if not isinstance(raw_hydrated, list) or len(raw_hydrated) != len(head):
+    if not isinstance(raw_hydrated, list) or len(raw_hydrated) != len(pool):
         raise TypeError("hydrate_mmr_head must return one ordered result per candidate")
-    hydrated_head: list[dict[str, Any]] = []
+    hydrated_pool: list[dict[str, Any]] = []
     mmr_usable = True
     for candidate, request, hydrated in zip(
-        head,
+        pool,
         requested,
         raw_hydrated,
         strict=True,
@@ -573,8 +573,8 @@ def _hydrate_mmr_head(
             )
         else:
             copied["diversity_vector"] = vector
-        hydrated_head.append(copied)
-    return hydrated_head, mmr_usable
+        hydrated_pool.append(copied)
+    return hydrated_pool, mmr_usable
 
 
 def _final_results(
@@ -679,18 +679,18 @@ def retrieve(
         for candidate in reranked
         if candidate["rerank_score"] >= config.adaptive_relevance_floor
     ]
-    k = _adaptive_k(eligible, config)
-    hydrated_head, mmr_usable = _hydrate_mmr_head(
+    adaptive_count = _adaptive_k(eligible, config)
+    adaptive_pool = eligible[:adaptive_count]
+    hydrated_pool, mmr_usable = _hydrate_mmr_head(
         collection_client,
-        eligible,
-        k,
+        adaptive_pool,
         collection_type,
     )
     mmr_started = perf_counter()
     selected = (
-        _mmr(hydrated_head, min(k, len(hydrated_head)), config)
+        _mmr(hydrated_pool, config.final_count, config)
         if mmr_usable
-        else hydrated_head[:k]
+        else hydrated_pool[: config.final_count]
     )
     mmr_elapsed = (perf_counter() - mmr_started) * 1000.0
     if timing_observer is not None and collection_type == "conversations":
@@ -701,8 +701,8 @@ def retrieve(
             "collection_type": collection_type,
             "hybrid_candidates": len(candidates),
             "eligible_candidates": len(eligible),
-            "adaptive_k": k,
-            "mmr_head": len(hydrated_head),
+            "adaptive_k": adaptive_count,
+            "mmr_pool": len(hydrated_pool),
             "mmr_fallback": not mmr_usable,
         },
     )
