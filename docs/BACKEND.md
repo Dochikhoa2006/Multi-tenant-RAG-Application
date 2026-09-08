@@ -1,6 +1,8 @@
 # Backend Specification
 
-All backend logic for the Smart RAG Interview Preparation System. Covers Weaviate data model, retrieval pipeline, wizard CRUD operations, and text processing pipeline.
+Backend specification for the Multi-Tenant Multi-Agent Advanced RAG
+Application. It covers the Weaviate data model, retrieval pipeline, wizard CRUD
+and recovery, text processing, and model-provider boundaries.
 
 ---
 

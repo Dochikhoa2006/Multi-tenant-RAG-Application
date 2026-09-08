@@ -1,6 +1,6 @@
 # API Endpoints
 
-REST API reference for the Smart RAG Interview Preparation System.
+REST API reference for the Multi-Tenant Multi-Agent Advanced RAG Application.
 
 ---
 

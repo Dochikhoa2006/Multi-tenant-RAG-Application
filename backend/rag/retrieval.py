@@ -623,16 +623,6 @@ def _budget_results(
     return selected
 
 
-def _render_context(
-    results: Sequence[Mapping[str, Any]],
-    budget: int,
-    *,
-    tokenizer: Tokenizer | None = None,
-) -> str:
-    selected = _budget_results(results, budget, tokenizer=tokenizer)
-    return _CONTEXT_SEPARATOR.join(result["raw_text"] for result in selected)
-
-
 def retrieve(
     collection_client: object,
     query_text: str,

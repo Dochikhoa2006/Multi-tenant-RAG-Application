@@ -1,6 +1,8 @@
 # Frontend Specification
 
-All frontend UI design for the Smart RAG Interview Preparation System. Covers application layout, three modes (Chat, Knowledge Facts, Policy), and component behavior.
+Frontend contract for the Multi-Tenant Multi-Agent Advanced RAG Application.
+It covers the Chat, Knowledge Facts, and Policy modes and their component
+behavior.
 
 ---
 
@@ -30,7 +32,7 @@ The frontend is a single-page application with three primary modes accessible vi
 
 ## 2. Chat Mode
 
-**Purpose:** Conversational interface for interview Q&A practice.
+**Purpose:** Conversational interface for grounded questions and answers.
 
 **UI Elements:**
 - **Sidebar:** Scrollable list of past chat sessions, each showing an auto-generated title. Each session has a **Delete** button (with confirmation dialog) that permanently removes the session and cascade-deletes all its conversation embeddings from Weaviate.
@@ -50,7 +52,8 @@ The frontend is a single-page application with three primary modes accessible vi
 
 ## 3. Knowledge Facts Mode
 
-**Purpose:** Manage the user's technical knowledge base — concepts, algorithms, papers, frameworks, and any factual content relevant to interview preparation.
+**Purpose:** Manage the user's factual source material, including concepts,
+documents, procedures, research, and other knowledge used for grounding.
 
 **UI Elements:**
 
@@ -74,7 +77,8 @@ The frontend is a single-page application with three primary modes accessible vi
 
 ## 4. Policy Mode
 
-**Purpose:** Manage policy documents — behavioral guidelines, interview rubrics, evaluation criteria, do's and don'ts, and strategic frameworks.
+**Purpose:** Manage policy material such as rules, constraints, behavioral
+guidance, evaluation criteria, and strategic frameworks.
 
 **UI and Behavior:** Identical to Knowledge Facts Mode in every way. The only difference is the underlying Weaviate collection (Policy Collection instead of Knowledge Facts Collection).
 

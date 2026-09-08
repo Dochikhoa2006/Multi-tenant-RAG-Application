@@ -14,7 +14,7 @@ class UserIsolationError(WeaviateResponseError):
 
 
 class IncompatibleCollectionSchemaError(RuntimeError):
-    """Raised when an existing collection cannot satisfy the Stage 2 contract."""
+    """Raised when an existing collection cannot satisfy the active schema contract."""
 
     def __init__(self, collection_name: str, reason: str) -> None:
         self.collection_name = collection_name

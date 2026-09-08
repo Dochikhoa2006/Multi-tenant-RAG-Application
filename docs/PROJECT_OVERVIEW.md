@@ -1,13 +1,23 @@
-# Smart RAG Interview Preparation System
-## Full-Stack Application for Generative AI Engineer FAANG Interview Coaching
+# Multi-Tenant Multi-Agent Advanced RAG Application
+## General-Purpose Retrieval-Augmented Generation
 
 ---
 
 ## Product Vision
 
-A retrieval-augmented generation (RAG) application that helps users prepare for Generative AI Engineer interviews at FAANG and big-tech companies. The system provides an intelligent chatbot backed by user-curated knowledge bases and policy guidelines, with every interaction growing smarter through embedded conversation history.
+A general-purpose retrieval-augmented generation application that answers
+questions from user-owned knowledge and policy material while using completed
+conversation history to resolve follow-up context.
 
-Users maintain two structured knowledge stores — **Knowledge Facts** (technical content, papers, concepts) and **Policies** (behavioral guidelines, interview strategies, rubrics) — organized into editable units called **Wizards**. A conversational interface leverages all three data sources to deliver context-rich, interview-grade answers.
+Each user owns three physically isolated Weaviate collections: Conversation,
+Knowledge Facts, and Policy. Wizards provide lifecycle management for knowledge
+and policy content. The query path combines BM25/LateOn hybrid retrieval, BGE
+reranking, Adaptive-K, application MMR, Granite query rewriting, and grounded
+Qwen answer generation.
+
+The product's multi-agent name describes this fixed coordination of specialized
+model-backed roles. The current implementation is not an autonomous-agent,
+tool-calling, or dynamic agent-delegation framework.
 
 ---
 
@@ -20,129 +30,67 @@ Users maintain two structured knowledge stores — **Knowledge Facts** (technica
 | **Wizard** | A user-facing content board mapped one-to-one to a **Document ID**. Users view, edit, upload into, and delete wizards through the UI. |
 | **Document ID** | The internal identifier for a wizard. Each wizard is exactly one document. |
 | **Paragraph ID** | A segment boundary produced by **Semantic Paragraph Splitting** within a document. Paragraphs are numbered sequentially from top to bottom of the wizard text. |
-| **Chunk ID** | The atomic embedding unit for knowledge facts and policy collections. A chunk is a small, semantically coherent sentence group within a paragraph. Vector embeddings are generated at this level — never at the paragraph or document level. Conversations do not use chunk IDs (see Conversation ID). |
-| **Conversation ID** | A single question-answer pair treated as one embedding unit. Serves as both the record identifier and the embedding unit ID — no separate chunk ID is needed. Unlike knowledge/policy data, conversations skip paragraph, document, and chunk hierarchy. |
+| **Chunk ID** | The stable object identifier for one lossless Knowledge Facts or Policy semantic chunk. Each chunk stores a LateOn token matrix for first-stage retrieval and a GTE dense vector for MMR diversity. |
+| **Conversation ID** | The stable canonical identity of one completed question-answer pair. A long canonical pair may be stored as several lossless retrieval-segment objects that all retain the same `conversation_id`; segment hits collapse back to that identity after BGE reranking. |
 | **Session** | A UI-level grouping of multiple conversations within chat mode. Sessions have auto-generated titles but do not affect backend retrieval. |
 
 ---
 
-## Project Directory Structure
+## Current Repository Structure
 
 ```
-RAG Application/
+repository/
 ├── backend/
-│   ├── main.py                      # App entrypoint, server startup
-│   ├── config.py                    # Environment variables, constants
-│   ├── model_config.py              # LLM and embedding model settings
-│   ├── prompts.py                   # All prompt templates (Model A rewrite, answer generation, session title)
-│   ├── api/
-│   │   ├── chat.py                  # Chat endpoints (query, sessions)
-│   │   ├── knowledge.py             # Knowledge Facts wizard endpoints
-│   │   └── policy.py                # Policy wizard endpoints
-│   ├── rag/
-│   │   ├── retrieval.py             # Hybrid search + reranking (MMR, cross-encoder)
-│   │   ├── query_rewriter.py        # Model A: conversation-aware query rewriting
-│   │   ├── generator.py             # Final LLM answer generation (SSE streaming)
-│   │   └── embedder.py              # Background embedding (conversation, chunk)
-│   ├── processing/
-│   │   ├── paragraph_splitter.py    # Semantic Paragraph Splitting
-│   │   ├── chunker.py               # Intra-paragraph semantic chunking
-│   │   └── file_reader.py           # Text-only file extraction
-│   ├── weaviate_client/
-│   │   ├── client.py                # Weaviate connection and collection init
-│   │   ├── conversation.py          # Conversation collection CRUD
-│   │   ├── knowledge.py             # Knowledge Facts collection CRUD
-│   │   └── policy.py                # Policy collection CRUD
-│   ├── mappings/
-│   │   ├── session_map.py           # Session → conversation IDs
-│   │   ├── document_map.py          # Document (wizard) → paragraph IDs + raw text
-│   │   └── paragraph_map.py         # Paragraph → chunk IDs
-│   └── wizard/
-│       ├── crud.py                  # Create, delete wizard logic
-│       └── save.py                  # Re-embed pipeline (diff, merge, re-split, re-chunk)
-├── frontend/
-│   ├── index.html
-│   ├── index.css
-│   ├── app.js                       # App shell, mode switching, routing
-│   ├── components/
-│   │   ├── chat/
-│   │   │   ├── ChatView.js          # Message area, input bar
-│   │   │   ├── SessionList.js       # Sidebar session list
-│   │   │   └── StreamRenderer.js    # SSE token-by-token rendering
-│   │   ├── wizard/
-│   │   │   ├── WizardGallery.js     # Grid of wizard cards
-│   │   │   ├── WizardEditor.js      # Zoom-in edit view (text area, upload, save, cancel)
-│   │   │   └── WizardCard.js        # Single wizard card with delete button
-│   │   └── shared/
-│   │       ├── ModeNav.js           # Top-level mode tabs (Chat, Knowledge Facts, Policy)
-│   │       └── ConfirmDialog.js     # Delete confirmation modal
-│   ├── services/
-│   │   ├── api.js                   # HTTP client for backend endpoints
-│   │   └── sse.js                   # SSE connection handler
-│   └── utils/
-│       └── changeDetector.js        # Smart text diff (enables/disables Save button)
-└── README.md
+│   ├── api/                 # Chat, task, and shared Knowledge/Policy routers
+│   ├── mappings/            # Process-local session/document/paragraph ownership
+│   ├── processing/          # File reading, paragraph splitting, and chunking
+│   ├── providers/           # Granite/Qwen and ONNX CUDA provider adapters
+│   ├── rag/                 # Retrieval, rewrite, generation, persistence orchestration
+│   ├── weaviate_client/     # Schema, collection lifecycle, retrieval, and hydration
+│   ├── wizard/              # Wizard CRUD, save, rollback, and recovery
+│   ├── main.py              # Provider-neutral FastAPI factory
+│   ├── runtime_app.py       # Integrated single-process production composition
+│   ├── services.py          # Shared application services and chat registry
+│   └── model_config.py      # Model, retrieval, and token-budget configuration
+├── deployment/              # Modal services, secure Weaviate Compose, and ragctl
+├── scripts/                 # Artifact manifests, migration, and opt-in benchmarks
+├── tests/                   # Offline contract and integration tests
+├── docs/                    # Architecture, API, configuration, and UI specifications
+├── compose.yaml             # Linux NVIDIA development topology
+├── Dockerfile               # Single-worker integrated API image
+└── rag                      # One-command lifecycle shim
 ```
+
+The repository does not currently contain the production SPA described in
+`FRONTEND.md`. The integrated backend exposes a small development-only
+`/dev/e2e` harness; `FRONTEND.md` remains the contract for a future UI.
 
 ---
 
 ## System Architecture Overview
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        FRONTEND (SPA)                           │
-│                                                                 │
-│  ┌─────────────┐   ┌──────────────────┐   ┌─────────────────┐  │
-│  │  Chat Mode  │   │ Knowledge Facts  │   │   Policy Mode   │  │
-│  │             │   │     Mode         │   │                 │  │
-│  │ - Sessions  │   │ - Wizard Cards   │   │ - Wizard Cards  │  │
-│  │ - Q&A Flow  │   │ - Inline Editor  │   │ - Inline Editor │  │
-│  │ - New Chat  │   │ - File Upload    │   │ - File Upload   │  │
-│  └──────┬──────┘   └────────┬─────────┘   └────────┬────────┘  │
-│         │                   │                       │           │
-└─────────┼───────────────────┼───────────────────────┼───────────┘
-          │                   │                       │
-          ▼                   ▼                       ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      BACKEND (API Server)                       │
-│                                                                 │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │                  RAG Orchestration Layer                  │   │
-│  │                                                          │   │
-│  │  ┌────────────┐  ┌──────────────┐  ┌──────────────────┐  │   │
-│  │  │ Query      │  │ Retrieval    │  │ Generation       │  │   │
-│  │  │ Rewriting  │  │ Pipeline     │  │ (SSE Streaming)  │  │   │
-│  │  └────────────┘  └──────────────┘  └──────────────────┘  │   │
-│  └──────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │                CRUD + Embedding Pipeline                  │   │
-│  │                                                          │   │
-│  │  Semantic Paragraph Splitting → Chunking → Embedding     │   │
-│  └──────────────────────────────────────────────────────────┘   │
-│                                                                 │
-└────────────────────────────────┬────────────────────────────────┘
-                                 │
-                                 ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                     WEAVIATE (Vector DB)                        │
-│                                                                 │
-│    Per User ID:                                                 │
-│    ┌─────────────────┐ ┌───────────────┐ ┌───────────────────┐  │
-│    │  Conversation   │ │ Knowledge     │ │     Policy        │  │
-│    │  Collection     │ │ Facts         │ │     Collection    │  │
-│    │                 │ │ Collection    │ │                   │  │
-│    │ conversation_id │ │ document_id   │ │ document_id       │  │
-│    │ vector          │ │ paragraph_id  │ │ paragraph_id      │  │
-│    │ raw_text        │ │ chunk_id      │ │ chunk_id          │  │
-│    │                 │ │ vector        │ │ vector            │  │
-│    │                 │ │ raw_text      │ │ raw_text          │  │
-│    └─────────────────┘ └───────────────┘ └───────────────────┘  │
-│                                                                 │
-│    Collections are FULLY ISOLATED — no cross-collection         │
-│    interference during retrieval, chunking, or mutation.        │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+```text
+Client or development harness
+            │ REST / SSE
+            ▼
+Single-worker FastAPI runtime
+  ├─ original query → Conversation hybrid C50 → BGE → collapse
+  │                    → Adaptive-K → MMR → Granite rewrite
+  ├─ rewritten query ─┬→ Knowledge hybrid K50 → BGE → Adaptive-K → MMR
+  │                   └→ Policy hybrid P40 → BGE → Adaptive-K → MMR
+  └─ bounded context → Qwen non-thinking answer stream
+            │
+            ├─ completed Q+A → background Conversation vectors
+            └─ completed answer → background session-title generation
+
+Per-user Weaviate collections
+  ├─ Conversation segment objects → one canonical conversation_id
+  ├─ Knowledge Facts chunk objects
+  └─ Policy chunk objects
+
+Every object supplies two named vectors:
+  late_interaction → 128-D LateOn token vectors for MaxSim hybrid search
+  mmr_diversity   → 768-D GTE dense vector for application MMR only
 ```
 
 ---

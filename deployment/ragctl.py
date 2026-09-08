@@ -1010,7 +1010,7 @@ def up(config: Mapping[str, str], runner: CommandRunner) -> None:
                 file=sys.stderr,
             )
         raise
-    print("RAG is ready — run: ./rag ask", flush=True)
+    print("Advanced RAG Application is ready — run: ./rag ask", flush=True)
 
 
 def disable_funnels(runner: CommandRunner) -> None:
@@ -1240,7 +1240,7 @@ def ask(
 
 
 def status(config: Mapping[str, str], runner: CommandRunner) -> None:
-    print("RAG service status (credentials redacted)")
+    print("Advanced RAG Application status (credentials redacted)")
     compose = runner.run(
         [
             "docker",
@@ -1311,7 +1311,9 @@ def status(config: Mapping[str, str], runner: CommandRunner) -> None:
 def parser() -> argparse.ArgumentParser:
     cli = argparse.ArgumentParser(
         prog="./rag",
-        description="Start, query, inspect, or stop the private Modal RAG application.",
+        description=(
+            "Start, query, inspect, or stop the private Advanced RAG Application."
+        ),
     )
     commands = cli.add_subparsers(dest="command", required=True)
     commands.add_parser("up", help="start and validate every RAG service")

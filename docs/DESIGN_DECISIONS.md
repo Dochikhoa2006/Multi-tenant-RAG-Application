@@ -1,6 +1,7 @@
 # Design Decisions
 
-Architectural rationale, non-functional requirements, and future considerations for the Smart RAG Interview Preparation System.
+Architectural rationale, non-functional requirements, and future considerations
+for the Multi-Tenant Multi-Agent Advanced RAG Application.
 
 ---
 
@@ -8,16 +9,24 @@ Architectural rationale, non-functional requirements, and future considerations 
 
 ### Why Only Weaviate?
 
-This project uses a single Weaviate instance as both the source of truth and the embedding store. There is no separate relational database, no Redis cache, no secondary storage. Weaviate handles all data persistence, vector indexing, and retrieval. This keeps the architecture simple — one system to deploy, query, and maintain.
+This project uses one Weaviate instance as the persistent content and vector
+store. There is no separate relational database, Redis cache, or secondary
+persistent store. Session, document, and paragraph ownership mappings remain
+process-local in the current single-worker runtime, while Weaviate owns stored
+retrieval objects, vector indexes, and retrieval. The durability boundary is
+described below rather than hidden behind a broader source-of-truth claim.
 
 ### Why Three Separate Collections?
 
-Interview preparation involves fundamentally different types of information:
-- **Conversations** are experiential — they capture how the user practices and what the AI has previously answered.
-- **Knowledge Facts** are declarative — technical content, definitions, algorithms.
-- **Policies** are prescriptive — rules, strategies, evaluation frameworks.
+The application manages three fundamentally different types of information:
+- **Conversations** preserve completed question-answer history for contextual continuity.
+- **Knowledge Facts** provide declarative source material used for factual grounding.
+- **Policies** provide prescriptive rules, constraints, and behavioral or strategic guidance.
 
-Separating them allows independent retrieval strategies (MMR for diverse conversation recall, cross-encoder for precise fact/policy lookup), independent top-k tuning, and zero risk of cross-contamination during CRUD operations.
+All three collections use the same ranking structure: BM25 plus LateOn native
+hybrid retrieval, BGE reranking, Adaptive-K, and application MMR. Separation
+still permits collection-specific fixed candidate/final limits, MMR settings,
+and token budgets while preventing cross-contamination during CRUD operations.
 
 ### Why Per-User Named Collections Instead of Shared Collections with Filtering?
 
@@ -28,7 +37,7 @@ Each user gets three physically separate Weaviate collections rather than sharin
 Session, document, and paragraph mappings are intentionally in-memory for the
 single-process Stage 2 prototype. They are not restart-safe and must not be
 shared across independent backend workers. Before production deployment, a
-durable design consistent with Weaviate as the source of truth must be approved;
+durable design consistent with the current persistent-storage boundary must be approved;
 that change may require revisiting the current three-collection data model.
 
 ### Stage 3 Mutation Recovery Boundary
@@ -47,7 +56,9 @@ not a blocker for continuing the single-process prototype stages.
 
 ### Why Cascade-Delete Sessions?
 
-When a user deletes a chat session, all conversation embeddings belonging to that session are permanently removed from Weaviate. This ensures the conversation collection stays clean and relevant — stale or unwanted practice sessions don't pollute future retrieval results.
+When a user deletes a chat session, all conversation embeddings belonging to
+that session are permanently removed from Weaviate. This keeps stale or
+unwanted conversations from affecting future retrieval.
 
 ### Why Embed at the Chunk Level, Not the Paragraph or Document Level?
 
@@ -97,7 +108,9 @@ durable mapping/session design.
 
 ### Why Rewrite the Query Using Conversation History?
 
-Past conversations contain valuable context about the user's preparation focus, knowledge gaps, and conversation patterns. By feeding relevant past conversations to a rewriting model, the system produces a query that captures implicit intent — leading to more targeted knowledge and policy retrieval.
+Past conversations can resolve references and omitted context in a follow-up
+question. Feeding only relevant completed conversations to the rewriting model
+produces a standalone query for more targeted Knowledge and Policy retrieval.
 
 ### Why a Local Merged Granite Query Rewriter?
 
@@ -157,8 +170,8 @@ Every button action (create, delete, save, etc.) immediately updates the UI to r
 ## 3. Future Considerations
 
 - **PDF and DOCX Support:** Add text extraction from binary document formats via libraries like PyMuPDF or python-docx.
-- **Multi-Language Embedding:** Support non-English interview preparation with multilingual embedding models.
-- **Collaborative Wizards:** Allow sharing wizard content between users for study group preparation.
-- **Evaluation Mode:** Timed mock interviews with scoring rubrics pulled from the Policy collection.
+- **Multi-Language Retrieval:** Support additional languages with explicitly validated multilingual retrieval models.
+- **Collaborative Wizards:** Add explicitly authorized content sharing without weakening tenant isolation.
+- **Evaluation Workflows:** Add optional domain-specific evaluations grounded in Policy content.
 - **Export and Backup:** Allow users to export their knowledge bases and conversation history.
-- **Fine-Tuned Models:** Train domain-specific embedding and reranking models on GenAI interview content for improved retrieval quality.
+- **Domain-Specific Models:** Evaluate approved domain-specific retrieval models without weakening artifact or parity validation.

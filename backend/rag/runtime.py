@@ -1,4 +1,4 @@
-"""Injectable provider contracts and runtime dependencies for Stage 4."""
+"""Injectable provider contracts and runtime dependencies."""
 
 from __future__ import annotations
 
@@ -120,7 +120,7 @@ class BackgroundTaskQueue(Protocol):
 
 
 class RAGRuntime:
-    """Own the explicitly injected external capabilities used by Stage 4."""
+    """Own the explicitly injected external capabilities used by the RAG pipeline."""
 
     def __init__(
         self,

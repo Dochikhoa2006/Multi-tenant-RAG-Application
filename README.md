@@ -1,6 +1,14 @@
-# Smart RAG Interview Preparation System
+# Multi-Tenant Multi-Agent Advanced RAG Application
 
-Full-stack RAG application for Generative AI Engineer FAANG interview coaching. Backed by Weaviate vector database with three isolated collections (Conversation, Knowledge Facts, Policy) per user.
+A general-purpose advanced RAG application with isolated Conversation,
+Knowledge Facts, and Policy collections for each user. It combines native
+BM25/LateOn hybrid retrieval, BGE reranking, Adaptive-K, application MMR,
+Granite query rewriting, and grounded Qwen generation.
+
+The current multi-agent identity refers to the fixed orchestration of
+specialized model-backed roles, including query rewriting and answer/title
+generation. The repository does not implement autonomous agents, tool-calling
+agents, or dynamic agent delegation.
 
 ## One-command private deployment
 
@@ -39,7 +47,7 @@ sessions. See
 
 ## Integrated Development Runtime
 
-Stage 7A provides the complete single-process composition at
+The complete single-process composition is available at
 `backend.runtime_app:create_runtime_app`. It loads one shared ONNX embedding
 client, reranker, Granite client, Qwen client, Weaviate manager, and task queue.
 The Granite and Qwen SGLang servers remain external services.

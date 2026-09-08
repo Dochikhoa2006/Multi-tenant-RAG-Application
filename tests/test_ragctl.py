@@ -429,6 +429,10 @@ def test_launcher_uses_the_public_telemetry_key_owner() -> None:
     assert ragctl.CHAT_TIMING_KEYS is TIMING_KEYS
 
 
+def test_launcher_help_uses_the_short_product_name() -> None:
+    assert "Advanced RAG Application" in ragctl.parser().description
+
+
 @pytest.mark.parametrize(
     "events",
     [

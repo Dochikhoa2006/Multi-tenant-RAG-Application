@@ -380,10 +380,14 @@ def test_dev_ui_is_integrated_only_and_targets_real_api() -> None:
             task_queue=RecordingQueue([]),
         )
     )
+    assert app.title == "Advanced RAG Application API"
+    assert providerless.title == "Advanced RAG Application API"
 
     with TestClient(app) as client:
         page = client.get("/dev/e2e")
         assert page.status_code == 200
+        assert "<title>Advanced RAG Development E2E</title>" in page.text
+        assert "<h1>Advanced RAG Development E2E</h1>" in page.text
         assert "fetch('/api/chat/sessions'" in page.text
         assert "fetch('/api/chat/query'" in page.text
         assert "response.body.getReader()" in page.text

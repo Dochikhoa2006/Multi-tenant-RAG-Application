@@ -1,4 +1,4 @@
-"""Application services and process-local Stage 5 registries."""
+"""Application services and process-local registries."""
 
 from __future__ import annotations
 

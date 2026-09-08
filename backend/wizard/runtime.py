@@ -86,7 +86,7 @@ def _default_collection_factory(
 
 
 class WizardRuntime:
-    """Own Stage 3 dependencies and authoritative process-local mappings."""
+    """Own wizard dependencies and authoritative process-local mappings."""
 
     def __init__(
         self,

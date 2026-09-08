@@ -19,6 +19,9 @@
 # Local interpreter and editor artifacts.
 __pycache__/
 *.py[cod]
+.pytest_cache/
+/.onnx-export-venv/
+/:memory:.ses
 .DS_Store
 qwen3-4b-awq/
 .venv/

@@ -1,4 +1,4 @@
-"""Provider-neutral Stage 4 RAG building blocks."""
+"""Provider-neutral RAG building blocks."""
 
 from backend.rag.embedder import (
     embed_chunks,

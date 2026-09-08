@@ -11,7 +11,7 @@ _PAGE = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>RAG Development E2E</title>
+  <title>Advanced RAG Development E2E</title>
   <style>
     body { font: 16px/1.45 system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
     label { display: block; margin-top: 1rem; }
@@ -24,7 +24,7 @@ _PAGE = """<!doctype html>
   </style>
 </head>
 <body>
-  <h1>RAG Development E2E</h1>
+  <h1>Advanced RAG Development E2E</h1>
   <p>This page calls the real same-origin API and consumes its SSE response.</p>
   <label>User ID <input id="user" value="usr_dev"></label>
   <label>Session <select id="session"></select></label>

@@ -1,4 +1,4 @@
-"""Stage 3 wizard lifecycle and re-embedding orchestration."""
+"""Wizard lifecycle and re-embedding orchestration."""
 
 from backend.wizard.crud import create_wizard, delete_wizard
 from backend.wizard.errors import (

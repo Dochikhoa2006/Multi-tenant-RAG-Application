@@ -66,7 +66,7 @@ def _runtime(llm: FakeLLM) -> RAGRuntime:
 def test_rewrite_query_composes_ordered_context_and_uses_model_a() -> None:
     llm = FakeLLM("  Explain vector databases for my system  ")
     conversations = [
-        {"raw_text": "Q: What am I building? A: An interview RAG app."},
+        {"raw_text": "Q: What am I building? A: A multi-tenant RAG app."},
         {
             "properties": {
                 "raw_text": "Q: Which database? A: Weaviate."
@@ -86,7 +86,7 @@ def test_rewrite_query_composes_ordered_context_and_uses_model_a() -> None:
     assert isinstance(prompt, QueryRewritePrompt)
     assert "<original_query>\nHow does it work?\n</original_query>" in prompt
     assert prompt.index("[Conversation 1]") < prompt.index("[Conversation 2]")
-    assert "An interview RAG app" in prompt
+    assert "A multi-tenant RAG app" in prompt
     assert "Weaviate" in prompt
 
 

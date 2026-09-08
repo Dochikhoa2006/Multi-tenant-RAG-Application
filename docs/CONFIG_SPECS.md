@@ -1,6 +1,8 @@
 # Configuration & Model Specifications
 
-This document defines all model selections, hyperparameter configurations, token budgets, and prompt definitions for the Smart RAG Interview Preparation System.
+This document defines the model selections, hyperparameter configurations,
+token budgets, and prompt contracts for the Multi-Tenant Multi-Agent Advanced
+RAG Application.
 
 Stage 5 retains at most `TASK_MAX_COMPLETED_RECORDS` completed in-memory task
 records (default `10000`). This operational setting does not affect queued or

@@ -61,7 +61,7 @@ def create_app(
                             application_services.manager.disconnect
                         )
 
-    application = FastAPI(title="RAG Application API", lifespan=lifespan)
+    application = FastAPI(title="Advanced RAG Application API", lifespan=lifespan)
     application.state.services = application_services
 
     @application.middleware("http")

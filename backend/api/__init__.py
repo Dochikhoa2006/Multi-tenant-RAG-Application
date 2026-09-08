@@ -1,2 +1,1 @@
-"""FastAPI routers for the Stage 5 application layer."""
-
+"""FastAPI routers for the application layer."""

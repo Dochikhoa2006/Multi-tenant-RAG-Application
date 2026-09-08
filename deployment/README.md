@@ -1,4 +1,4 @@
-# Modal-first RAG Deployment
+# Modal-first Advanced RAG Application Deployment
 
 The no-GCP E2E topology uses three Modal services. Two dedicated SGLang 0.5.18
 CUDA services run Granite and Qwen, while a private singleton Modal Server runs

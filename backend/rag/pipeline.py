@@ -52,7 +52,7 @@ def _validated_collection(
 
 @dataclass(frozen=True)
 class UserRetrievalCollections:
-    """The three existing Stage 2 collection wrappers for one user."""
+    """The three collection wrappers for one user."""
 
     user_id: str
     conversations: object
