@@ -20,6 +20,9 @@ def _config() -> dict[str, str]:
         "WEAVIATE_GRPC_SECURE": "true",
         "MODAL_PROXY_TOKEN_ID": "wk-private-id",
         "MODAL_PROXY_TOKEN_SECRET": "ws-private-secret",
+        "MODAL_PROFILE": "test-workspace",
+        "MODAL_WORKSPACE": "test-workspace",
+        "MODAL_ENVIRONMENT": "main",
         "SGLANG_QUERY_REWRITE_API_KEY": "wk-private-id.ws-private-secret",
         "QWEN_SGLANG_API_KEY": "wk-private-id.ws-private-secret",
         "RAG_USER_ID": ragctl.DEFAULT_USER_ID,
@@ -77,6 +80,90 @@ def test_runtime_secret_contains_only_the_current_required_values() -> None:
     assert secret["QWEN_SGLANG_API_KEY"] == "wk-private-id.ws-private-secret"
     assert "MODAL_PROXY_TOKEN_ID" not in secret
     assert "MODAL_PROXY_TOKEN_SECRET" not in secret
+
+
+def test_config_requires_complete_modal_target() -> None:
+    config = _config()
+    config["MODAL_WORKSPACE"] = ""
+
+    with pytest.raises(ragctl.RagCtlError, match="MODAL_WORKSPACE"):
+        ragctl.validate_config(config)
+
+
+def test_config_rejects_modal_token_environment_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MODAL_TOKEN_ID", "unexpected-token")
+
+    with pytest.raises(ragctl.RagCtlError, match="token environment overrides"):
+        ragctl.validate_config(_config())
+
+
+def test_command_runner_verifies_modal_target_and_propagates_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config()
+    events: list[str] = []
+    captured_environment: dict[str, str] = {}
+
+    monkeypatch.setattr(
+        ragctl,
+        "verify_modal_target",
+        lambda value: events.append(value["MODAL_WORKSPACE"]),
+    )
+
+    def fake_run(command: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured_environment.update(kwargs["env"])  # type: ignore[arg-type]
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(ragctl.subprocess, "run", fake_run)
+    ragctl.CommandRunner(config).run([ragctl.MODAL, "app", "list"], quiet=True)
+
+    assert events == ["test-workspace"]
+    assert captured_environment["MODAL_PROFILE"] == "test-workspace"
+    assert captured_environment["MODAL_ENVIRONMENT"] == "main"
+
+
+def test_non_modal_command_does_not_run_modal_target_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ragctl,
+        "verify_modal_target",
+        lambda *_: (_ for _ in ()).throw(AssertionError("unexpected probe")),
+    )
+    monkeypatch.setattr(
+        ragctl.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 0, stdout="", stderr=""
+        ),
+    )
+
+    ragctl.CommandRunner(_config()).run(["docker", "info"], quiet=True)
+
+
+def test_modal_target_probe_failure_is_fail_closed_and_redacted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config()
+    monkeypatch.setattr(
+        ragctl.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command,
+            1,
+            stdout="",
+            stderr="workspace mismatch " + config["WEAVIATE_API_KEY"],
+        ),
+    )
+
+    with pytest.raises(ragctl.RagCtlError) as caught:
+        ragctl.verify_modal_target(config)
+
+    assert "workspace mismatch" in str(caught.value)
+    assert config["WEAVIATE_API_KEY"] not in str(caught.value)
+    assert "[REDACTED]" in str(caught.value)
 
 
 def test_user_collection_names_use_exact_physical_suffixes() -> None:
@@ -358,7 +445,7 @@ def test_launcher_keeps_gpu_overrides_and_source_defaults() -> None:
 
     assert ragctl.GPU_DEFAULTS == {
         "MODAL_SGLANG_GPU": "L40S",
-        "QWEN_MODAL_SGLANG_GPU": "H100",
+        "QWEN_MODAL_SGLANG_GPU": "L40S",
         "MODAL_RAG_GPU": "L40S",
     }
     assert 'GPU = os.getenv("MODAL_SGLANG_GPU", "L40S")' in granite

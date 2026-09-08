@@ -52,7 +52,7 @@ PROGRESS_SECONDS = 30.0
 
 GPU_DEFAULTS = {
     "MODAL_SGLANG_GPU": "L40S",
-    "QWEN_MODAL_SGLANG_GPU": "H100",
+    "QWEN_MODAL_SGLANG_GPU": "L40S",
     "MODAL_RAG_GPU": "L40S",
 }
 ALLOWED_OPERATIONAL_GPUS = frozenset({"L40S", "H100"})
@@ -84,6 +84,12 @@ RUNTIME_SECRET_KEYS = (
     "QWEN_SGLANG_API_KEY",
 )
 
+MODAL_TARGET_KEYS = (
+    "MODAL_PROFILE",
+    "MODAL_WORKSPACE",
+    "MODAL_ENVIRONMENT",
+)
+
 REQUIRED_ENV_KEYS = (
     "WEAVIATE_URL",
     "WEAVIATE_API_KEY",
@@ -92,6 +98,7 @@ REQUIRED_ENV_KEYS = (
     "WEAVIATE_GRPC_SECURE",
     "MODAL_PROXY_TOKEN_ID",
     "MODAL_PROXY_TOKEN_SECRET",
+    *MODAL_TARGET_KEYS,
 )
 
 
@@ -158,6 +165,15 @@ def validate_config(config: Mapping[str, str]) -> None:
     if grpc_port != 8443:
         raise RagCtlError("WEAVIATE_GRPC_PORT must remain 8443 for the secure Funnel")
 
+    modal_target(config)
+    if any(
+        os.environ.get(name, "").strip() or config.get(name, "").strip()
+        for name in ("MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET")
+    ):
+        raise RagCtlError(
+            "Modal token environment overrides are forbidden; use the configured profile"
+        )
+
     bearer = proxy_bearer(config)
     for name in ("SGLANG_QUERY_REWRITE_API_KEY", "QWEN_SGLANG_API_KEY"):
         configured = config.get(name, "").strip()
@@ -178,6 +194,70 @@ def proxy_bearer(config: Mapping[str, str]) -> str:
         + "."
         + config.get("MODAL_PROXY_TOKEN_SECRET", "").strip()
     )
+
+
+def modal_target(config: Mapping[str, str]) -> tuple[str, str, str]:
+    values = tuple(config.get(name, "").strip() for name in MODAL_TARGET_KEYS)
+    missing = [name for name, value in zip(MODAL_TARGET_KEYS, values) if not value]
+    if missing:
+        raise RagCtlError("Missing required .env variables: " + ", ".join(missing))
+    return values  # type: ignore[return-value]
+
+
+_MODAL_TARGET_PROBE = """
+import os
+import modal.config as modal_config
+from modal.environments import Environment
+from modal.workspace import Workspace
+
+expected_profile = os.environ["MODAL_PROFILE"]
+expected_workspace = os.environ["MODAL_WORKSPACE"]
+expected_environment = os.environ["MODAL_ENVIRONMENT"]
+if modal_config._config_active_profile() != expected_profile:
+    raise SystemExit("the active Modal profile does not match MODAL_PROFILE")
+if modal_config._profile != expected_profile:
+    raise SystemExit("the effective Modal profile does not match MODAL_PROFILE")
+workspace = Workspace.from_context()
+workspace.hydrate()
+if workspace.name != expected_workspace:
+    raise SystemExit("the authenticated Modal workspace does not match MODAL_WORKSPACE")
+Environment.from_name(expected_environment).hydrate()
+"""
+
+
+def verify_modal_target(config: Mapping[str, str]) -> None:
+    """Fail closed unless the configured Modal account and environment are active."""
+
+    profile, workspace, environment_name = modal_target(config)
+    if any(
+        os.environ.get(name, "").strip() or config.get(name, "").strip()
+        for name in ("MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET")
+    ):
+        raise RagCtlError(
+            "Modal token environment overrides are forbidden; use the configured profile"
+        )
+    probe_environment = os.environ.copy()
+    probe_environment.update(
+        {
+            "MODAL_PROFILE": profile,
+            "MODAL_WORKSPACE": workspace,
+            "MODAL_ENVIRONMENT": environment_name,
+        }
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", _MODAL_TARGET_PROBE],
+        cwd=PROJECT_ROOT,
+        env=probe_environment,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "target verification failed").strip()
+        raise RagCtlError(
+            "Modal target verification failed: " + redact(detail, config)
+        )
 
 
 def secret_values(config: Mapping[str, str]) -> tuple[str, ...]:
@@ -215,6 +295,8 @@ class CommandRunner:
         timeout: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command = [os.fspath(item) for item in args]
+        if Path(command[0]).resolve() == MODAL.resolve():
+            verify_modal_target(self.config)
         if not quiet:
             shown = " ".join(shlex.quote(item) for item in command)
             print(f"→ {redact(shown, self.config)}", flush=True)
@@ -284,7 +366,7 @@ def preflight(config: Mapping[str, str], runner: CommandRunner) -> str:
         raise RagCtlError(
             "WEAVIATE_URL does not match the active Standalone Tailscale node"
         )
-    runner.run([MODAL, "profile", "current"], capture=True, quiet=True)
+    verify_modal_target(config)
     return hostname
 
 
@@ -493,7 +575,7 @@ def deploy_granite(config: Mapping[str, str], runner: CommandRunner) -> str:
             "MODAL_SGLANG_ROUTING_REGION": "us-east",
         },
     )
-    return resolve_server_url(GRANITE_APP, GRANITE_CLASS) + "/v1"
+    return resolve_server_url(GRANITE_APP, GRANITE_CLASS, config) + "/v1"
 
 
 def deploy_qwen(config: Mapping[str, str], runner: CommandRunner) -> str:
@@ -507,13 +589,28 @@ def deploy_qwen(config: Mapping[str, str], runner: CommandRunner) -> str:
             "QWEN_MODAL_SGLANG_ROUTING_REGION": "us-east",
         },
     )
-    return resolve_server_url(QWEN_APP, QWEN_CLASS) + "/v1"
+    return resolve_server_url(QWEN_APP, QWEN_CLASS, config) + "/v1"
 
 
-def resolve_server_url(app_name: str, class_name: str) -> str:
+def resolve_server_url(
+    app_name: str,
+    class_name: str,
+    config: Mapping[str, str],
+) -> str:
+    profile, _, environment_name = modal_target(config)
+    verify_modal_target(config)
+    os.environ["MODAL_PROFILE"] = profile
+    os.environ["MODAL_ENVIRONMENT"] = environment_name
     import modal
 
-    return modal.Server.from_name(app_name, class_name).get_url().rstrip("/")
+    url = modal.Server.from_name(
+        app_name,
+        class_name,
+        environment_name=environment_name,
+    ).get_url()
+    if not isinstance(url, str) or not url.startswith("https://"):
+        raise RagCtlError("Modal Server URL discovery returned an invalid endpoint")
+    return url.rstrip("/")
 
 
 def _waiting_message(service: str, last_status: int | None, requested_gpu: str) -> str:
@@ -743,7 +840,7 @@ def deploy_runtime(config: Mapping[str, str], runner: CommandRunner) -> str:
             "MODAL_RAG_ROUTING_REGION": "us-east",
         },
     )
-    return resolve_server_url(RUNTIME_APP, RUNTIME_CLASS)
+    return resolve_server_url(RUNTIME_APP, RUNTIME_CLASS, config)
 
 
 def _runtime_headers(config: Mapping[str, str]) -> dict[str, str]:
@@ -906,7 +1003,7 @@ def up(config: Mapping[str, str], runner: CommandRunner) -> None:
         qwen_url = deploy_qwen(config, runner)
         validate_qwen(qwen_url, bearer, qwen_gpu)
 
-        print("[5/8] Publishing the exact nine-value runtime secret", flush=True)
+        print("[5/8] Publishing the current approved runtime secret", flush=True)
         deploy_runtime_secret(
             build_runtime_secret(config, granite_url, qwen_url), runner
         )

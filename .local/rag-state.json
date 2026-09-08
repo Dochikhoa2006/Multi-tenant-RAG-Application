@@ -1,5 +1,0 @@
-{
-  "granite_url": "https://dochikhoa2006--rag-granite-query-rewrite-sglang-granites-af416d.us-east.modal.direct/v1",
-  "qwen_url": "https://dochikhoa2006--rag-qwen-answer-title-sglang-qwensglangserver.us-east.modal.direct/v1",
-  "runtime_url": "https://dochikhoa2006--rag-fastapi-onnx-runtime-ragruntimeserver.us-east.modal.direct"
-}
