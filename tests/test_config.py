@@ -378,6 +378,60 @@ def test_removed_hybrid_components_setting_is_always_rejected(value: str) -> Non
     assert "HYBRID_COMPONENTS is no longer supported" in result.stderr
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "CONVERSATION_CANDIDATE_COUNT",
+        "KNOWLEDGE_CANDIDATE_COUNT",
+        "POLICY_CANDIDATE_COUNT",
+    ],
+)
+def test_fixed_first_stage_candidate_counts_reject_obsolete_overrides(
+    name: str,
+) -> None:
+    result = _run_python(
+        "import backend.model_config",
+        overrides={name: "1"},
+    )
+
+    assert result.returncode != 0
+    assert "first-stage retrieval is fixed to C50 / K50 / P40" in result.stderr
+    assert "Remove the obsolete environment variable" in result.stderr
+
+
+def test_first_stage_candidate_counts_are_exact_defaults() -> None:
+    environment = os.environ.copy()
+    for name in (
+        "CONVERSATION_CANDIDATE_COUNT",
+        "KNOWLEDGE_CANDIDATE_COUNT",
+        "POLICY_CANDIDATE_COUNT",
+    ):
+        environment.pop(name, None)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from backend.model_config import CONVERSATION_SEARCH, "
+                "KNOWLEDGE_SEARCH, POLICY_SEARCH; "
+                "assert (CONVERSATION_SEARCH.candidate_count, "
+                "KNOWLEDGE_SEARCH.candidate_count, "
+                "POLICY_SEARCH.candidate_count) == (50, 50, 40); "
+                "assert (CONVERSATION_SEARCH.candidate_ceiling, "
+                "KNOWLEDGE_SEARCH.candidate_ceiling, "
+                "POLICY_SEARCH.candidate_ceiling) == (50, 50, 40)"
+            ),
+        ],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_answer_and_title_models_share_qwen_served_identity() -> None:
     environment = os.environ.copy()
     environment["QWEN_SGLANG_SERVED_MODEL"] = "shared-qwen"

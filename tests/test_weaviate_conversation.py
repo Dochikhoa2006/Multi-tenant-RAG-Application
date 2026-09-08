@@ -1020,7 +1020,7 @@ def test_hybrid_search_returns_typed_results_and_expected_query() -> None:
     conversations = ConversationCollection(manager, USER_ID)
 
     results = conversations.hybrid_search(
-        "database indexing", [_lateon_row(0.3, 0.7), _lateon_row(0.2, 0.8)], 40
+        "database indexing", [_lateon_row(0.3, 0.7), _lateon_row(0.2, 0.8)], 50
     )
 
     assert results == [
@@ -1038,11 +1038,11 @@ def test_hybrid_search_returns_typed_results_and_expected_query() -> None:
     assert kwargs["alpha"] == 0.70
     assert kwargs["query_properties"] == ["segment_text"]
     assert kwargs["fusion_type"] is HybridFusion.RELATIVE_SCORE
-    assert kwargs["limit"] == 40
+    assert kwargs["limit"] == 50
     assert kwargs["include_vector"] is False
     assert kwargs["target_vector"] == "late_interaction"
     assert "diversity_selection" not in kwargs
-    assert CONVERSATION_SEARCH.candidate_count == 40
+    assert CONVERSATION_SEARCH.candidate_count == 50
     assert CONVERSATION_SEARCH.final_count == 5
     assert CONVERSATION_SEARCH.mmr_lambda == 0.70
     assert "return_metadata" not in kwargs
@@ -1346,7 +1346,7 @@ def test_cross_user_search_result_is_rejected() -> None:
     conversations = ConversationCollection(manager, USER_ID)
 
     with pytest.raises(UserIsolationError, match="user_id"):
-        conversations.hybrid_search("query", [_lateon_row(0.1)], 40)
+        conversations.hybrid_search("query", [_lateon_row(0.1)], 50)
 
 
 @pytest.mark.parametrize(
@@ -1379,7 +1379,7 @@ def test_malformed_or_mismatched_result_ids_are_rejected(
     conversations = ConversationCollection(manager, USER_ID)
 
     with pytest.raises(WeaviateResponseError, match="UUID|segment_id"):
-        conversations.hybrid_search("query", [_lateon_row(0.1)], 40)
+        conversations.hybrid_search("query", [_lateon_row(0.1)], 50)
 
 
 @pytest.mark.parametrize("properties", [None, [], "not-a-mapping"])
@@ -1398,7 +1398,7 @@ def test_malformed_result_properties_are_rejected(properties: object) -> None:
     conversations = ConversationCollection(manager, USER_ID)
 
     with pytest.raises(WeaviateResponseError, match="properties"):
-        conversations.hybrid_search("query", [_lateon_row(0.1)], 40)
+        conversations.hybrid_search("query", [_lateon_row(0.1)], 50)
 
 
 @pytest.mark.parametrize(
@@ -1443,7 +1443,7 @@ def test_every_conversation_operation_uses_only_its_bound_collection(
     )
     conversations.delete(CONVERSATION_ID)
     conversations.delete_batch([CONVERSATION_ID])
-    conversations.hybrid_search("query", [_lateon_row(0.1)], 40)
+    conversations.hybrid_search("query", [_lateon_row(0.1)], 50)
 
     assert [call.args[0] for call in client.collections.use.call_args_list] == [
         expected_name,

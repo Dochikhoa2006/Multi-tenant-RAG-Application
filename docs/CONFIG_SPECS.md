@@ -31,7 +31,7 @@ Hybrid
 └── alpha = 0.70
 
 Conversation
-├── candidate ceiling = 40 unique conversations
+├── first-stage ceiling = 50 segment/object hits
 ├── BGE → Adaptive-K → application MMR
 ├── lambda = 0.70
 └── final = 5
@@ -98,7 +98,7 @@ Context
 
 | Collection | Candidate ceiling | Ranking | Adaptive defaults | Final maximum |
 |---|---|---|---|---|
-| **Conversation** | `40` unique canonical conversations | BGE → Adaptive-K → bounded MMR | floor `-1.0`, gap `0.15`, lambda `0.70` | `5` |
+| **Conversation** | `50` segment/object hits | BGE → collapse → Adaptive-K → bounded MMR | floor `-1.0`, gap `0.15`, lambda `0.70` | `5` |
 | **Knowledge Facts** | `50` chunks | BGE → Adaptive-K → bounded MMR | floor `-1.0`, gap `0.15`, lambda `0.70` | `8` |
 | **Policy** | `40` chunks | BGE → Adaptive-K → bounded MMR | floor `-1.0`, gap `0.15`, lambda `0.70` | `5` |
 
@@ -110,6 +110,12 @@ then considers the first
 `min(2*k, total_eligible_count)` results from the full BGE-sorted eligible pool.
 Each lambda, raw-logit score floor, and sigmoid-gap threshold is independently
 configurable per collection.
+
+The first-stage counts are fixed at Conversation `50`, Knowledge `50`, and
+Policy `40`; candidate-count environment overrides are rejected. Conversation
+performs one hybrid query for at most 50 segment/object hits, BGE-scores every
+returned hit once, and only then collapses by canonical `conversation_id`. It
+does not retry to reach a target number of unique conversations.
 
 Hybrid queries return no GTE vectors. Each nonempty bounded MMR head is hydrated
 with one application-level `fetch_objects_by_ids()` call, and the returned

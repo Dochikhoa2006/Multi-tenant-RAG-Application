@@ -73,28 +73,32 @@ class FakeCollection:
         self.results = results
         self.calls: list[tuple[str, list[list[float]], int]] = []
         self.hydration_calls: list[list[SearchResult]] = []
+        self._returned_fixtures: dict[str, _FixtureResult] = {}
 
     def hybrid_search(
         self, query: str, vector: list[list[float]], top_k: int
     ) -> list[SearchResult]:
         self.calls.append((query, vector, top_k))
         if callable(self.results):
-            return [item.search for item in self.results(top_k)]
-        return [item.search for item in self.results[:top_k]]
+            fixtures = list(self.results(top_k))
+        else:
+            fixtures = list(self.results[:top_k])
+        self._returned_fixtures.update(
+            {item.search.object_id: item for item in fixtures}
+        )
+        return [item.search for item in fixtures]
 
     def hydrate_mmr_head(
         self,
         candidates: Sequence[SearchResult],
     ) -> list[HydratedSearchResult]:
         self.hydration_calls.append(list(candidates))
-        fixtures = self.results(160) if callable(self.results) else self.results
-        by_id = {item.search.object_id: item for item in fixtures}
         return [
             HydratedSearchResult(
                 object_id=candidate.object_id,
                 canonical_id=candidate.canonical_id,
-                diversity_vector=by_id[candidate.object_id].vector,
-                raw_text=by_id[candidate.object_id].raw_text,
+                diversity_vector=self._returned_fixtures[candidate.object_id].vector,
+                raw_text=self._returned_fixtures[candidate.object_id].raw_text,
                 segment_index=candidate.segment_index,
             )
             for candidate in candidates
@@ -177,7 +181,7 @@ def _candidate(index: int, score: float, vector: Sequence[float]) -> dict[str, o
 
 
 def test_collection_candidate_ceilings_and_final_maxima_are_exact() -> None:
-    assert (CONVERSATION_SEARCH.candidate_count, CONVERSATION_SEARCH.candidate_ceiling) == (40, 40)
+    assert (CONVERSATION_SEARCH.candidate_count, CONVERSATION_SEARCH.candidate_ceiling) == (50, 50)
     assert (KNOWLEDGE_SEARCH.candidate_count, KNOWLEDGE_SEARCH.candidate_ceiling) == (50, 50)
     assert (POLICY_SEARCH.candidate_count, POLICY_SEARCH.candidate_ceiling) == (40, 40)
     assert (
@@ -224,7 +228,7 @@ def test_knowledge_runs_bge_then_adaptive_k_then_bounded_mmr() -> None:
 
 
 def test_adaptive_k_uses_exact_decision_window_and_can_return_zero() -> None:
-    config = RetrievalConfig(40, 40, 3, -1.0, 0.15, 0.70)
+    config = RetrievalConfig(50, 50, 3, -1.0, 0.15, 0.70)
     eligible = [
         _candidate(1, 10.0, [1.0]),
         _candidate(2, 9.9, [1.0]),
@@ -237,7 +241,7 @@ def test_adaptive_k_uses_exact_decision_window_and_can_return_zero() -> None:
 
 
 def test_adaptive_k_does_not_artificially_cut_nearly_equal_logits() -> None:
-    config = RetrievalConfig(40, 40, 5, -1.0, 0.15, 0.70)
+    config = RetrievalConfig(50, 50, 5, -1.0, 0.15, 0.70)
     eligible = [
         _candidate(index, score, [1.0])
         for index, score in enumerate((0.04, 0.03, 0.02, 0.01, 0.0), start=1)
@@ -247,7 +251,7 @@ def test_adaptive_k_does_not_artificially_cut_nearly_equal_logits() -> None:
 
 
 def test_adaptive_k_sigmoid_is_stable_for_extreme_logits() -> None:
-    config = RetrievalConfig(40, 40, 3, -1001.0, 0.15, 0.70)
+    config = RetrievalConfig(50, 50, 3, -1001.0, 0.15, 0.70)
     eligible = [
         _candidate(1, 1000.0, [1.0]),
         _candidate(2, 999.0, [1.0]),
@@ -258,7 +262,7 @@ def test_adaptive_k_sigmoid_is_stable_for_extreme_logits() -> None:
 
 
 def test_mmr_uses_normalized_bge_relevance_and_exact_two_k_head() -> None:
-    config = RetrievalConfig(40, 40, 5, -1.0, 0.15, 0.50)
+    config = RetrievalConfig(50, 50, 5, -1.0, 0.15, 0.50)
     eligible = [
         _candidate(1, 10.0, [1.0, 0.0]),
         _candidate(2, 9.0, [1.0, 0.0]),
@@ -280,15 +284,15 @@ def test_mmr_lambda_is_independently_configured_per_collection() -> None:
     assert KNOWLEDGE_SEARCH is not POLICY_SEARCH
 
 
-def test_conversation_overfetches_unique_identities_and_runs_bge_once() -> None:
+def test_conversation_searches_fifty_segment_hits_once_and_runs_bge_once() -> None:
     all_hits = [
         _conversation_segment(
             index + 1,
-            (index % 20) + 1,
-            index // 20,
-            vector=(1.0, float((index % 20) % 2)),
+            (index % 17) + 1,
+            index // 17,
+            vector=(1.0, float((index % 17) % 2)),
         )
-        for index in range(160)
+        for index in range(50)
     ]
     collection = FakeCollection(lambda limit: all_hits[:limit])
     reranker = FakeReranker()
@@ -299,13 +303,31 @@ def test_conversation_overfetches_unique_identities_and_runs_bge_once() -> None:
         "conversations",
         runtime=_runtime(reranker),
     )
-    assert [call[2] for call in collection.calls] == [40, 80, 160]
+    assert [call[2] for call in collection.calls] == [50]
     assert len(reranker.calls) == 1
-    assert reranker.calls[0]["top_n"] == 160
+    assert reranker.calls[0]["top_n"] == 50
     assert len(set(item["object_id"] for item in results)) == len(results)
     assert len(results) <= CONVERSATION_SEARCH.final_count
     assert len(collection.hydration_calls) == 1
     assert len(collection.hydration_calls[0]) <= 2 * CONVERSATION_SEARCH.final_count
+
+
+def test_conversation_short_page_does_not_retry() -> None:
+    hits = [_conversation_segment(index, index, 0) for index in range(1, 18)]
+    collection = FakeCollection(hits)
+    reranker = FakeReranker()
+
+    retrieve(
+        collection,
+        "question",
+        [[0.3, 0.7]],
+        "conversations",
+        runtime=_runtime(reranker),
+    )
+
+    assert [call[2] for call in collection.calls] == [50]
+    assert len(reranker.calls) == 1
+    assert reranker.calls[0]["top_n"] == 17
 
 
 def test_conversation_collapses_segments_by_highest_bge_and_keeps_canonical_text() -> None:

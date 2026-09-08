@@ -165,6 +165,12 @@ during retrieval.
 Conversation canonical text is fetched with the vector only for representative
 head segments, avoiding one full Q+A copy per first-stage segment hit.
 
+At the fixed `C50 / K50 / P40` ceilings, the initial responses contain at most
+140 objects and zero GTE-vector floats. The former eager response shape would
+have returned 107,520 vector floats; bounded hydration returns at most 36
+objects, or 27,648 floats, and at most 10 Conversation canonical-text copies.
+These are logical payload bounds, not measured wire bytes or a latency claim.
+
 This deferred Conversation hydration deliberately narrows one defensive check.
 Canonical text and GTE-vector integrity are verified for every representative
 conversation capable of reaching final context, but not across sibling segments
@@ -178,9 +184,14 @@ fail-closed.
 
 | Collection | Hybrid candidate ceiling | Unified ranking | Final maximum |
 |---|---|---|---|
-| Conversation | `40` unique canonical conversations | BGE → Adaptive-K → MMR (`lambda = 0.70`) | `5` |
+| Conversation | `50` segment/object hits | BGE → collapse → Adaptive-K → MMR (`lambda = 0.70`) | `5` |
 | Knowledge Facts | `50` chunks | BGE → Adaptive-K → MMR (`lambda = 0.70`) | `8` |
 | Policy | `40` chunks | BGE → Adaptive-K → MMR (`lambda = 0.70`) | `5` |
+
+These first-stage counts are fixed at `C50 / K50 / P40`. Each collection makes
+one hybrid query and BGE scores every returned hit exactly once. Conversation
+collapses segment hits only after BGE and does not retry or overfetch to obtain
+a target number of unique canonical conversations.
 
 Retrieval units have a hard ceiling of 300 tokens in the pinned LateOn tokenizer
 and are never silently truncated. Knowledge/Policy keep one lossless semantic

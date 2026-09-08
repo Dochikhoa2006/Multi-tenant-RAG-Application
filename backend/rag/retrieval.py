@@ -48,7 +48,6 @@ _RERANK_TIMING_PHASES = {
     "knowledge_facts": "knowledge_cross_encoder_rerank",
     "policy": "policy_cross_encoder_rerank",
 }
-_CONVERSATION_OVERFETCH_MULTIPLIERS = (1, 2, 4)
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -302,29 +301,15 @@ def _hybrid_candidates(
     hybrid_search: Any,
     query: str,
     vector: tuple[tuple[float, ...], ...],
-    collection_type: str,
     config: RetrievalConfig,
 ) -> list[SearchResult]:
-    limits = (
-        tuple(config.candidate_count * item for item in _CONVERSATION_OVERFETCH_MULTIPLIERS)
-        if collection_type == "conversations"
-        else (config.candidate_count,)
-    )
-    accumulated: dict[str, SearchResult] = {}
-    for limit in limits:
-        page = _normalized_candidates(
-            hybrid_search(query, [list(row) for row in vector], limit),
+    return _normalized_candidates(
+        hybrid_search(
+            query,
+            [list(row) for row in vector],
+            config.candidate_count,
         )
-        for candidate in page:
-            accumulated.setdefault(candidate.object_id, candidate)
-        if collection_type != "conversations":
-            break
-        unique_conversations = {
-            candidate.canonical_id for candidate in accumulated.values()
-        }
-        if len(unique_conversations) >= config.candidate_count or len(page) < limit:
-            break
-    return list(accumulated.values())
+    )
 
 
 def _hydration_requests(
@@ -491,7 +476,6 @@ def retrieve(
         hybrid_search,
         query,
         vector,
-        collection_type,
         config,
     )
     search_elapsed = (perf_counter() - search_started) * 1000.0

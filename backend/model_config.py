@@ -556,6 +556,21 @@ if "HYBRID_COMPONENTS" in os.environ:
         f"{LATE_INTERACTION_VECTOR_NAME} + BM25"
     )
 
+_OBSOLETE_CANDIDATE_COUNT_VARIABLES = (
+    "CONVERSATION_CANDIDATE_COUNT",
+    "KNOWLEDGE_CANDIDATE_COUNT",
+    "POLICY_CANDIDATE_COUNT",
+)
+_configured_candidate_counts = tuple(
+    name for name in _OBSOLETE_CANDIDATE_COUNT_VARIABLES if name in os.environ
+)
+if _configured_candidate_counts:
+    raise ValueError(
+        f"{', '.join(_configured_candidate_counts)} no longer supported; "
+        "first-stage retrieval is fixed to C50 / K50 / P40. Remove the "
+        "obsolete environment variable(s)."
+    )
+
 
 HYBRID_SEARCH = HybridSearchConfig(
     fusion_method=_env_string("HYBRID_FUSION_METHOD", "relativeScoreFusion"),
@@ -563,8 +578,8 @@ HYBRID_SEARCH = HybridSearchConfig(
 )
 
 CONVERSATION_SEARCH = RetrievalConfig(
-    candidate_count=_env_int("CONVERSATION_CANDIDATE_COUNT", 40),
-    candidate_ceiling=40,
+    candidate_count=50,
+    candidate_ceiling=50,
     final_count=_env_int("CONVERSATION_FINAL_COUNT", 5),
     adaptive_relevance_floor=_env_finite_float(
         "CONVERSATION_ADAPTIVE_RELEVANCE_FLOOR", -1.0
@@ -575,7 +590,7 @@ CONVERSATION_SEARCH = RetrievalConfig(
     mmr_lambda=_env_probability("CONVERSATION_MMR_LAMBDA", 0.70),
 )
 KNOWLEDGE_SEARCH = RetrievalConfig(
-    candidate_count=_env_int("KNOWLEDGE_CANDIDATE_COUNT", 50),
+    candidate_count=50,
     candidate_ceiling=50,
     final_count=_env_int("KNOWLEDGE_FINAL_COUNT", 8),
     adaptive_relevance_floor=_env_finite_float(
@@ -587,7 +602,7 @@ KNOWLEDGE_SEARCH = RetrievalConfig(
     mmr_lambda=_env_probability("KNOWLEDGE_MMR_LAMBDA", 0.70),
 )
 POLICY_SEARCH = RetrievalConfig(
-    candidate_count=_env_int("POLICY_CANDIDATE_COUNT", 40),
+    candidate_count=40,
     candidate_ceiling=40,
     final_count=_env_int("POLICY_FINAL_COUNT", 5),
     adaptive_relevance_floor=_env_finite_float(
