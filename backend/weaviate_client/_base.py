@@ -8,17 +8,19 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 from uuid import UUID
 
-from weaviate.classes.query import HybridFusion, MetadataQuery
+from weaviate.classes.query import HybridFusion
 
 from backend.config import get_collection_name
 from backend.model_config import (
     HYBRID_SEARCH,
     LATEON_EMBEDDING_DIMENSION,
     LATE_INTERACTION_VECTOR_NAME,
+    MMR_DIVERSITY_VECTOR_DIMENSION,
     MMR_DIVERSITY_VECTOR_NAME,
 )
 from backend.weaviate_client.client import WeaviateManager
 from backend.weaviate_client.models import (
+    HydratedSearchResult,
     SearchResult,
     UserIsolationError,
     WeaviateResponseError,
@@ -106,7 +108,11 @@ def _fusion_type() -> HybridFusion:
     )
 
 
-def _result_vector(value: object) -> tuple[float, ...]:
+def _result_vector(
+    value: object,
+    *,
+    expected_dimension: int | None = None,
+) -> tuple[float, ...]:
     """Validate the requested stored GTE MMR-diversity vector."""
 
     if value is None:
@@ -119,9 +125,15 @@ def _result_vector(value: object) -> tuple[float, ...]:
             )
         selected = value[MMR_DIVERSITY_VECTOR_NAME]
     try:
-        return tuple(_vector_values(selected, "MMR-diversity vector"))
+        result = tuple(_vector_values(selected, "MMR-diversity vector"))
     except (TypeError, ValueError) as exc:
         raise WeaviateResponseError("result contains a malformed MMR vector") from exc
+    if expected_dimension is not None and len(result) != expected_dimension:
+        raise WeaviateResponseError(
+            "result MMR-diversity vector must have exactly "
+            f"{expected_dimension} dimensions"
+        )
+    return result
 
 
 def _result_multi_vector(value: object) -> tuple[tuple[float, ...], ...]:
@@ -143,18 +155,6 @@ def _result_multi_vector(value: object) -> tuple[tuple[float, ...], ...]:
         ) from exc
 
 
-def _result_score(value: object) -> float:
-    if value is None or isinstance(value, bool):
-        raise WeaviateResponseError("hybrid result is missing a numeric score")
-    try:
-        score = float(value)
-    except (TypeError, ValueError) as exc:
-        raise WeaviateResponseError("hybrid result contains a malformed score") from exc
-    if not math.isfinite(score):
-        raise WeaviateResponseError("hybrid result score must be finite")
-    return score
-
-
 def _result_uuid(value: object, name: str) -> str:
     try:
         return str(UUID(str(value)))
@@ -165,8 +165,13 @@ def _result_uuid(value: object, name: str) -> str:
 class _CollectionBase:
     collection_type: str
     id_property: str
+    canonical_id_property: str
     return_properties: tuple[str, ...]
+    search_return_properties: tuple[str, ...]
+    hydration_return_properties: tuple[str, ...]
     search_property = "raw_text"
+    segment_index_property: str | None = None
+    hydrate_raw_text = False
 
     def __init__(self, manager: WeaviateManager, user_id: str) -> None:
         if not isinstance(manager, WeaviateManager):
@@ -199,9 +204,8 @@ class _CollectionBase:
             "fusion_type": _fusion_type(),
             "limit": limit,
             "target_vector": LATE_INTERACTION_VECTOR_NAME,
-            "include_vector": [MMR_DIVERSITY_VECTOR_NAME],
-            "return_metadata": MetadataQuery(score=True),
-            "return_properties": list(self.return_properties),
+            "include_vector": False,
+            "return_properties": list(self.search_return_properties),
         }
         response = self._collection.query.hybrid(**query_options)
         results: list[SearchResult] = []
@@ -232,14 +236,158 @@ class _CollectionBase:
                 raise WeaviateResponseError(
                     f"hybrid result object UUID does not match {self.id_property}"
                 )
-            metadata = getattr(item, "metadata", None)
-            score = getattr(metadata, "score", None) if metadata is not None else None
+            canonical_id = _result_uuid(
+                properties.get(self.canonical_id_property),
+                self.canonical_id_property,
+            )
+            try:
+                retrieval_text = _required_text(
+                    properties.get(self.search_property),
+                    self.search_property,
+                )
+            except (TypeError, ValueError) as exc:
+                raise WeaviateResponseError(
+                    "hybrid result contains malformed retrieval text"
+                ) from exc
+            segment_index: int | None = None
+            if self.segment_index_property is not None:
+                value = properties.get(self.segment_index_property)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise WeaviateResponseError(
+                        "hybrid result has an invalid segment_index"
+                    )
+                segment_index = value
             results.append(
                 SearchResult(
                     object_id=object_id,
-                    properties=properties,
-                    score=_result_score(score),
-                    vector=_result_vector(getattr(item, "vector", None)),
+                    canonical_id=canonical_id,
+                    retrieval_text=retrieval_text,
+                    segment_index=segment_index,
                 )
             )
         return results
+
+    def hydrate_mmr_head(
+        self,
+        candidates: Sequence[SearchResult],
+    ) -> list[HydratedSearchResult]:
+        """Fetch persisted MMR data once for an already bounded candidate head."""
+
+        if isinstance(candidates, (str, bytes)) or not isinstance(
+            candidates,
+            Sequence,
+        ):
+            raise TypeError("candidates must be a sequence of SearchResult values")
+        if not candidates:
+            return []
+        expected: dict[str, SearchResult] = {}
+        for candidate in candidates:
+            if not isinstance(candidate, SearchResult):
+                raise TypeError("candidates must contain only SearchResult values")
+            object_id = _result_uuid(candidate.object_id, "candidate object UUID")
+            canonical_id = _result_uuid(
+                candidate.canonical_id,
+                "candidate canonical UUID",
+            )
+            if object_id in expected:
+                raise WeaviateResponseError(
+                    "MMR hydration request contains duplicate object UUIDs"
+                )
+            if (
+                self.canonical_id_property == self.id_property
+                and canonical_id != object_id
+            ):
+                raise WeaviateResponseError(
+                    "MMR hydration candidate canonical UUID is inconsistent"
+                )
+            expected[object_id] = candidate
+
+        object_ids = list(expected)
+        response = self._collection.query.fetch_objects_by_ids(
+            object_ids,
+            limit=len(object_ids),
+            include_vector=[MMR_DIVERSITY_VECTOR_NAME],
+            return_properties=list(self.hydration_return_properties),
+        )
+        objects = getattr(response, "objects", None)
+        if not isinstance(objects, list):
+            raise WeaviateResponseError("MMR hydration response objects are malformed")
+
+        hydrated: dict[str, HydratedSearchResult] = {}
+        for item in objects:
+            raw_properties = getattr(item, "properties", None)
+            if not isinstance(raw_properties, Mapping):
+                raise WeaviateResponseError(
+                    "MMR hydration result properties must be a mapping"
+                )
+            properties = {
+                key: str(value) if isinstance(value, UUID) else value
+                for key, value in raw_properties.items()
+            }
+            if properties.get("user_id") != self.user_id:
+                raise UserIsolationError(
+                    "MMR hydration result user_id does not match the bound user"
+                )
+            object_id = _result_uuid(getattr(item, "uuid", None), "object UUID")
+            if object_id not in expected:
+                raise WeaviateResponseError(
+                    "MMR hydration returned an unexpected object UUID"
+                )
+            if object_id in hydrated:
+                raise WeaviateResponseError(
+                    "MMR hydration returned a duplicate object UUID"
+                )
+            business_id = _result_uuid(
+                properties.get(self.id_property),
+                self.id_property,
+            )
+            if object_id != business_id:
+                raise WeaviateResponseError(
+                    f"MMR hydration object UUID does not match {self.id_property}"
+                )
+            candidate = expected[object_id]
+            canonical_id = _result_uuid(
+                properties.get(self.canonical_id_property),
+                self.canonical_id_property,
+            )
+            if canonical_id != candidate.canonical_id:
+                raise WeaviateResponseError(
+                    "MMR hydration canonical UUID does not match the candidate"
+                )
+            segment_index: int | None = None
+            if self.segment_index_property is not None:
+                value = properties.get(self.segment_index_property)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise WeaviateResponseError(
+                        "MMR hydration result has an invalid segment_index"
+                    )
+                if value != candidate.segment_index:
+                    raise WeaviateResponseError(
+                        "MMR hydration segment_index does not match the candidate"
+                    )
+                segment_index = value
+            raw_text: str | None = None
+            if self.hydrate_raw_text:
+                try:
+                    raw_text = _required_text(properties.get("raw_text"), "raw_text")
+                except (TypeError, ValueError) as exc:
+                    raise WeaviateResponseError(
+                        "MMR hydration result has malformed canonical text"
+                    ) from exc
+            hydrated[object_id] = HydratedSearchResult(
+                object_id=object_id,
+                canonical_id=canonical_id,
+                diversity_vector=_result_vector(
+                    getattr(item, "vector", None),
+                    expected_dimension=MMR_DIVERSITY_VECTOR_DIMENSION,
+                ),
+                raw_text=raw_text,
+                segment_index=segment_index,
+            )
+
+        if set(hydrated) != set(expected):
+            missing = len(set(expected) - set(hydrated))
+            raise WeaviateResponseError(
+                f"MMR hydration response is incomplete ({missing} object(s) missing)"
+            )
+        return [hydrated[object_id] for object_id in object_ids]

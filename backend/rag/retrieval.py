@@ -26,7 +26,7 @@ from backend.rag.runtime import (
     Tokenizer,
     resolve_runtime,
 )
-from backend.weaviate_client.models import SearchResult
+from backend.weaviate_client.models import HydratedSearchResult, SearchResult
 
 
 _COLLECTION_CONFIGS: dict[str, RetrievalConfig] = {
@@ -92,42 +92,22 @@ def _multi_vector(value: object, name: str) -> tuple[tuple[float, ...], ...]:
 
 def _normalized_candidates(
     results: object,
-    collection_type: str,
-) -> list[dict[str, Any]]:
+) -> list[SearchResult]:
     if not isinstance(results, list):
         raise TypeError("hybrid_search must return a list")
-    normalized: list[dict[str, Any]] = []
+    normalized: list[SearchResult] = []
     for result in results:
         if not isinstance(result, SearchResult):
             raise TypeError("hybrid_search results must be SearchResult values")
-        properties = result.properties
-        if not isinstance(properties, Mapping):
-            raise TypeError("search result properties must be a mapping")
-        copied_properties = dict(properties)
-        raw_text = _required_text(copied_properties.get("raw_text"), "raw_text")
-        retrieval_text = (
-            _required_text(copied_properties.get("segment_text"), "segment_text")
-            if collection_type == "conversations"
-            else raw_text
-        )
-        score = float(result.score)
-        if not math.isfinite(score):
-            raise ValueError("hybrid score must be finite")
-        normalized.append(
-            {
-                "object_id": result.object_id,
-                "properties": copied_properties,
-                "raw_text": raw_text,
-                "retrieval_text": retrieval_text,
-                "hybrid_score": score,
-                "diversity_vector": _vector(result.vector, "diversity vector"),
-            }
-        )
+        _required_text(result.object_id, "object_id")
+        _required_text(result.canonical_id, "canonical_id")
+        _required_text(result.retrieval_text, "retrieval_text")
+        normalized.append(result)
     return normalized
 
 
 def _cross_encoder(
-    candidates: list[dict[str, Any]],
+    candidates: list[SearchResult],
     query: str,
     config: RetrievalConfig,
     runtime: RAGRuntime,
@@ -136,7 +116,7 @@ def _cross_encoder(
         return []
     raw_results = runtime.reranker.rerank(
         query,
-        [candidate["retrieval_text"] for candidate in candidates],
+        [candidate.retrieval_text for candidate in candidates],
         model=RERANKER_MODEL,
         top_n=len(candidates),
     )
@@ -161,9 +141,16 @@ def _cross_encoder(
         if not math.isfinite(score):
             raise ValueError("reranker score must be finite")
         used_indices.add(item.index)
-        candidate = dict(candidates[item.index])
-        candidate["rerank_score"] = score
-        selected.append(candidate)
+        candidate = candidates[item.index]
+        selected.append(
+            {
+                "object_id": candidate.object_id,
+                "canonical_id": candidate.canonical_id,
+                "retrieval_text": candidate.retrieval_text,
+                "segment_index": candidate.segment_index,
+                "rerank_score": score,
+            }
+        )
     return sorted(
         selected,
         key=lambda candidate: (
@@ -174,18 +161,12 @@ def _cross_encoder(
 
 
 def _conversation_id(candidate: Mapping[str, Any]) -> str:
-    properties = candidate.get("properties")
-    if not isinstance(properties, Mapping):
-        raise TypeError("Conversation candidate properties must be a mapping")
-    value = properties.get("conversation_id")
+    value = candidate.get("canonical_id")
     return _required_text(value, "conversation_id")
 
 
 def _segment_index(candidate: Mapping[str, Any]) -> int:
-    properties = candidate.get("properties")
-    if not isinstance(properties, Mapping):
-        raise TypeError("Conversation candidate properties must be a mapping")
-    value = properties.get("segment_index")
+    value = candidate.get("segment_index")
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError("segment_index must be a non-negative integer")
     return value
@@ -196,15 +177,8 @@ def _collapse_conversations(
     limit: int,
 ) -> list[dict[str, Any]]:
     selected: dict[str, dict[str, Any]] = {}
-    canonical: dict[str, tuple[str, tuple[float, ...]]] = {}
     for candidate in candidates:
         conversation_id = _conversation_id(candidate)
-        identity = (candidate["raw_text"], candidate["diversity_vector"])
-        if conversation_id in canonical and canonical[conversation_id] != identity:
-            raise ValueError(
-                "Conversation segments disagree on canonical text or GTE vector"
-            )
-        canonical[conversation_id] = identity
         current = selected.get(conversation_id)
         if current is None or (
             -candidate["rerank_score"],
@@ -320,9 +294,7 @@ def _mmr(
         remaining.remove(best_index)
     results: list[dict[str, Any]] = []
     for index in selected_indices:
-        copied = dict(head[index])
-        copied["normalized_rerank_score"] = normalized[index]
-        results.append(copied)
+        results.append(head[index])
     return results
 
 
@@ -332,28 +304,131 @@ def _hybrid_candidates(
     vector: tuple[tuple[float, ...], ...],
     collection_type: str,
     config: RetrievalConfig,
-) -> list[dict[str, Any]]:
+) -> list[SearchResult]:
     limits = (
         tuple(config.candidate_count * item for item in _CONVERSATION_OVERFETCH_MULTIPLIERS)
         if collection_type == "conversations"
         else (config.candidate_count,)
     )
-    accumulated: dict[str, dict[str, Any]] = {}
+    accumulated: dict[str, SearchResult] = {}
     for limit in limits:
         page = _normalized_candidates(
             hybrid_search(query, [list(row) for row in vector], limit),
-            collection_type,
         )
         for candidate in page:
-            accumulated.setdefault(str(candidate["object_id"]), candidate)
+            accumulated.setdefault(candidate.object_id, candidate)
         if collection_type != "conversations":
             break
         unique_conversations = {
-            _conversation_id(candidate) for candidate in accumulated.values()
+            candidate.canonical_id for candidate in accumulated.values()
         }
         if len(unique_conversations) >= config.candidate_count or len(page) < limit:
             break
     return list(accumulated.values())
+
+
+def _hydration_requests(
+    head: Sequence[Mapping[str, Any]],
+    collection_type: str,
+) -> list[SearchResult]:
+    requests: list[SearchResult] = []
+    for candidate in head:
+        object_id = (
+            _required_text(candidate.get("segment_id"), "segment_id")
+            if collection_type == "conversations"
+            else _required_text(candidate.get("object_id"), "object_id")
+        )
+        canonical_id = (
+            _required_text(candidate.get("object_id"), "conversation_id")
+            if collection_type == "conversations"
+            else object_id
+        )
+        requests.append(
+            SearchResult(
+                object_id=object_id,
+                canonical_id=canonical_id,
+                retrieval_text=_required_text(
+                    candidate.get("retrieval_text"),
+                    "retrieval_text",
+                ),
+                segment_index=(
+                    _segment_index(candidate)
+                    if collection_type == "conversations"
+                    else None
+                ),
+            )
+        )
+    return requests
+
+
+def _hydrate_mmr_head(
+    collection_client: object,
+    eligible: Sequence[dict[str, Any]],
+    k: int,
+    collection_type: str,
+) -> list[dict[str, Any]]:
+    if k == 0:
+        return []
+    head = list(eligible[: min(2 * k, len(eligible))])
+    hydrate = getattr(collection_client, "hydrate_mmr_head", None)
+    if not callable(hydrate):
+        raise TypeError("collection_client must provide hydrate_mmr_head()")
+    requested = _hydration_requests(head, collection_type)
+    raw_hydrated = hydrate(requested)
+    if not isinstance(raw_hydrated, list) or len(raw_hydrated) != len(head):
+        raise TypeError("hydrate_mmr_head must return one ordered result per candidate")
+    hydrated_head: list[dict[str, Any]] = []
+    for candidate, request, hydrated in zip(
+        head,
+        requested,
+        raw_hydrated,
+        strict=True,
+    ):
+        if not isinstance(hydrated, HydratedSearchResult):
+            raise TypeError(
+                "hydrate_mmr_head results must be HydratedSearchResult values"
+            )
+        if (
+            hydrated.object_id != request.object_id
+            or hydrated.canonical_id != request.canonical_id
+            or hydrated.segment_index != request.segment_index
+        ):
+            raise ValueError(
+                "hydrated result identity or order does not match its candidate"
+            )
+        copied = dict(candidate)
+        copied["diversity_vector"] = _vector(
+            hydrated.diversity_vector,
+            "diversity vector",
+        )
+        if collection_type == "conversations":
+            copied["raw_text"] = _required_text(hydrated.raw_text, "raw_text")
+        else:
+            copied["raw_text"] = copied["retrieval_text"]
+        hydrated_head.append(copied)
+    return hydrated_head
+
+
+def _final_results(
+    selected: Sequence[Mapping[str, Any]],
+    collection_type: str,
+) -> list[dict[str, Any]]:
+    if collection_type == "conversations":
+        return [
+            {
+                "object_id": _required_text(item.get("object_id"), "object_id"),
+                "raw_text": _required_text(item.get("raw_text"), "raw_text"),
+            }
+            for item in selected
+        ]
+    return [
+        {
+            "object_id": _required_text(item.get("object_id"), "object_id"),
+            "raw_text": _required_text(item.get("raw_text"), "raw_text"),
+            "rerank_score": float(item["rerank_score"]),
+        }
+        for item in selected
+    ]
 
 
 def _budget_results(
@@ -408,6 +483,8 @@ def retrieve(
     hybrid_search = getattr(collection_client, "hybrid_search", None)
     if not callable(hybrid_search):
         raise TypeError("collection_client must provide hybrid_search()")
+    if not callable(getattr(collection_client, "hydrate_mmr_head", None)):
+        raise TypeError("collection_client must provide hydrate_mmr_head()")
     config = _COLLECTION_CONFIGS[collection_type]
     search_started = perf_counter()
     candidates = _hybrid_candidates(
@@ -435,8 +512,14 @@ def retrieve(
         if candidate["rerank_score"] >= config.adaptive_relevance_floor
     ]
     k = _adaptive_k(eligible, config)
+    hydrated_head = _hydrate_mmr_head(
+        collection_client,
+        eligible,
+        k,
+        collection_type,
+    )
     mmr_started = perf_counter()
-    selected = _mmr(eligible, k, config)
+    selected = _mmr(hydrated_head, k, config)
     mmr_elapsed = (perf_counter() - mmr_started) * 1000.0
     if timing_observer is not None and collection_type == "conversations":
         timing_observer("conversation_mmr_rerank", mmr_elapsed)
@@ -447,9 +530,10 @@ def retrieve(
             "hybrid_candidates": len(candidates),
             "eligible_candidates": len(eligible),
             "adaptive_k": k,
-            "mmr_head": min(2 * k, len(eligible)),
+            "mmr_head": len(hydrated_head),
         },
     )
+    selected = _final_results(selected, collection_type)
     if collection_type in _CONTEXT_BUDGETS:
         selected = _budget_results(
             selected,

@@ -7,13 +7,17 @@ from uuid import UUID
 import pytest
 
 from backend.config import get_collection_name
-from backend.model_config import LATEON_EMBEDDING_DIMENSION
+from backend.model_config import (
+    LATEON_EMBEDDING_DIMENSION,
+    MMR_DIVERSITY_VECTOR_DIMENSION,
+)
 from backend.weaviate_client.client import WeaviateManager
 from backend.weaviate_client.knowledge import KnowledgeCollection
 from backend.weaviate_client.models import (
     ChunkRecord,
     IncompleteDeletionError,
     PartialParagraphUpdateError,
+    SearchResult,
     WeaviateResponseError,
 )
 from backend.weaviate_client.policy import PolicyCollection
@@ -28,6 +32,10 @@ THIRD_CHUNK_ID = "20000000-0000-0000-0000-000000000003"
 
 def _lateon_row(first: float, second: float = 0.0) -> list[float]:
     return [first, second, *([0.0] * (LATEON_EMBEDDING_DIMENSION - 2))]
+
+
+def _gte_vector(first: float = 1.0) -> list[float]:
+    return [first, *([0.0] * (MMR_DIVERSITY_VECTOR_DIMENSION - 1))]
 
 
 def _manager_and_collection() -> tuple[WeaviateManager, MagicMock, MagicMock]:
@@ -213,8 +221,8 @@ def test_knowledge_hybrid_search_keeps_collection_result_order() -> None:
                     "chunk_id": CHUNK_ID,
                     "raw_text": "first",
                 },
-                vector={"mmr_diversity": [0.1, 0.2]},
-                metadata=SimpleNamespace(score=0.9),
+                vector=None,
+                metadata=None,
             ),
             SimpleNamespace(
                 uuid=UUID(SECOND_CHUNK_ID),
@@ -225,8 +233,8 @@ def test_knowledge_hybrid_search_keeps_collection_result_order() -> None:
                     "chunk_id": SECOND_CHUNK_ID,
                     "raw_text": "second",
                 },
-                vector={"mmr_diversity": [0.2, 0.1]},
-                metadata=SimpleNamespace(score=0.8),
+                vector=None,
+                metadata=None,
             ),
         ]
     )
@@ -235,19 +243,90 @@ def test_knowledge_hybrid_search_keeps_collection_result_order() -> None:
     results = knowledge.hybrid_search("query", [_lateon_row(0.5, 0.5)], 50)
 
     assert [item.object_id for item in results] == [CHUNK_ID, SECOND_CHUNK_ID]
-    assert [item.vector for item in results] == [(0.1, 0.2), (0.2, 0.1)]
+    assert [item.retrieval_text for item in results] == ["first", "second"]
     kwargs = collection.query.hybrid.call_args.kwargs
-    assert kwargs["include_vector"] == ["mmr_diversity"]
+    assert kwargs["include_vector"] is False
     assert kwargs["target_vector"] == "late_interaction"
     assert kwargs["query_properties"] == ["raw_text"]
     assert "diversity_selection" not in kwargs
-    assert kwargs["return_properties"] == [
-        "user_id",
-        "document_id",
-        "paragraph_id",
-        "chunk_id",
-        "raw_text",
+    assert "return_metadata" not in kwargs
+    assert kwargs["return_properties"] == ["user_id", "chunk_id", "raw_text"]
+
+
+def test_knowledge_hydrates_mmr_head_in_one_ordered_batch() -> None:
+    manager, _, collection = _manager_and_collection()
+    collection.query.fetch_objects_by_ids.return_value = SimpleNamespace(
+        objects=[
+            SimpleNamespace(
+                uuid=UUID(SECOND_CHUNK_ID),
+                properties={"user_id": USER_ID, "chunk_id": SECOND_CHUNK_ID},
+                vector={"mmr_diversity": _gte_vector(0.5)},
+            ),
+            SimpleNamespace(
+                uuid=UUID(CHUNK_ID),
+                properties={"user_id": USER_ID, "chunk_id": CHUNK_ID},
+                vector={"mmr_diversity": _gte_vector()},
+            ),
+        ]
+    )
+    knowledge = KnowledgeCollection(manager, USER_ID)
+    requested = [
+        SearchResult(CHUNK_ID, CHUNK_ID, "first"),
+        SearchResult(SECOND_CHUNK_ID, SECOND_CHUNK_ID, "second"),
     ]
+
+    hydrated = knowledge.hydrate_mmr_head(requested)
+
+    assert [item.object_id for item in hydrated] == [CHUNK_ID, SECOND_CHUNK_ID]
+    assert all(len(item.diversity_vector) == 768 for item in hydrated)
+    assert collection.query.fetch_objects_by_ids.call_count == 1
+    kwargs = collection.query.fetch_objects_by_ids.call_args.kwargs
+    assert kwargs["include_vector"] == ["mmr_diversity"]
+    assert kwargs["return_properties"] == ["user_id", "chunk_id"]
+
+
+@pytest.mark.parametrize(
+    ("objects", "match"),
+    [
+        ([], "incomplete"),
+        (
+            [
+                SimpleNamespace(
+                    uuid=UUID(CHUNK_ID),
+                    properties={"user_id": USER_ID, "chunk_id": CHUNK_ID},
+                    vector={"mmr_diversity": [1.0]},
+                )
+            ],
+            "768 dimensions",
+        ),
+    ],
+)
+def test_knowledge_hydration_fails_closed(objects: list[object], match: str) -> None:
+    manager, _, collection = _manager_and_collection()
+    collection.query.fetch_objects_by_ids.return_value = SimpleNamespace(objects=objects)
+    knowledge = KnowledgeCollection(manager, USER_ID)
+
+    with pytest.raises(WeaviateResponseError, match=match):
+        knowledge.hydrate_mmr_head([SearchResult(CHUNK_ID, CHUNK_ID, "text")])
+
+
+def test_knowledge_empty_hydration_makes_no_sdk_call() -> None:
+    manager, _, collection = _manager_and_collection()
+    knowledge = KnowledgeCollection(manager, USER_ID)
+
+    assert knowledge.hydrate_mmr_head([]) == []
+    collection.query.fetch_objects_by_ids.assert_not_called()
+
+
+def test_knowledge_hydration_rejects_duplicate_request_ids_before_sdk_call() -> None:
+    manager, _, collection = _manager_and_collection()
+    knowledge = KnowledgeCollection(manager, USER_ID)
+    candidate = SearchResult(CHUNK_ID, CHUNK_ID, "text")
+
+    with pytest.raises(WeaviateResponseError, match="duplicate"):
+        knowledge.hydrate_mmr_head([candidate, candidate])
+
+    collection.query.fetch_objects_by_ids.assert_not_called()
 
 
 def test_chunk_delete_failure_is_not_swallowed() -> None:

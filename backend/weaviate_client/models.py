@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
 
 
 class WeaviateResponseError(RuntimeError):
@@ -103,6 +102,17 @@ class SearchResult:
     """One normalized first-stage hybrid-search result."""
 
     object_id: str
-    properties: Mapping[str, Any]
-    score: float
-    vector: tuple[float, ...] | None = None
+    canonical_id: str
+    retrieval_text: str
+    segment_index: int | None = None
+
+
+@dataclass(frozen=True)
+class HydratedSearchResult:
+    """One MMR-head result hydrated from its persisted named vector."""
+
+    object_id: str
+    canonical_id: str
+    diversity_vector: tuple[float, ...]
+    raw_text: str | None = None
+    segment_index: int | None = None

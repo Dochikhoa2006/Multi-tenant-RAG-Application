@@ -104,6 +104,7 @@ def _dry_run_delete_response(value: object) -> tuple[int, tuple[str, ...]]:
 
 class _ChunkCollection(_CollectionBase):
     id_property = "chunk_id"
+    canonical_id_property = "chunk_id"
     return_properties = (
         "user_id",
         "document_id",
@@ -111,6 +112,8 @@ class _ChunkCollection(_CollectionBase):
         "chunk_id",
         "raw_text",
     )
+    search_return_properties = ("user_id", "chunk_id", "raw_text")
+    hydration_return_properties = ("user_id", "chunk_id")
 
     def insert_chunk(
         self,

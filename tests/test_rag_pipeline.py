@@ -18,7 +18,7 @@ from backend.model_config import (
 )
 from backend.rag.pipeline import UserRetrievalCollections, run_rag_pipeline
 from backend.rag.runtime import RAGRuntime, RerankResult
-from backend.weaviate_client.models import SearchResult
+from backend.weaviate_client.models import HydratedSearchResult, SearchResult
 
 
 USER_ID = "usr_pipeline"
@@ -35,31 +35,33 @@ def _uuid(index: int) -> str:
     return f"71000000-0000-0000-0000-{index:012d}"
 
 
+@dataclass(frozen=True)
+class _FixtureResult:
+    search: SearchResult
+    raw_text: str
+    vector: tuple[float, ...]
+
+
 def _result(
     index: int,
     text: str,
     vector: Sequence[float],
     score: float,
     collection_type: str,
-) -> SearchResult:
+) -> _FixtureResult:
     object_id = _uuid(index)
-    properties: dict[str, object] = {"user_id": USER_ID, "raw_text": text}
-    if collection_type == "conversations":
-        properties.update(
-            {
-                "segment_id": object_id,
-                "conversation_id": _uuid(index + 100),
-                "segment_index": 0,
-                "segment_text": text,
-            }
-        )
-    else:
-        properties["chunk_id"] = object_id
-    return SearchResult(
-        object_id=object_id,
-        properties=properties,
+    canonical_id = (
+        _uuid(index + 100) if collection_type == "conversations" else object_id
+    )
+    return _FixtureResult(
+        search=SearchResult(
+            object_id=object_id,
+            canonical_id=canonical_id,
+            retrieval_text=text,
+            segment_index=0 if collection_type == "conversations" else None,
+        ),
+        raw_text=text,
         vector=tuple(vector),
-        score=score,
     )
 
 
@@ -182,7 +184,7 @@ class RecordingCollection:
     def __init__(
         self,
         name: str,
-        results: list[SearchResult],
+        results: list[_FixtureResult],
         events: list[str],
         *,
         rendezvous: threading.Barrier | None = None,
@@ -212,7 +214,23 @@ class RecordingCollection:
         self.events.append(f"search:{self.name}")
         if self.rendezvous is not None:
             self.rendezvous.wait(timeout=2)
-        return list(self.results)
+        return [item.search for item in self.results]
+
+    def hydrate_mmr_head(
+        self,
+        candidates: Sequence[SearchResult],
+    ) -> list[HydratedSearchResult]:
+        by_id = {item.search.object_id: item for item in self.results}
+        return [
+            HydratedSearchResult(
+                candidate.object_id,
+                candidate.canonical_id,
+                by_id[candidate.object_id].vector,
+                by_id[candidate.object_id].raw_text,
+                candidate.segment_index,
+            )
+            for candidate in candidates
+        ]
 
 
 @dataclass

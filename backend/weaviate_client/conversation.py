@@ -36,7 +36,10 @@ class ConversationCollection(_CollectionBase):
 
     collection_type = "conversations"
     id_property = "segment_id"
+    canonical_id_property = "conversation_id"
     search_property = "segment_text"
+    segment_index_property = "segment_index"
+    hydrate_raw_text = True
     return_properties = (
         "user_id",
         "conversation_id",
@@ -44,6 +47,20 @@ class ConversationCollection(_CollectionBase):
         "segment_index",
         "raw_text",
         "segment_text",
+    )
+    search_return_properties = (
+        "user_id",
+        "conversation_id",
+        "segment_id",
+        "segment_index",
+        "segment_text",
+    )
+    hydration_return_properties = (
+        "user_id",
+        "conversation_id",
+        "segment_id",
+        "segment_index",
+        "raw_text",
     )
 
     def insert(

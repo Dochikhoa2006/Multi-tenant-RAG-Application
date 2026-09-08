@@ -111,6 +111,11 @@ then considers the first
 Each lambda, raw-logit score floor, and sigmoid-gap threshold is independently
 configurable per collection.
 
+Hybrid queries return no GTE vectors. Each nonempty bounded MMR head is hydrated
+with one application-level `fetch_objects_by_ids()` call, and the returned
+768-dimensional `mmr_diversity` vectors are restored to BGE order before MMR.
+Conversation canonical text is included in that same bounded hydration read.
+
 Every late-interaction retrieval unit is measured by the pinned LateOn tokenizer
 and must be at most 300 model tokens with no silent truncation. Knowledge/Policy
 retain the existing semantic chunking target/minimum behavior, with 300 as the

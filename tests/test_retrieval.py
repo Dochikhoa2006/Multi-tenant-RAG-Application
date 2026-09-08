@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable, Sequence
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -15,20 +16,31 @@ from backend.model_config import (
 )
 from backend.rag.retrieval import _adaptive_k, _mmr, retrieve
 from backend.rag.runtime import RAGRuntime, RerankResult
-from backend.weaviate_client.models import SearchResult
+from backend.weaviate_client.models import HydratedSearchResult, SearchResult
 
 
 def _uuid(index: int) -> str:
     return f"90000000-0000-0000-0000-{index:012d}"
 
 
-def _chunk(index: int, text: str, vector: Sequence[float], score: float) -> SearchResult:
+@dataclass(frozen=True)
+class _FixtureResult:
+    search: SearchResult
+    raw_text: str
+    vector: tuple[float, ...]
+
+
+def _chunk(
+    index: int,
+    text: str,
+    vector: Sequence[float],
+    score: float,
+) -> _FixtureResult:
     object_id = _uuid(index)
-    return SearchResult(
-        object_id=object_id,
-        properties={"user_id": "usr_test", "chunk_id": object_id, "raw_text": text},
-        score=score,
-        vector=list(vector),
+    return _FixtureResult(
+        search=SearchResult(object_id, object_id, text),
+        raw_text=text,
+        vector=tuple(vector),
     )
 
 
@@ -40,37 +52,53 @@ def _conversation_segment(
     raw_text: str | None = None,
     vector: Sequence[float] = (1.0, 0.0),
     score: float = 0.5,
-) -> SearchResult:
-    return SearchResult(
-        object_id=_uuid(segment_id),
-        properties={
-            "user_id": "usr_test",
-            "segment_id": _uuid(segment_id),
-            "conversation_id": _uuid(conversation),
-            "segment_index": segment_index,
-            "raw_text": raw_text or f"canonical-{conversation}",
-            "segment_text": f"segment-{segment_id}",
-        },
-        score=score,
-        vector=list(vector),
+) -> _FixtureResult:
+    return _FixtureResult(
+        search=SearchResult(
+            object_id=_uuid(segment_id),
+            canonical_id=_uuid(conversation),
+            retrieval_text=f"segment-{segment_id}",
+            segment_index=segment_index,
+        ),
+        raw_text=raw_text or f"canonical-{conversation}",
+        vector=tuple(vector),
     )
 
 
 class FakeCollection:
     def __init__(
         self,
-        results: list[SearchResult] | Callable[[int], list[SearchResult]],
+        results: list[_FixtureResult] | Callable[[int], list[_FixtureResult]],
     ) -> None:
         self.results = results
         self.calls: list[tuple[str, list[list[float]], int]] = []
+        self.hydration_calls: list[list[SearchResult]] = []
 
     def hybrid_search(
         self, query: str, vector: list[list[float]], top_k: int
     ) -> list[SearchResult]:
         self.calls.append((query, vector, top_k))
         if callable(self.results):
-            return list(self.results(top_k))
-        return list(self.results[:top_k])
+            return [item.search for item in self.results(top_k)]
+        return [item.search for item in self.results[:top_k]]
+
+    def hydrate_mmr_head(
+        self,
+        candidates: Sequence[SearchResult],
+    ) -> list[HydratedSearchResult]:
+        self.hydration_calls.append(list(candidates))
+        fixtures = self.results(160) if callable(self.results) else self.results
+        by_id = {item.search.object_id: item for item in fixtures}
+        return [
+            HydratedSearchResult(
+                object_id=candidate.object_id,
+                canonical_id=candidate.canonical_id,
+                diversity_vector=by_id[candidate.object_id].vector,
+                raw_text=by_id[candidate.object_id].raw_text,
+                segment_index=candidate.segment_index,
+            )
+            for candidate in candidates
+        ]
 
 
 class FakeReranker:
@@ -187,7 +215,12 @@ def test_knowledge_runs_bge_then_adaptive_k_then_bounded_mmr() -> None:
         }
     ]
     assert len(results) == 2
-    assert all("normalized_rerank_score" in item for item in results)
+    assert results == [
+        {"object_id": _uuid(1), "raw_text": "first", "rerank_score": 3.0},
+        {"object_id": _uuid(2), "raw_text": "second", "rerank_score": 2.9},
+    ]
+    assert len(collection.hydration_calls) == 1
+    assert len(collection.hydration_calls[0]) == 3
 
 
 def test_adaptive_k_uses_exact_decision_window_and_can_return_zero() -> None:
@@ -236,8 +269,7 @@ def test_mmr_uses_normalized_bge_relevance_and_exact_two_k_head() -> None:
     selected = _mmr(eligible, 2, config)
     assert [item["object_id"] for item in selected] == [_uuid(1), _uuid(3)]
     assert _uuid(5) not in {item["object_id"] for item in selected}
-    assert selected[0]["normalized_rerank_score"] == 1.0
-    assert selected[1]["normalized_rerank_score"] == pytest.approx(1 / 3)
+    assert all("normalized_rerank_score" not in item for item in selected)
 
 
 def test_mmr_lambda_is_independently_configured_per_collection() -> None:
@@ -272,6 +304,8 @@ def test_conversation_overfetches_unique_identities_and_runs_bge_once() -> None:
     assert reranker.calls[0]["top_n"] == 160
     assert len(set(item["object_id"] for item in results)) == len(results)
     assert len(results) <= CONVERSATION_SEARCH.final_count
+    assert len(collection.hydration_calls) == 1
+    assert len(collection.hydration_calls[0]) <= 2 * CONVERSATION_SEARCH.final_count
 
 
 def test_conversation_collapses_segments_by_highest_bge_and_keeps_canonical_text() -> None:
@@ -289,23 +323,24 @@ def test_conversation_collapses_segments_by_highest_bge_and_keeps_canonical_text
     )
     assert len(results) == 1
     assert results[0]["object_id"] == conversation_id
-    assert results[0]["segment_id"] == _uuid(2)
     assert results[0]["raw_text"] == "Question: Q\n\nAnswer: A"
 
 
-def test_conversation_rejects_inconsistent_canonical_gte_vectors() -> None:
+def test_conversation_defers_integrity_checks_to_winning_head_representative() -> None:
     hits = [
         _conversation_segment(1, 10, 0, vector=(1.0, 0.0)),
         _conversation_segment(2, 10, 1, vector=(0.0, 1.0)),
     ]
-    with pytest.raises(ValueError, match="disagree"):
-        retrieve(
-            FakeCollection(hits),
-            "question",
-            [[1.0]],
-            "conversations",
-            runtime=_runtime(FakeReranker()),
-        )
+    collection = FakeCollection(hits)
+    results = retrieve(
+        collection,
+        "question",
+        [[1.0]],
+        "conversations",
+        runtime=_runtime(FakeReranker()),
+    )
+    assert results == [{"object_id": _uuid(10), "raw_text": "canonical-10"}]
+    assert [item.object_id for item in collection.hydration_calls[0]] == [_uuid(1)]
 
 
 def test_policy_context_budget_keeps_only_complete_mmr_results() -> None:
@@ -329,14 +364,16 @@ def test_policy_context_budget_keeps_only_complete_mmr_results() -> None:
 
 
 def test_relevance_floor_can_produce_no_context() -> None:
+    collection = FakeCollection([_chunk(1, "text", [1.0], 0.8)])
     results = retrieve(
-        FakeCollection([_chunk(1, "text", [1.0], 0.8)]),
+        collection,
         "query",
         [[1.0]],
         "policy",
         runtime=_runtime(FakeReranker([RerankResult(0, -2.0)])),
     )
     assert results == []
+    assert collection.hydration_calls == []
 
 
 @pytest.mark.parametrize("collection_type", ["unknown", "knowledge", ""])

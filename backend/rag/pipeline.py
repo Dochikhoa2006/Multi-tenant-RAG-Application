@@ -45,6 +45,8 @@ def _validated_collection(
         )
     if not callable(getattr(value, "hybrid_search", None)):
         raise TypeError(f"{name} must provide hybrid_search()")
+    if not callable(getattr(value, "hydrate_mmr_head", None)):
+        raise TypeError(f"{name} must provide hydrate_mmr_head()")
     return value
 
 

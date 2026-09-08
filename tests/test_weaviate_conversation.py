@@ -20,6 +20,7 @@ from backend.model_config import (
     HYBRID_SEARCH,
     LATEON_EMBEDDING_DIMENSION,
     LATE_INTERACTION_VECTOR_NAME,
+    MMR_DIVERSITY_VECTOR_DIMENSION,
     MMR_DIVERSITY_VECTOR_NAME,
 )
 from backend.weaviate_client.client import WeaviateManager, _collection_description
@@ -39,6 +40,9 @@ USER_ID = "usr_abc123"
 CONVERSATION_ID = "00000000-0000-0000-0000-000000000001"
 SECOND_CONVERSATION_ID = "00000000-0000-0000-0000-000000000002"
 SEGMENT_ID = str(uuid5(UUID(CONVERSATION_ID), "retrieval-segment:0"))
+SECOND_SEGMENT_ID = str(
+    uuid5(UUID(SECOND_CONVERSATION_ID), "retrieval-segment:0")
+)
 COLLECTION_NAMES = (
     get_collection_name(USER_ID, "conversations"),
     get_collection_name(USER_ID, "knowledge_facts"),
@@ -54,6 +58,33 @@ EXISTING_COLLECTION_SUBSETS = [
 
 def _lateon_row(first: float, second: float = 0.0) -> list[float]:
     return [first, second, *([0.0] * (LATEON_EMBEDDING_DIMENSION - 2))]
+
+
+def _gte_vector(first: float = 1.0) -> list[float]:
+    return [first, *([0.0] * (MMR_DIVERSITY_VECTOR_DIMENSION - 1))]
+
+
+def _hydration_object(
+    *,
+    object_id: object = SEGMENT_ID,
+    user_id: object = USER_ID,
+    conversation_id: object = CONVERSATION_ID,
+    segment_id: object = SEGMENT_ID,
+    segment_index: object = 0,
+    raw_text: object = "content",
+    vector: object | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        uuid=object_id,
+        properties={
+            "user_id": user_id,
+            "conversation_id": conversation_id,
+            "segment_id": segment_id,
+            "segment_index": segment_index,
+            "raw_text": raw_text,
+        },
+        vector={"mmr_diversity": _gte_vector()} if vector is None else vector,
+    )
 
 
 def _property_config(
@@ -979,11 +1010,10 @@ def test_hybrid_search_returns_typed_results_and_expected_query() -> None:
                     "conversation_id": UUID(CONVERSATION_ID),
                     "segment_id": UUID(SEGMENT_ID),
                     "segment_index": 0,
-                    "raw_text": "Question\nAnswer",
                     "segment_text": "Question\nAnswer",
                 },
-                vector={"mmr_diversity": [0.1, 0.2]},
-                metadata=SimpleNamespace(score=0.91),
+                vector=None,
+                metadata=None,
             )
         ]
     )
@@ -996,16 +1026,9 @@ def test_hybrid_search_returns_typed_results_and_expected_query() -> None:
     assert results == [
         SearchResult(
             object_id=SEGMENT_ID,
-            properties={
-                "user_id": USER_ID,
-                "conversation_id": CONVERSATION_ID,
-                "segment_id": SEGMENT_ID,
-                "segment_index": 0,
-                "raw_text": "Question\nAnswer",
-                "segment_text": "Question\nAnswer",
-            },
-            score=0.91,
-            vector=(0.1, 0.2),
+            canonical_id=CONVERSATION_ID,
+            retrieval_text="Question\nAnswer",
+            segment_index=0,
         )
     ]
     kwargs = collection.query.hybrid.call_args.kwargs
@@ -1016,13 +1039,20 @@ def test_hybrid_search_returns_typed_results_and_expected_query() -> None:
     assert kwargs["query_properties"] == ["segment_text"]
     assert kwargs["fusion_type"] is HybridFusion.RELATIVE_SCORE
     assert kwargs["limit"] == 40
-    assert kwargs["include_vector"] == ["mmr_diversity"]
+    assert kwargs["include_vector"] is False
     assert kwargs["target_vector"] == "late_interaction"
     assert "diversity_selection" not in kwargs
     assert CONVERSATION_SEARCH.candidate_count == 40
     assert CONVERSATION_SEARCH.final_count == 5
     assert CONVERSATION_SEARCH.mmr_lambda == 0.70
-    assert kwargs["return_metadata"].score is True
+    assert "return_metadata" not in kwargs
+    assert kwargs["return_properties"] == [
+        "user_id",
+        "conversation_id",
+        "segment_id",
+        "segment_index",
+        "segment_text",
+    ]
 
 
 def test_sdk_errors_are_not_swallowed() -> None:
@@ -1142,9 +1172,9 @@ def test_search_query_validation_prevents_sdk_call(
     collection.query.hybrid.assert_not_called()
 
 
-def test_search_requires_requested_mmr_diversity_vector() -> None:
+def test_conversation_hydration_fetches_canonical_text_and_vector_together() -> None:
     manager, _, collection = _manager_and_collection()
-    collection.query.hybrid.return_value = SimpleNamespace(
+    collection.query.fetch_objects_by_ids.return_value = SimpleNamespace(
         objects=[
             SimpleNamespace(
                 uuid=UUID(SEGMENT_ID),
@@ -1154,23 +1184,44 @@ def test_search_requires_requested_mmr_diversity_vector() -> None:
                     "segment_id": SEGMENT_ID,
                     "segment_index": 0,
                     "raw_text": "content",
-                    "segment_text": "content",
                 },
-                vector={"unexpected": [float("nan")]},
-                metadata=SimpleNamespace(score=0.8),
+                vector={"mmr_diversity": _gte_vector()},
             )
         ]
     )
     conversations = ConversationCollection(manager, USER_ID)
+    candidate = SearchResult(SEGMENT_ID, CONVERSATION_ID, "segment", 0)
 
-    with pytest.raises(WeaviateResponseError, match="MMR-diversity"):
-        conversations.hybrid_search("query", [_lateon_row(0.1)], 40)
+    hydrated = conversations.hydrate_mmr_head([candidate])
+
+    assert hydrated[0].raw_text == "content"
+    assert len(hydrated[0].diversity_vector) == 768
+    assert collection.query.fetch_objects_by_ids.call_count == 1
+    kwargs = collection.query.fetch_objects_by_ids.call_args.kwargs
+    assert kwargs["include_vector"] == ["mmr_diversity"]
+    assert kwargs["return_properties"] == [
+        "user_id",
+        "conversation_id",
+        "segment_id",
+        "segment_index",
+        "raw_text",
+    ]
 
 
-@pytest.mark.parametrize("bad_score", [None, float("nan"), float("inf"), "bad"])
-def test_missing_or_malformed_response_scores_are_rejected(bad_score: object) -> None:
+@pytest.mark.parametrize(
+    ("vector", "match"),
+    [
+        ({"unexpected": _gte_vector()}, "MMR-diversity"),
+        ({"mmr_diversity": [float("nan")] * 768}, "malformed"),
+        ({"mmr_diversity": [1.0]}, "768 dimensions"),
+    ],
+)
+def test_missing_or_malformed_hydration_vectors_are_rejected(
+    vector: object,
+    match: str,
+) -> None:
     manager, _, collection = _manager_and_collection()
-    collection.query.hybrid.return_value = SimpleNamespace(
+    collection.query.fetch_objects_by_ids.return_value = SimpleNamespace(
         objects=[
             SimpleNamespace(
                 uuid=UUID(SEGMENT_ID),
@@ -1180,17 +1231,97 @@ def test_missing_or_malformed_response_scores_are_rejected(bad_score: object) ->
                     "segment_id": SEGMENT_ID,
                     "segment_index": 0,
                     "raw_text": "content",
-                    "segment_text": "content",
                 },
-                vector={"mmr_diversity": [0.1]},
-                metadata=SimpleNamespace(score=bad_score),
+                vector=vector,
             )
         ]
     )
     conversations = ConversationCollection(manager, USER_ID)
 
-    with pytest.raises(WeaviateResponseError, match="score"):
-        conversations.hybrid_search("query", [_lateon_row(0.1)], 40)
+    with pytest.raises(WeaviateResponseError, match=match):
+        conversations.hydrate_mmr_head(
+            [SearchResult(SEGMENT_ID, CONVERSATION_ID, "segment", 0)]
+        )
+
+
+@pytest.mark.parametrize(
+    ("objects", "error_type", "match"),
+    [
+        ([], WeaviateResponseError, "incomplete"),
+        (
+            [_hydration_object(), _hydration_object()],
+            WeaviateResponseError,
+            "duplicate",
+        ),
+        (
+            [
+                _hydration_object(
+                    object_id=SECOND_SEGMENT_ID,
+                    conversation_id=SECOND_CONVERSATION_ID,
+                    segment_id=SECOND_SEGMENT_ID,
+                )
+            ],
+            WeaviateResponseError,
+            "unexpected",
+        ),
+        (
+            [_hydration_object(user_id="usr_other")],
+            UserIsolationError,
+            "user_id",
+        ),
+        (
+            [_hydration_object(object_id="not-a-uuid")],
+            WeaviateResponseError,
+            "invalid object UUID",
+        ),
+        (
+            [_hydration_object(segment_id=SECOND_SEGMENT_ID)],
+            WeaviateResponseError,
+            "segment_id",
+        ),
+        (
+            [_hydration_object(conversation_id=SECOND_CONVERSATION_ID)],
+            WeaviateResponseError,
+            "canonical UUID",
+        ),
+        (
+            [_hydration_object(segment_index=1)],
+            WeaviateResponseError,
+            "segment_index",
+        ),
+        (
+            [_hydration_object(raw_text="")],
+            WeaviateResponseError,
+            "canonical text",
+        ),
+        (
+            [
+                SimpleNamespace(
+                    uuid=UUID(SEGMENT_ID),
+                    properties=None,
+                    vector={"mmr_diversity": _gte_vector()},
+                )
+            ],
+            WeaviateResponseError,
+            "properties",
+        ),
+    ],
+)
+def test_conversation_hydration_rejects_incomplete_or_corrupt_results(
+    objects: list[object],
+    error_type: type[Exception],
+    match: str,
+) -> None:
+    manager, _, collection = _manager_and_collection()
+    collection.query.fetch_objects_by_ids.return_value = SimpleNamespace(
+        objects=objects
+    )
+    conversations = ConversationCollection(manager, USER_ID)
+
+    with pytest.raises(error_type, match=match):
+        conversations.hydrate_mmr_head(
+            [SearchResult(SEGMENT_ID, CONVERSATION_ID, "segment", 0)]
+        )
 
 
 def test_cross_user_search_result_is_rejected() -> None:

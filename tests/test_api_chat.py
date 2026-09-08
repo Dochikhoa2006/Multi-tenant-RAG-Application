@@ -20,7 +20,11 @@ from backend.model_config import LATEON_EMBEDDING_DIMENSION
 from backend.rag.pipeline import UserRetrievalCollections
 from backend.rag.runtime import RAGRuntime, RerankResult
 from backend.services import AppServices
-from backend.weaviate_client.models import DeletionReport, SearchResult
+from backend.weaviate_client.models import (
+    DeletionReport,
+    HydratedSearchResult,
+    SearchResult,
+)
 
 
 USER_ID = "usr_api"
@@ -66,28 +70,31 @@ class FakeCollection:
     ) -> list[SearchResult]:
         self.calls.append((query_text, [list(row) for row in query_vector], top_k))
         object_id = str(uuid4())
-        properties: dict[str, object] = {
-            "user_id": self.user_id,
-            "raw_text": self.text,
-        }
-        if self.collection_type == "conversations":
-            properties.update(
-                {
-                    "segment_id": object_id,
-                    "conversation_id": str(uuid4()),
-                    "segment_index": 0,
-                    "segment_text": self.text,
-                }
-            )
-        else:
-            properties["chunk_id"] = object_id
+        canonical_id = (
+            str(uuid4()) if self.collection_type == "conversations" else object_id
+        )
         return [
             SearchResult(
                 object_id=object_id,
-                properties=properties,
-                vector=(1.0, 0.0),
-                score=0.9,
+                canonical_id=canonical_id,
+                retrieval_text=self.text,
+                segment_index=0 if self.collection_type == "conversations" else None,
             )
+        ]
+
+    def hydrate_mmr_head(
+        self,
+        candidates: Sequence[SearchResult],
+    ) -> list[HydratedSearchResult]:
+        return [
+            HydratedSearchResult(
+                candidate.object_id,
+                candidate.canonical_id,
+                (1.0, 0.0),
+                self.text,
+                candidate.segment_index,
+            )
+            for candidate in candidates
         ]
 
 

@@ -155,6 +155,25 @@ token guards run after MMR. Adaptive-K measures adjacent gaps after applying a
 window-independent sigmoid to each raw BGE logit; only MMR performs head-local
 min-max normalization.
 
+Initial hybrid responses project only the identity and text needed for BGE;
+they do not return `mmr_diversity`. After Adaptive-K fixes the bounded MMR head,
+the application performs one application-level `fetch_objects_by_ids()` call
+for that nonempty head and restores the persisted GTE vectors in BGE order. The
+implementation does not assume how the pinned SDK maps that call to transport
+RPCs. Knowledge/Policy lifecycle-only IDs remain stored but are not transferred
+during retrieval.
+Conversation canonical text is fetched with the vector only for representative
+head segments, avoiding one full Q+A copy per first-stage segment hit.
+
+This deferred Conversation hydration deliberately narrows one defensive check.
+Canonical text and GTE-vector integrity are verified for every representative
+conversation capable of reaching final context, but not across sibling segments
+eliminated during BGE collapse. Thus valid-data ranking and context are
+unchanged, while corruption isolated to an eliminated sibling may no longer
+fail that request. User ownership, object/business UUID correspondence, winning
+segment identity, vector shape, and consumed canonical-text validation remain
+fail-closed.
+
 **Top-K Configuration:**
 
 | Collection | Hybrid candidate ceiling | Unified ranking | Final maximum |
