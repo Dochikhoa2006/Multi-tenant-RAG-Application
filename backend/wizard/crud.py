@@ -4,6 +4,12 @@ from __future__ import annotations
 
 from uuid import UUID
 
+from backend.wizard.diagnostics import (
+    add_count,
+    observe_stage,
+    set_flag,
+    set_sample,
+)
 from backend.wizard.errors import WizardDeleteError, WizardDeleteRecoveryError
 from backend.wizard.runtime import WizardRuntime, resolve_runtime
 
@@ -71,6 +77,7 @@ def delete_wizard(
     process-local maps, so process-crash atomicity is not claimed.
     """
 
+    set_flag("save_delete_executed", True)
     active_runtime = resolve_runtime(runtime)
     document_map = active_runtime.document_map(user_id, collection_type)
     paragraph_map = active_runtime.paragraph_map(user_id, collection_type)
@@ -79,25 +86,45 @@ def delete_wizard(
     paragraph_data = document_map.get_paragraph_data(document_id)
     chunk_mappings = paragraph_map.get_document_chunks(document_id)
     collection = active_runtime.collection(user_id, collection_type)
-    snapshots = collection.snapshot_by_document(document_id)
+    with observe_stage("delete.recovery_snapshot"):
+        snapshots = collection.snapshot_by_document(document_id)
+    add_count("recovery_snapshot_chunk_count", len(snapshots))
+    set_sample(
+        "delete_snapshot_chunk_ids",
+        [record.chunk_id for record in snapshots],
+        exact_count=len(snapshots),
+    )
     failed_stage = "storage_delete"
     try:
-        collection.delete_by_document(document_id)
+        with observe_stage("delete.storage_delete"):
+            deletion = collection.delete_by_document(document_id)
+        add_count("weaviate_deleted_match_count", deletion.matched)
+        add_count("weaviate_deleted_success_count", deletion.successful)
+        set_sample(
+            "deleted_chunk_ids",
+            deletion.deleted_ids,
+            exact_count=deletion.successful,
+        )
         failed_stage = "mapping_commit"
-        paragraph_map.delete_document(document_id)
-        document_map.delete_document(document_id)
+        with observe_stage("delete.paragraph_map_remove"):
+            paragraph_map.delete_document(document_id)
+        with observe_stage("delete.document_map_remove"):
+            document_map.delete_document(document_id)
     except Exception as exc:
         recovery_errors: list[BaseException] = []
         try:
-            collection.restore_chunks(snapshots)
+            with observe_stage("compensation.chunk_restore"):
+                collection.restore_chunks(snapshots)
         except Exception as recovery_exc:
             recovery_errors.append(recovery_exc)
         try:
-            paragraph_map.replace_document(document_id, chunk_mappings)
+            with observe_stage("compensation.paragraph_map_restore"):
+                paragraph_map.replace_document(document_id, chunk_mappings)
         except Exception as recovery_exc:
             recovery_errors.append(recovery_exc)
         try:
-            document_map.restore_document(document_id, paragraph_data)
+            with observe_stage("compensation.document_map_restore"):
+                document_map.restore_document(document_id, paragraph_data)
         except Exception as recovery_exc:
             recovery_errors.append(recovery_exc)
         affected = [record.chunk_id for record in snapshots]

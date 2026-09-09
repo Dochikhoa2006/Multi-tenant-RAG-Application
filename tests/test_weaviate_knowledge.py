@@ -21,6 +21,12 @@ from backend.weaviate_client.models import (
     WeaviateResponseError,
 )
 from backend.weaviate_client.policy import PolicyCollection
+from backend.wizard.diagnostics import (
+    DiagnosticTraceRegistry,
+    activate_operation,
+    install_registry,
+    uninstall_registry,
+)
 
 
 USER_ID = "usr_abc123"
@@ -125,6 +131,47 @@ def test_delete_by_document_uses_document_filter() -> None:
     where = collection.data.delete_many.call_args_list[0].kwargs["where"]
     assert where.target == "document_id"
     assert where.value == DOCUMENT_ID
+
+
+def test_traced_verified_delete_keeps_the_same_two_calls_and_arguments() -> None:
+    manager, _, collection = _manager_and_collection()
+    _successful_delete(collection, (CHUNK_ID,))
+    knowledge = KnowledgeCollection(manager, USER_ID)
+    registry = DiagnosticTraceRegistry(USER_ID)
+    session_id = "30000000-0000-0000-0000-000000000001"
+    operation_id = "30000000-0000-0000-0000-000000000002"
+    registry.start(USER_ID, session_id, "run-1")
+    handle = registry.begin_operation(
+        user_id=USER_ID,
+        session_id=session_id,
+        operation_id=operation_id,
+        kind="delete",
+        collection_type="knowledge_facts",
+        wizard_id=DOCUMENT_ID,
+    )
+    assert handle is not None
+    install_registry(registry)
+    try:
+        with activate_operation(handle):
+            knowledge.delete_by_document(DOCUMENT_ID)
+    finally:
+        uninstall_registry(registry)
+
+    assert collection.data.delete_many.call_count == 2
+    actual_call, verification_call = collection.data.delete_many.call_args_list
+    assert actual_call.kwargs == {
+        "where": actual_call.kwargs["where"],
+        "verbose": True,
+    }
+    assert verification_call.kwargs == {
+        "where": verification_call.kwargs["where"],
+        "verbose": True,
+        "dry_run": True,
+    }
+    assert actual_call.kwargs["where"] is verification_call.kwargs["where"]
+    operation = registry.snapshot(USER_ID, session_id, operation_id)["operations"][0]
+    assert operation["stages"]["weaviate.delete_mutation"]["call_count"] == 1
+    assert operation["stages"]["weaviate.delete_verification"]["call_count"] == 1
 
 
 def test_delete_by_paragraphs_is_scoped_to_document() -> None:

@@ -112,11 +112,27 @@ _COLLECTION_TYPE_SUFFIXES = {
 USER_ID_PATTERN = _required_string("USER_ID_PATTERN", r"^[A-Za-z0-9_-]+$")
 TEXT_FILE_ENCODING = _required_string("TEXT_FILE_ENCODING", "utf-8-sig")
 TEXT_FILE_JOIN_SEPARATOR = _raw_string("TEXT_FILE_JOIN_SEPARATOR", "\n\n")
+WIZARD_DIAGNOSTICS_ENABLED = _boolean("WIZARD_DIAGNOSTICS_ENABLED", False)
+RAG_DIAGNOSTIC_USER_ID = _raw_string("RAG_DIAGNOSTIC_USER_ID", "")
 
 try:
     _USER_ID_PATTERN = re.compile(USER_ID_PATTERN)
 except re.error as exc:
     raise ValueError("USER_ID_PATTERN must be a valid regular expression") from exc
+
+if WIZARD_DIAGNOSTICS_ENABLED:
+    if not RAG_DIAGNOSTIC_USER_ID:
+        raise ValueError(
+            "RAG_DIAGNOSTIC_USER_ID is required when Wizard diagnostics are enabled"
+        )
+    if RAG_DIAGNOSTIC_USER_ID != RAG_DIAGNOSTIC_USER_ID.strip():
+        raise ValueError(
+            "RAG_DIAGNOSTIC_USER_ID must not contain leading or trailing whitespace"
+        )
+    if _USER_ID_PATTERN.fullmatch(RAG_DIAGNOSTIC_USER_ID) is None:
+        raise ValueError(
+            "RAG_DIAGNOSTIC_USER_ID does not match configured USER_ID_PATTERN"
+        )
 
 
 def get_collection_name(user_id: str, collection_type: str) -> str:

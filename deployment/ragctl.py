@@ -29,6 +29,9 @@ from backend.api.telemetry import TIMING_KEYS
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = PROJECT_ROOT / ".env"
 STATE_PATH = PROJECT_ROOT / ".local" / "rag-state.json"
+WIZARD_DIAGNOSTICS_PATH = PROJECT_ROOT / ".local" / "diagnostics" / "wizard"
+WIZARD_CORPUS_STATE_PATH = WIZARD_DIAGNOSTICS_PATH / "corpus-state.json"
+WIZARD_CORPUS_LOCK_PATH = WIZARD_DIAGNOSTICS_PATH / "corpus-state.lock"
 COMPOSE_FILE = PROJECT_ROOT / "deployment" / "compose.weaviate-secure.yaml"
 CERT_DIR = PROJECT_ROOT / ".local" / "tailscale-certs"
 CERT_PATH = CERT_DIR / "weaviate.pem"
@@ -94,6 +97,9 @@ REQUIRED_ENV_KEYS = (
     "MODAL_PROXY_TOKEN_ID",
     "MODAL_PROXY_TOKEN_SECRET",
     *MODAL_TARGET_KEYS,
+)
+RUNTIME_DIAGNOSTIC_ENV_KEYS = frozenset(
+    {"WIZARD_DIAGNOSTICS_ENABLED", "RAG_DIAGNOSTIC_USER_ID"}
 )
 
 
@@ -298,7 +304,15 @@ class CommandRunner:
             shown = " ".join(shlex.quote(item) for item in command)
             print(f"→ {redact(shown, self.config)}", flush=True)
         environment = os.environ.copy()
-        environment.update(self.config)
+        for name in RUNTIME_DIAGNOSTIC_ENV_KEYS:
+            environment.pop(name, None)
+        environment.update(
+            {
+                name: value
+                for name, value in self.config.items()
+                if name not in RUNTIME_DIAGNOSTIC_ENV_KEYS
+            }
+        )
         if overrides:
             environment.update(overrides)
         result = subprocess.run(
@@ -820,9 +834,21 @@ def deploy_runtime_secret(secret: Mapping[str, str], runner: CommandRunner) -> N
             path.unlink(missing_ok=True)
 
 
-def deploy_runtime(config: Mapping[str, str], runner: CommandRunner) -> str:
+def deploy_runtime(
+    config: Mapping[str, str],
+    runner: CommandRunner,
+    *,
+    wizard_diagnostic_user_id: str | None = None,
+) -> str:
+    overrides = {"WIZARD_DIAGNOSTICS_ENABLED": "false"}
+    if wizard_diagnostic_user_id is not None:
+        overrides = {
+            "WIZARD_DIAGNOSTICS_ENABLED": "true",
+            "RAG_DIAGNOSTIC_USER_ID": wizard_diagnostic_user_id,
+        }
     runner.run(
         [MODAL, "deploy", PROJECT_ROOT / "deployment" / "modal_runtime.py"],
+        overrides=overrides,
     )
     return resolve_server_url(RUNTIME_APP, RUNTIME_CLASS, config)
 
@@ -964,7 +990,12 @@ def read_runtime_url(config: Mapping[str, str]) -> str:
     raise RagCtlError("No runtime endpoint is known; run ./rag up first")
 
 
-def up(config: Mapping[str, str], runner: CommandRunner) -> None:
+def up(
+    config: Mapping[str, str],
+    runner: CommandRunner,
+    *,
+    wizard_diagnostic_user_id: str | None = None,
+) -> None:
     validate_config(config)
     try:
         print("[1/8] Checking local prerequisites", flush=True)
@@ -994,7 +1025,14 @@ def up(config: Mapping[str, str], runner: CommandRunner) -> None:
 
         print("[6/8] Deploying the singleton CUDA runtime", flush=True)
         runtime_gpu = gpu_request(config, "MODAL_RAG_GPU")
-        runtime_url = deploy_runtime(config, runner)
+        if wizard_diagnostic_user_id is None:
+            runtime_url = deploy_runtime(config, runner)
+        else:
+            runtime_url = deploy_runtime(
+                config,
+                runner,
+                wizard_diagnostic_user_id=wizard_diagnostic_user_id,
+            )
 
         print("[7/8] Waiting for authenticated runtime readiness", flush=True)
         validate_runtime(runtime_url, config, runner, runtime_gpu)
@@ -1082,6 +1120,223 @@ def down(
     if volume.returncode != 0:
         raise RagCtlError("Persistent Weaviate volume is missing after shutdown")
     print("RAG is off; Modal Volumes, secrets, and Weaviate data are preserved.")
+
+
+def diagnose_wizard(
+    config: Mapping[str, str],
+    runner: CommandRunner,
+    fixtures_path: Path,
+    *,
+    reseed_corpus: bool = False,
+) -> None:
+    """Exercise the real Wizard API and retain its verified retrieval corpus."""
+
+    validate_config(config)
+    from deployment.wizard_diagnostic import (
+        OperationRecorder,
+        corpus_state_lock,
+        create_diagnostic_run,
+        load_corpus_state,
+        preflight_wizard_fixtures,
+        update_run_summary,
+        validate_corpus_preflight,
+        validate_diagnostic_user,
+    )
+    from deployment.wizard_diagnostic_api import run_wizard_phase_1c
+
+    diagnostic_user_id, other_user_id = validate_diagnostic_user(config)
+    fixtures = preflight_wizard_fixtures(fixtures_path, PROJECT_ROOT, config)
+    with corpus_state_lock(WIZARD_CORPUS_LOCK_PATH):
+        corpus_state = load_corpus_state(
+            WIZARD_CORPUS_STATE_PATH, diagnostic_user_id
+        )
+        validate_corpus_preflight(
+            corpus_state,
+            fixtures,
+            reseed=reseed_corpus,
+        )
+        run = create_diagnostic_run(
+            WIZARD_DIAGNOSTICS_PATH,
+            diagnostic_user_id,
+            fixtures,
+        )
+        recorder = OperationRecorder(run.operations_path)
+        progress = {
+            "scratch_status": "pending",
+            "corpus_action": "pending",
+            "telemetry_status": "pending",
+            "security_status": "pending",
+            "trace_deleted": False,
+        }
+        print(f"Wizard diagnostic run: {run.run_id}", flush=True)
+        print(f"Artifacts: {run.directory}", flush=True)
+
+        try:
+            down(config, runner)
+        except KeyboardInterrupt:
+            update_run_summary(
+                run,
+                status="interrupted",
+                pre_down_status="interrupted",
+                up_status="not_started",
+                down_status="not_started",
+                failure_stage="pre_down",
+                finished=True,
+                operations_count=recorder.count,
+                operation_totals=recorder.totals,
+                **progress,
+            )
+            raise
+        except BaseException:
+            update_run_summary(
+                run,
+                status="failed",
+                pre_down_status="failed",
+                up_status="not_started",
+                down_status="not_started",
+                failure_stage="pre_down",
+                finished=True,
+                operations_count=recorder.count,
+                operation_totals=recorder.totals,
+                **progress,
+            )
+            raise
+
+        update_run_summary(
+            run,
+            status="running",
+            pre_down_status="succeeded",
+            up_status="pending",
+            down_status="pending",
+            operations_count=recorder.count,
+            operation_totals=recorder.totals,
+            **progress,
+        )
+        try:
+            up(
+                config,
+                runner,
+                wizard_diagnostic_user_id=diagnostic_user_id,
+            )
+        except KeyboardInterrupt:
+            update_run_summary(
+                run,
+                status="interrupted",
+                pre_down_status="succeeded",
+                up_status="interrupted",
+                down_status="managed_by_up_failure_cleanup",
+                failure_stage="up",
+                finished=True,
+                operations_count=recorder.count,
+                operation_totals=recorder.totals,
+                **progress,
+            )
+            raise
+        except BaseException:
+            update_run_summary(
+                run,
+                status="failed",
+                pre_down_status="succeeded",
+                up_status="failed",
+                down_status="managed_by_up_failure_cleanup",
+                failure_stage="up",
+                finished=True,
+                operations_count=recorder.count,
+                operation_totals=recorder.totals,
+                **progress,
+            )
+            raise
+
+        phase_error: BaseException | None = None
+        try:
+            update_run_summary(
+                run,
+                status="running",
+                pre_down_status="succeeded",
+                up_status="succeeded",
+                down_status="pending",
+                operations_count=recorder.count,
+                operation_totals=recorder.totals,
+                **progress,
+            )
+            run_wizard_phase_1c(
+                read_runtime_url(config),
+                _runtime_headers(config),
+                config,
+                fixtures,
+                WIZARD_CORPUS_STATE_PATH,
+                corpus_state,
+                diagnostic_user_id,
+                other_user_id,
+                run.run_id,
+                reseed_corpus,
+                recorder,
+                progress,
+            )
+        except BaseException as exc:
+            phase_error = exc
+
+        try:
+            down(config, runner)
+        except BaseException as down_error:
+            if phase_error is not None:
+                down_error.add_note(
+                    "Phase 1C also failed before shutdown: " + repr(phase_error)
+                )
+            interrupted = isinstance(down_error, KeyboardInterrupt)
+            update_run_summary(
+                run,
+                status="interrupted" if interrupted else "failed",
+                pre_down_status="succeeded",
+                up_status="succeeded",
+                down_status="interrupted" if interrupted else "failed",
+                failure_stage="down",
+                finished=True,
+                operations_count=recorder.count,
+                operation_totals=recorder.totals,
+                **progress,
+            )
+            raise
+
+        if phase_error is not None:
+            interrupted = isinstance(phase_error, KeyboardInterrupt)
+            failure_stage = (
+                "scratch"
+                if progress["scratch_status"] != "passed"
+                else "corpus"
+                if progress["corpus_action"] == "failed"
+                else "diagnostic"
+            )
+            update_run_summary(
+                run,
+                status="interrupted" if interrupted else "failed",
+                pre_down_status="succeeded",
+                up_status="succeeded",
+                down_status="succeeded",
+                failure_stage=failure_stage,
+                finished=True,
+                operations_count=recorder.count,
+                operation_totals=recorder.totals,
+                **progress,
+            )
+            raise phase_error
+
+        update_run_summary(
+            run,
+            status="succeeded",
+            pre_down_status="succeeded",
+            up_status="succeeded",
+            down_status="succeeded",
+            finished=True,
+            operations_count=recorder.count,
+            operation_totals=recorder.totals,
+            **progress,
+        )
+        print(
+            "Wizard diagnostic Phase 1C completed; "
+            f"corpus {progress['corpus_action']}.",
+            flush=True,
+        )
 
 
 def iter_sse(lines: Iterable[str]) -> Iterator[tuple[str, object]]:
@@ -1326,6 +1581,26 @@ def parser() -> argparse.ArgumentParser:
     )
     commands.add_parser("status", help="show redacted service status")
     commands.add_parser("down", help="stop all application services and preserve data")
+    diagnose_parser = commands.add_parser(
+        "diagnose", help="run a diagnostic against the real deployment"
+    )
+    diagnostics = diagnose_parser.add_subparsers(
+        dest="diagnostic", required=True
+    )
+    wizard_parser = diagnostics.add_parser(
+        "wizard", help="validate wizard diagnostic inputs and lifecycle"
+    )
+    wizard_parser.add_argument(
+        "--fixtures",
+        type=Path,
+        required=True,
+        help="fixture root containing knowledge/ and policy/",
+    )
+    wizard_parser.add_argument(
+        "--reseed-corpus",
+        action="store_true",
+        help="replace the recorded corpus before retiring its old documents",
+    )
     return cli
 
 
@@ -1348,12 +1623,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             status(config, runner)
         elif args.command == "down":
             down(config, runner)
+        elif args.command == "diagnose" and args.diagnostic == "wizard":
+            diagnose_wizard(
+                config,
+                runner,
+                args.fixtures,
+                reseed_corpus=args.reseed_corpus,
+            )
         else:  # pragma: no cover - argparse owns this invariant
             raise RagCtlError(f"Unknown command: {args.command}")
     except KeyboardInterrupt:
         print("Interrupted.", file=sys.stderr)
         return 130
-    except (RagCtlError, httpx.HTTPError, OSError, ValueError, KeyError) as exc:
+    except (
+        RagCtlError,
+        httpx.HTTPError,
+        OSError,
+        ValueError,
+        KeyError,
+    ) as exc:
         print("ERROR: " + redact(exc, config), file=sys.stderr)
         return 1
     return 0

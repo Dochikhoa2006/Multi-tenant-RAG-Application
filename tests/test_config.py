@@ -231,6 +231,45 @@ def test_upload_and_cors_configuration_rejects_invalid_combinations(
     assert result.returncode != 0
 
 
+def test_wizard_diagnostics_configuration_is_default_off() -> None:
+    result = _run_python(
+        """
+from backend.config import RAG_DIAGNOSTIC_USER_ID, WIZARD_DIAGNOSTICS_ENABLED
+assert WIZARD_DIAGNOSTICS_ENABLED is False
+assert RAG_DIAGNOSTIC_USER_ID == ''
+""",
+        overrides={
+            "WIZARD_DIAGNOSTICS_ENABLED": "false",
+            "RAG_DIAGNOSTIC_USER_ID": "",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_enabled_wizard_diagnostics_require_the_configured_user_contract() -> None:
+    valid = _run_python(
+        """
+from backend.config import RAG_DIAGNOSTIC_USER_ID, WIZARD_DIAGNOSTICS_ENABLED
+assert WIZARD_DIAGNOSTICS_ENABLED is True
+assert RAG_DIAGNOSTIC_USER_ID == 'wizard_diagnostic'
+""",
+        overrides={
+            "WIZARD_DIAGNOSTICS_ENABLED": "true",
+            "RAG_DIAGNOSTIC_USER_ID": "wizard_diagnostic",
+        },
+    )
+    assert valid.returncode == 0, valid.stderr
+    for user_id in ("", " padded ", "invalid/user"):
+        invalid = _run_python(
+            "import backend.config",
+            overrides={
+                "WIZARD_DIAGNOSTICS_ENABLED": "true",
+                "RAG_DIAGNOSTIC_USER_ID": user_id,
+            },
+        )
+        assert invalid.returncode != 0
+
+
 @pytest.mark.parametrize(
     "overrides",
     [

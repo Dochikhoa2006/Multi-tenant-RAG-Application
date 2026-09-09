@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from backend.main import create_app
+from backend import runtime_app as runtime_app_module
 from backend.providers.granite_query_rewriter import RoleRoutingLLMClient
 from backend.runtime_app import RuntimeDependencyError, create_runtime_app
 from backend.services import AppServices
@@ -256,6 +257,45 @@ def test_runtime_composes_singletons_and_closes_owned_resources_in_order() -> No
         "processing.cleanup",
         "manager.disconnect",
     ]
+
+
+def test_runtime_mounts_diagnostic_routes_only_when_explicitly_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.wizard.diagnostics import uninstall_registry
+
+    def paths(application: object) -> list[str]:
+        found: list[str] = []
+
+        def visit(routes: object) -> None:
+            for route in routes:  # type: ignore[union-attr]
+                path = getattr(route, "path", None)
+                if isinstance(path, str):
+                    found.append(path)
+                nested = getattr(
+                    getattr(route, "original_router", None), "routes", None
+                )
+                if nested is not None:
+                    visit(nested)
+
+        visit(application.routes)  # type: ignore[union-attr]
+        return found
+
+    ordinary, _, _ = _application([])
+    hidden_path = "/api/_diagnostics/wizard/trace"
+    assert hidden_path not in paths(ordinary)
+    assert hidden_path not in paths(create_app())
+
+    monkeypatch.setattr(runtime_app_module, "WIZARD_DIAGNOSTICS_ENABLED", True)
+    monkeypatch.setattr(
+        runtime_app_module, "RAG_DIAGNOSTIC_USER_ID", "wizard_diagnostic"
+    )
+    diagnostic, _, _ = _application([])
+    try:
+        assert paths(diagnostic).count(hidden_path) == 3
+        assert hidden_path not in diagnostic.openapi()["paths"]
+    finally:
+        uninstall_registry(diagnostic.state.wizard_diagnostic_registry)
 
 
 def test_default_model_discovery_uses_expected_urls_and_bearer_tokens() -> None:

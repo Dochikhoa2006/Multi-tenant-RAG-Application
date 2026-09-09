@@ -109,10 +109,20 @@ def test_command_runner_verifies_modal_target_and_propagates_environment(
             "MODAL_SGLANG_GPU": "H100",
             "MODAL_SGLANG_COMPUTE_REGION": "eu",
             "MODAL_SGLANG_ROUTING_REGION": "eu-west",
+            "SUPPORTED_FILE_EXTENSIONS": ".note",
+            "TEXT_FILE_ENCODING": "utf-16",
+            "TEXT_FILE_JOIN_SEPARATOR": "--",
+            "UPLOAD_MAX_FILE_BYTES": "1000",
+            "UPLOAD_MAX_TOTAL_BYTES": "2000",
+            "UPLOAD_READ_CHUNK_BYTES": "500",
+            "WIZARD_DIAGNOSTICS_ENABLED": "true",
+            "RAG_DIAGNOSTIC_USER_ID": "wizard_diagnostic",
         }
     )
     events: list[str] = []
     captured_environment: dict[str, str] = {}
+    monkeypatch.setenv("WIZARD_DIAGNOSTICS_ENABLED", "true")
+    monkeypatch.setenv("RAG_DIAGNOSTIC_USER_ID", "ambient_user")
 
     monkeypatch.setattr(
         ragctl,
@@ -133,6 +143,14 @@ def test_command_runner_verifies_modal_target_and_propagates_environment(
     assert captured_environment["MODAL_SGLANG_GPU"] == "H100"
     assert captured_environment["MODAL_SGLANG_COMPUTE_REGION"] == "eu"
     assert captured_environment["MODAL_SGLANG_ROUTING_REGION"] == "eu-west"
+    assert captured_environment["SUPPORTED_FILE_EXTENSIONS"] == ".note"
+    assert captured_environment["TEXT_FILE_ENCODING"] == "utf-16"
+    assert captured_environment["TEXT_FILE_JOIN_SEPARATOR"] == "--"
+    assert captured_environment["UPLOAD_MAX_FILE_BYTES"] == "1000"
+    assert captured_environment["UPLOAD_MAX_TOTAL_BYTES"] == "2000"
+    assert captured_environment["UPLOAD_READ_CHUNK_BYTES"] == "500"
+    assert "WIZARD_DIAGNOSTICS_ENABLED" not in captured_environment
+    assert "RAG_DIAGNOSTIC_USER_ID" not in captured_environment
 
 
 def test_non_modal_command_does_not_run_modal_target_probe(
@@ -317,7 +335,7 @@ def test_config_rejects_unapproved_operational_gpu(value: str) -> None:
         ragctl.validate_config(config)
 
 
-def test_deployments_use_the_existing_subprocess_environment_without_overrides(
+def test_only_runtime_deployment_receives_default_off_diagnostic_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _config()
@@ -335,10 +353,185 @@ def test_deployments_use_the_existing_subprocess_environment_without_overrides(
     ragctl.deploy_qwen(config, runner)  # type: ignore[arg-type]
     ragctl.deploy_runtime(config, runner)  # type: ignore[arg-type]
 
-    assert all("overrides" not in options for options in runner.options)
+    assert all("overrides" not in options for options in runner.options[:2])
+    assert runner.options[2]["overrides"] == {
+        "WIZARD_DIAGNOSTICS_ENABLED": "false"
+    }
     assert ragctl.gpu_request(config, "MODAL_SGLANG_GPU") == "H100"
     assert ragctl.gpu_request(config, "QWEN_MODAL_SGLANG_GPU") == "H100"
     assert ragctl.gpu_request(config, "MODAL_RAG_GPU") == "L40S"
+
+
+def test_diagnostic_runtime_override_is_scoped_to_modal_runtime_deploy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config()
+    runner = FakeRunner(config)
+    monkeypatch.setattr(ragctl, "resolve_server_url", lambda *_: "https://worker")
+
+    ragctl.deploy_runtime(
+        config,
+        runner,  # type: ignore[arg-type]
+        wizard_diagnostic_user_id="wizard_diagnostic",
+    )
+
+    assert runner.options == [
+        {
+            "overrides": {
+                "WIZARD_DIAGNOSTICS_ENABLED": "true",
+                "RAG_DIAGNOSTIC_USER_ID": "wizard_diagnostic",
+            }
+        }
+    ]
+
+
+def _diagnostic_fixture_tree(root: Path) -> Path:
+    fixtures = root / "fixtures"
+    (fixtures / "knowledge").mkdir(parents=True)
+    (fixtures / "policy").mkdir()
+    (fixtures / "knowledge" / "fact.txt").write_text("fact", encoding="utf-8")
+    (fixtures / "policy" / "rule.txt").write_text("rule", encoding="utf-8")
+    return fixtures
+
+
+def _prepare_diagnostic_test(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[dict[str, str], FakeRunner, list[str], Path]:
+    from deployment import wizard_diagnostic_api
+
+    config = _config()
+    config["RAG_DIAGNOSTIC_USER_ID"] = "wizard_diagnostic"
+    runner = FakeRunner(config)
+    events: list[str] = []
+    output = tmp_path / "output"
+    monkeypatch.setattr(ragctl, "WIZARD_DIAGNOSTICS_PATH", output)
+    monkeypatch.setattr(
+        ragctl, "WIZARD_CORPUS_STATE_PATH", output / "corpus-state.json"
+    )
+    monkeypatch.setattr(
+        ragctl, "WIZARD_CORPUS_LOCK_PATH", output / "corpus-state.lock"
+    )
+    monkeypatch.setattr(ragctl, "read_runtime_url", lambda *_: "https://runtime")
+    monkeypatch.setattr(ragctl, "_runtime_headers", lambda *_: {"auth": "hidden"})
+    monkeypatch.setattr(
+        wizard_diagnostic_api,
+        "run_wizard_phase_1c",
+        lambda *_, **__: events.append("diagnostic"),
+    )
+    return config, runner, events, _diagnostic_fixture_tree(tmp_path)
+
+
+def test_diagnostic_lifecycle_is_pre_down_up_diagnostic_down(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config, runner, events, fixtures = _prepare_diagnostic_test(
+        monkeypatch, tmp_path
+    )
+    monkeypatch.setattr(ragctl, "down", lambda *_: events.append("down"))
+    monkeypatch.setattr(ragctl, "up", lambda *_, **__: events.append("up"))
+
+    ragctl.diagnose_wizard(config, runner, fixtures)
+
+    assert events == ["down", "up", "diagnostic", "down"]
+
+
+def test_diagnostic_pre_down_failure_stops_before_startup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config, runner, events, fixtures = _prepare_diagnostic_test(
+        monkeypatch, tmp_path
+    )
+    monkeypatch.setattr(
+        ragctl,
+        "down",
+        lambda *_: (_ for _ in ()).throw(ragctl.RagCtlError("pre-down")),
+    )
+    monkeypatch.setattr(ragctl, "up", lambda *_, **__: events.append("up"))
+
+    with pytest.raises(ragctl.RagCtlError, match="pre-down"):
+        ragctl.diagnose_wizard(config, runner, fixtures)
+
+    assert events == []
+
+
+def test_diagnostic_ingestion_preflight_runs_before_any_lifecycle_command(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config, runner, events, fixtures = _prepare_diagnostic_test(
+        monkeypatch, tmp_path
+    )
+    config["UPLOAD_MAX_FILE_BYTES"] = "0"
+    monkeypatch.setattr(ragctl, "down", lambda *_: events.append("down"))
+    monkeypatch.setattr(ragctl, "up", lambda *_: events.append("up"))
+
+    with pytest.raises(ValueError, match="greater than zero"):
+        ragctl.diagnose_wizard(config, runner, fixtures)
+
+    assert events == []
+
+
+def test_diagnostic_failed_up_does_not_add_duplicate_shutdown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config, runner, events, fixtures = _prepare_diagnostic_test(
+        monkeypatch, tmp_path
+    )
+    monkeypatch.setattr(ragctl, "down", lambda *_: events.append("down"))
+
+    def failed_up(*_: object, **__: object) -> None:
+        events.extend(("up", "up-owned-cleanup"))
+        raise ragctl.RagCtlError("startup")
+
+    monkeypatch.setattr(ragctl, "up", failed_up)
+
+    with pytest.raises(ragctl.RagCtlError, match="startup"):
+        ragctl.diagnose_wizard(config, runner, fixtures)
+
+    assert events == ["down", "up", "up-owned-cleanup"]
+
+
+def test_diagnostic_failure_after_startup_always_runs_final_down(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from deployment import wizard_diagnostic_api
+
+    config, runner, events, fixtures = _prepare_diagnostic_test(
+        monkeypatch, tmp_path
+    )
+    monkeypatch.setattr(ragctl, "down", lambda *_: events.append("down"))
+    monkeypatch.setattr(ragctl, "up", lambda *_, **__: events.append("up"))
+    monkeypatch.setattr(
+        wizard_diagnostic_api,
+        "run_wizard_phase_1c",
+        lambda *_, **__: (_ for _ in ()).throw(ValueError("diagnostic")),
+    )
+
+    with pytest.raises(ValueError, match="diagnostic"):
+        ragctl.diagnose_wizard(config, runner, fixtures)
+
+    assert events == ["down", "up", "down"]
+
+
+def test_diagnostic_interruption_after_startup_always_runs_final_down(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from deployment import wizard_diagnostic_api
+
+    config, runner, events, fixtures = _prepare_diagnostic_test(
+        monkeypatch, tmp_path
+    )
+    monkeypatch.setattr(ragctl, "down", lambda *_: events.append("down"))
+    monkeypatch.setattr(ragctl, "up", lambda *_, **__: events.append("up"))
+    monkeypatch.setattr(
+        wizard_diagnostic_api,
+        "run_wizard_phase_1c",
+        lambda *_, **__: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        ragctl.diagnose_wizard(config, runner, fixtures)
+
+    assert events == ["down", "up", "down"]
 
 
 def test_waiting_progress_is_redacted_and_actionable() -> None:

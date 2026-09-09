@@ -13,6 +13,12 @@ from backend.weaviate_client.models import (
 )
 from backend.wizard.errors import WizardSaveError, WizardSaveRecoveryError
 from backend.wizard.runtime import WizardRuntime
+from backend.wizard.diagnostics import (
+    DiagnosticTraceRegistry,
+    activate_operation,
+    install_registry,
+    uninstall_registry,
+)
 from backend.wizard.save import save_wizard
 
 
@@ -355,6 +361,65 @@ def test_single_modified_paragraph_runs_all_steps_and_commits() -> None:
     assert runtime.paragraph_map(
         USER_ID, "knowledge_facts"
     ).get_document_chunks(DOCUMENT_ID) == {1: [new_chunk_id]}
+
+
+def test_save_trace_does_not_change_pipeline_call_order_or_call_counts() -> None:
+    def execute(*, traced: bool, new_id: str, old_id: str):
+        runtime, _, events = _runtime(new_chunk_ids=[new_id])
+        _seed_document(runtime, {1: "old text"}, {1: [old_id]})
+        registry = DiagnosticTraceRegistry(USER_ID)
+        handle = None
+        if traced:
+            session_id = _uuid(901, prefix=9)
+            registry.start(USER_ID, session_id, "run-1")
+            handle = registry.begin_operation(
+                user_id=USER_ID,
+                session_id=session_id,
+                operation_id=_uuid(902, prefix=9),
+                kind="save",
+                collection_type="knowledge_facts",
+                wizard_id=DOCUMENT_ID,
+            )
+            assert handle is not None
+            install_registry(registry)
+        try:
+            with activate_operation(handle):
+                save_wizard(
+                    USER_ID,
+                    DOCUMENT_ID,
+                    "knowledge_facts",
+                    "new text",
+                    [1],
+                    runtime=runtime,
+                )
+        finally:
+            if traced:
+                uninstall_registry(registry)
+        return events, registry, handle
+
+    off_events, _, _ = execute(
+        traced=False,
+        new_id=_uuid(910),
+        old_id=_uuid(911, prefix=8),
+    )
+    on_events, registry, handle = execute(
+        traced=True,
+        new_id=_uuid(920),
+        old_id=_uuid(921, prefix=8),
+    )
+
+    assert [event[0] for event in on_events] == [
+        event[0] for event in off_events
+    ] == ["delete", "split", "chunk", "encode_documents", "embed_many", "insert"]
+    assert handle is not None
+    operation = registry.snapshot(USER_ID, handle.session_id, handle.operation_id)[
+        "operations"
+    ][0]
+    assert operation["stages"]["save.semantic_split"]["call_count"] == 1
+    assert operation["stages"]["save.chunking"]["call_count"] == 1
+    assert operation["stages"]["save.lateon"]["call_count"] == 1
+    assert operation["stages"]["save.gte"]["call_count"] == 1
+    assert operation["stages"]["save.weaviate_insert"]["call_count"] == 1
 
 
 def test_modified_paragraph_hints_are_optional_and_diff_remains_authoritative() -> None:

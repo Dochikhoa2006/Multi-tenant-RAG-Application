@@ -61,3 +61,34 @@ def test_modal_runtime_takes_weaviate_transport_from_dedicated_secret() -> None:
     assert 'SECRET_NAME = os.getenv("MODAL_RAG_SECRET", "rag-runtime-secrets")' in source
     assert '"WEAVIATE_GRPC_PORT":' not in source
     assert '"WEAVIATE_GRPC_SECURE":' not in source
+
+
+def test_modal_runtime_forwards_common_effective_ingestion_environment() -> None:
+    source = DEPLOYMENT_PATH.read_text(encoding="utf-8")
+
+    for name in (
+        "SUPPORTED_FILE_EXTENSIONS",
+        "TEXT_FILE_ENCODING",
+        "TEXT_FILE_JOIN_SEPARATOR",
+        "UPLOAD_MAX_FILE_BYTES",
+        "UPLOAD_MAX_TOTAL_BYTES",
+        "UPLOAD_READ_CHUNK_BYTES",
+    ):
+        assert source.count(f'"{name}"') >= 2
+    assert '"WIZARD_DIAGNOSTICS_ENABLED", "false"' in source
+    assert 'runtime_environment["RAG_DIAGNOSTIC_USER_ID"]' in source
+    assert "reseed" not in source.lower()
+
+
+def test_modal_runtime_remains_one_application_without_diagnostic_variant() -> None:
+    module = ast.parse(DEPLOYMENT_PATH.read_text(encoding="utf-8"))
+    applications = [
+        node
+        for node in module.body
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and node.value.func.attr == "App"
+    ]
+
+    assert len(applications) == 1

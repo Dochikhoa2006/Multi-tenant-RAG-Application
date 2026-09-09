@@ -152,15 +152,40 @@ class _ChunkCollection(_CollectionBase):
         return inserted_id
 
     def _verified_delete(self, where: Any, scope: str) -> DeletionReport:
-        collection = self._collection
-        deleted = collection.data.delete_many(where=where, verbose=True)
-        matched, successful, failed, deleted_ids = _actual_delete_response(deleted)
-        remaining = collection.data.delete_many(
-            where=where,
-            verbose=True,
-            dry_run=True,
+        # Import lazily to keep the lower-level Weaviate package independent of
+        # backend.wizard package initialization. The module is already loaded
+        # on traced Save/Delete paths, so this does not add pipeline work.
+        from backend.wizard.diagnostics import (
+            add_count,
+            observe_stage,
+            set_flag,
+            set_sample,
         )
+
+        collection = self._collection
+        set_flag("weaviate_mutation_executed", True)
+        with observe_stage("weaviate.delete_mutation"):
+            deleted = collection.data.delete_many(where=where, verbose=True)
+        matched, successful, failed, deleted_ids = _actual_delete_response(deleted)
+        add_count("weaviate_delete_matched_count", matched)
+        add_count("weaviate_delete_successful_count", successful)
+        add_count("weaviate_delete_failed_count", failed)
+        set_sample(
+            "weaviate_deleted_ids", deleted_ids, exact_count=successful
+        )
+        with observe_stage("weaviate.delete_verification"):
+            remaining = collection.data.delete_many(
+                where=where,
+                verbose=True,
+                dry_run=True,
+            )
         remaining_count, remaining_ids = _dry_run_delete_response(remaining)
+        add_count("weaviate_delete_remaining_count", remaining_count)
+        set_sample(
+            "weaviate_delete_remaining_ids",
+            remaining_ids,
+            exact_count=remaining_count,
+        )
         if len(remaining_ids) != remaining_count:
             raise WeaviateResponseError("dry-run delete response is incomplete")
         report = DeletionReport(

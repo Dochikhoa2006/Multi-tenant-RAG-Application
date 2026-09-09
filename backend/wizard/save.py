@@ -11,6 +11,13 @@ from uuid import UUID
 from backend.mappings._common import positive_paragraph_id
 from backend.model_config import LATEON_EMBEDDING_DIMENSION
 from backend.weaviate_client.models import ChunkRecord, PartialParagraphUpdateError
+from backend.wizard.diagnostics import (
+    add_count,
+    observe_stage,
+    set_flag,
+    set_mapping_digest,
+    set_sample,
+)
 from backend.wizard.errors import WizardSaveError, WizardSaveRecoveryError
 from backend.wizard.runtime import WizardRuntime, resolve_runtime
 
@@ -295,7 +302,10 @@ def _batch_vectors(
 ) -> tuple[list[tuple[tuple[float, ...], ...]], list[tuple[float, ...]]]:
     if not texts:
         return [], []
-    raw_multi_vectors = runtime.multi_vectors.encode_documents(texts)
+    with observe_stage("save.lateon"):
+        raw_multi_vectors = runtime.multi_vectors.encode_documents(texts)
+    set_flag("lateon_executed", True)
+    add_count("lateon_document_count", len(texts))
     if isinstance(raw_multi_vectors, (str, bytes)) or not isinstance(
         raw_multi_vectors, Sequence
     ):
@@ -303,13 +313,22 @@ def _batch_vectors(
     if len(raw_multi_vectors) != len(texts):
         raise ValueError("multi-vector provider returned the wrong document count")
     multi_vectors = [_validated_multi_vector(value) for value in raw_multi_vectors]
+    row_counts = [len(value) for value in multi_vectors]
+    add_count("lateon_total_rows", sum(row_counts))
+    add_count("lateon_min_rows", min(row_counts))
+    add_count("lateon_max_rows", max(row_counts))
+    add_count("lateon_dimension", len(multi_vectors[0][0]))
+    set_flag("lateon_values_finite", True)
     multi_dimensions = {
         len(row) for matrix in multi_vectors for row in matrix
     }
     if len(multi_dimensions) != 1:
         raise ValueError("document multi-vectors must have consistent dimensions")
 
-    raw_diversity_vectors = runtime.embedder.embed_many(texts)
+    with observe_stage("save.gte"):
+        raw_diversity_vectors = runtime.embedder.embed_many(texts)
+    set_flag("gte_executed", True)
+    add_count("gte_vector_count", len(texts))
     if isinstance(raw_diversity_vectors, (str, bytes)) or not isinstance(
         raw_diversity_vectors, Sequence
     ):
@@ -322,6 +341,8 @@ def _batch_vectors(
     dimensions = {len(vector) for vector in diversity_vectors}
     if len(dimensions) != 1:
         raise ValueError("embedding vectors must have consistent dimensions")
+    add_count("gte_dimension", len(diversity_vectors[0]))
+    set_flag("gte_values_finite", True)
     return multi_vectors, diversity_vectors
 
 
@@ -347,29 +368,35 @@ def _recover_save(
             for chunk_id in attempted_retained_ids
         }
         try:
-            collection.update_paragraph_ids(old_ids)
-            collection.verify_paragraph_ids(old_ids)
+            with observe_stage("compensation.weaviate_metadata_restore"):
+                collection.update_paragraph_ids(old_ids)
+            with observe_stage("compensation.weaviate_metadata_verify"):
+                collection.verify_paragraph_ids(old_ids)
         except Exception as exc:
             errors.append(exc)
             unresolved_ids.extend(attempted_retained_ids)
     if attempted_insert_ids:
         try:
-            collection.delete_chunks(list(dict.fromkeys(attempted_insert_ids)))
+            with observe_stage("compensation.inserted_chunk_delete"):
+                collection.delete_chunks(list(dict.fromkeys(attempted_insert_ids)))
         except Exception as exc:
             errors.append(exc)
             unresolved_ids.extend(attempted_insert_ids)
     if deleted_snapshots:
         try:
-            collection.restore_chunks(deleted_snapshots)
+            with observe_stage("compensation.chunk_restore"):
+                collection.restore_chunks(deleted_snapshots)
         except Exception as exc:
             errors.append(exc)
             unresolved_ids.extend(record.chunk_id for record in deleted_snapshots)
     try:
-        paragraph_map.replace_document(document_id, old_chunk_mappings)
+        with observe_stage("compensation.paragraph_map_restore"):
+            paragraph_map.replace_document(document_id, old_chunk_mappings)
     except Exception as exc:
         errors.append(exc)
     try:
-        document_map.restore_document(document_id, old_paragraph_data)
+        with observe_stage("compensation.document_map_restore"):
+            document_map.restore_document(document_id, old_paragraph_data)
     except Exception as exc:
         errors.append(exc)
 
@@ -389,30 +416,51 @@ def save_wizard(
 
     if not isinstance(current_text, str):
         raise TypeError("current_text must be a string")
-    active_runtime = resolve_runtime(runtime)
-    document_map = active_runtime.document_map(user_id, collection_type)
-    paragraph_map = active_runtime.paragraph_map(user_id, collection_type)
-    paragraph_data = document_map.get_paragraph_data(document_id)
-    old_paragraphs = _saved_paragraphs(paragraph_data)
-    old_paragraph_ids = {item.paragraph_id for item in old_paragraphs}
-    hinted_ids = _validated_modified_ids(
-        modified_paragraph_ids,
-        old_paragraph_ids,
-    )
-    saved_text = "".join(item.text for item in old_paragraphs)
-    if current_text == saved_text:
-        return
+    set_flag("save_delete_executed", True)
+    with observe_stage("save.diff"):
+        active_runtime = resolve_runtime(runtime)
+        document_map = active_runtime.document_map(user_id, collection_type)
+        paragraph_map = active_runtime.paragraph_map(user_id, collection_type)
+        paragraph_data = document_map.get_paragraph_data(document_id)
+        old_paragraphs = _saved_paragraphs(paragraph_data)
+        old_paragraph_ids = {item.paragraph_id for item in old_paragraphs}
+        hinted_ids = _validated_modified_ids(
+            modified_paragraph_ids,
+            old_paragraph_ids,
+        )
+        saved_text = "".join(item.text for item in old_paragraphs)
+        if current_text == saved_text:
+            set_flag("save_noop", True)
+            return
 
-    # Steps 1-2: identify and align every contiguous modified union before
-    # making the first destructive call.
-    unions = _align_unions(old_paragraphs, current_text, hinted_ids)
-    old_chunks_by_paragraph = paragraph_map.get_document_chunks(document_id)
-    existing_chunk_ids = {
-        chunk_id
-        for chunk_ids in old_chunks_by_paragraph.values()
-        for chunk_id in chunk_ids
-    }
-    collection = active_runtime.collection(user_id, collection_type)
+        # Steps 1-2: identify and align every contiguous modified union before
+        # making the first destructive call.
+        unions = _align_unions(old_paragraphs, current_text, hinted_ids)
+        old_chunks_by_paragraph = paragraph_map.get_document_chunks(document_id)
+        existing_chunk_ids = {
+            chunk_id
+            for chunk_ids in old_chunks_by_paragraph.values()
+            for chunk_id in chunk_ids
+        }
+        collection = active_runtime.collection(user_id, collection_type)
+    add_count("saved_paragraph_count", len(old_paragraphs))
+    add_count("hinted_modified_paragraph_count", len(hinted_ids))
+    add_count("modified_union_count", len(unions))
+    set_mapping_digest("before_paragraph_mapping", old_chunks_by_paragraph)
+    set_sample(
+        "before_chunk_ids",
+        sorted(existing_chunk_ids),
+        exact_count=len(existing_chunk_ids),
+    )
+    set_sample(
+        "modified_paragraph_ids",
+        sorted(
+            paragraph_id
+            for union in unions
+            for paragraph_id in union.paragraph_ids
+        ),
+        exact_count=sum(len(union.paragraph_ids) for union in unions),
+    )
 
     targeted_ids = {
         chunk_id
@@ -420,14 +468,19 @@ def save_wizard(
         for paragraph_id in union.paragraph_ids
         for chunk_id in old_chunks_by_paragraph.get(paragraph_id, [])
     }
+    add_count("targeted_old_chunk_count", len(targeted_ids))
+    set_sample(
+        "targeted_old_chunk_ids", sorted(targeted_ids), exact_count=len(targeted_ids)
+    )
     snapshots: list[ChunkRecord] = []
     try:
         for union in unions:
-            snapshots.extend(
-                collection.snapshot_by_paragraphs(
-                    document_id, list(union.paragraph_ids)
+            with observe_stage("save.recovery_snapshot"):
+                snapshots.extend(
+                    collection.snapshot_by_paragraphs(
+                        document_id, list(union.paragraph_ids)
+                    )
                 )
-            )
         if {record.chunk_id for record in snapshots} != targeted_ids:
             raise RuntimeError("storage snapshot does not match paragraph mappings")
     except Exception as exc:
@@ -436,6 +489,7 @@ def save_wizard(
         ) from exc
 
     deleted_snapshots = tuple(snapshots)
+    add_count("recovery_snapshot_chunk_count", len(deleted_snapshots))
     attempted_insert_ids: list[str] = []
     inserted_ids: list[str] = []
     attempted_retained_ids: list[str] = []
@@ -449,7 +503,17 @@ def save_wizard(
     try:
         # Step 3: all verified deletions complete before semantic processing.
         for union in unions:
-            collection.delete_by_paragraphs(document_id, list(union.paragraph_ids))
+            with observe_stage("save.old_chunk_delete"):
+                deletion = collection.delete_by_paragraphs(
+                    document_id, list(union.paragraph_ids)
+                )
+            add_count("weaviate_deleted_match_count", deletion.matched)
+            add_count("weaviate_deleted_success_count", deletion.successful)
+            set_sample(
+                "deleted_chunk_ids",
+                deletion.deleted_ids,
+                exact_count=deletion.successful,
+            )
 
         # Steps 4-5: losslessly split/chunk, then embed the whole save batch.
         failed_stage = "step_4"
@@ -457,18 +521,26 @@ def save_wizard(
         unavailable_chunk_ids = set(existing_chunk_ids)
         pending_chunks: list[_StagedChunk] = []
         for union in unions:
+            with observe_stage("save.semantic_split"):
+                raw_split_paragraphs = active_runtime.paragraph_splitter(
+                    union.current_text
+                )
             split_paragraphs = _validated_processor_output(
-                active_runtime.paragraph_splitter(union.current_text),
+                raw_split_paragraphs,
                 union.current_text,
                 "paragraph_splitter",
             )
+            add_count("semantic_paragraph_count", len(split_paragraphs))
             staged_paragraphs: list[_ParagraphNode] = []
             for paragraph_text in split_paragraphs:
+                with observe_stage("save.chunking"):
+                    raw_chunks = active_runtime.paragraph_chunker(paragraph_text)
                 chunks = _validated_processor_output(
-                    active_runtime.paragraph_chunker(paragraph_text),
+                    raw_chunks,
                     paragraph_text,
                     "paragraph_chunker",
                 )
+                add_count("chunk_count", len(chunks))
                 staged_chunks: list[_StagedChunk] = []
                 for chunk_text in chunks:
                     if not chunk_text.strip():
@@ -491,6 +563,12 @@ def save_wizard(
                     )
                 )
             staged_by_union[union.paragraph_ids[0]] = staged_paragraphs
+
+        set_sample(
+            "new_chunk_ids",
+            [chunk.chunk_id for chunk in pending_chunks],
+            exact_count=len(pending_chunks),
+        )
 
         failed_stage = "step_5"
         multi_vectors, diversity_vectors = _batch_vectors(
@@ -528,80 +606,126 @@ def save_wizard(
 
         # Step 6: substitute unions and renumber the whole document.
         failed_stage = "step_6"
-        union_ids = {
-            paragraph_id for union in unions for paragraph_id in union.paragraph_ids
+        with observe_stage("save.renumbering"):
+            union_ids = {
+                paragraph_id for union in unions for paragraph_id in union.paragraph_ids
+            }
+            nodes: list[_ParagraphNode] = []
+            for old_paragraph in old_paragraphs:
+                if old_paragraph.paragraph_id in staged_by_union:
+                    nodes.extend(staged_by_union[old_paragraph.paragraph_id])
+                elif old_paragraph.paragraph_id not in union_ids:
+                    retained_chunks = tuple(
+                        _StagedChunk(chunk_id, "", (), ())
+                        for chunk_id in old_chunks_by_paragraph.get(
+                            old_paragraph.paragraph_id, []
+                        )
+                    )
+                    nodes.append(
+                        _ParagraphNode(
+                            raw_text=old_paragraph.text,
+                            chunks=retained_chunks,
+                            old_paragraph_id=old_paragraph.paragraph_id,
+                        )
+                    )
+            if not nodes:
+                nodes = [_ParagraphNode(raw_text="", chunks=(), old_paragraph_id=None)]
+            if "".join(node.raw_text for node in nodes) != current_text:
+                raise RuntimeError("renumbered paragraphs do not reconstruct current_text")
+
+            final_paragraph_data: dict[int, str] = {}
+            final_chunk_mappings: dict[int, list[str]] = {}
+            unmodified_updates: dict[str, int] = {}
+            new_chunks: list[tuple[int, _StagedChunk]] = []
+            for final_paragraph_id, node in enumerate(nodes, start=1):
+                final_paragraph_data[final_paragraph_id] = node.raw_text
+                final_chunk_mappings[final_paragraph_id] = [
+                    chunk.chunk_id for chunk in node.chunks
+                ]
+                if node.old_paragraph_id is None:
+                    new_chunks.extend(
+                        (final_paragraph_id, chunk) for chunk in node.chunks
+                    )
+                elif node.old_paragraph_id != final_paragraph_id:
+                    for chunk in node.chunks:
+                        unmodified_updates[chunk.chunk_id] = final_paragraph_id
+
+            # Prevalidate both halves of Step 8 before the first Step 7 write.
+            paragraph_map.validate_document_replacement(
+                document_id, final_chunk_mappings
+            )
+            document_map.validate_update(document_id, final_paragraph_data)
+
+        final_chunk_ids = {
+            chunk_id
+            for chunk_ids in final_chunk_mappings.values()
+            for chunk_id in chunk_ids
         }
-        nodes: list[_ParagraphNode] = []
-        for old_paragraph in old_paragraphs:
-            if old_paragraph.paragraph_id in staged_by_union:
-                nodes.extend(staged_by_union[old_paragraph.paragraph_id])
-            elif old_paragraph.paragraph_id not in union_ids:
-                retained_chunks = tuple(
-                    _StagedChunk(chunk_id, "", (), ())
-                    for chunk_id in old_chunks_by_paragraph.get(
-                        old_paragraph.paragraph_id, []
-                    )
-                )
-                nodes.append(
-                    _ParagraphNode(
-                        raw_text=old_paragraph.text,
-                        chunks=retained_chunks,
-                        old_paragraph_id=old_paragraph.paragraph_id,
-                    )
-                )
-        if not nodes:
-            nodes = [_ParagraphNode(raw_text="", chunks=(), old_paragraph_id=None)]
-        if "".join(node.raw_text for node in nodes) != current_text:
-            raise RuntimeError("renumbered paragraphs do not reconstruct current_text")
-
-        final_paragraph_data: dict[int, str] = {}
-        final_chunk_mappings: dict[int, list[str]] = {}
-        unmodified_updates: dict[str, int] = {}
-        new_chunks: list[tuple[int, _StagedChunk]] = []
-        for final_paragraph_id, node in enumerate(nodes, start=1):
-            final_paragraph_data[final_paragraph_id] = node.raw_text
-            final_chunk_mappings[final_paragraph_id] = [
-                chunk.chunk_id for chunk in node.chunks
-            ]
-            if node.old_paragraph_id is None:
-                new_chunks.extend(
-                    (final_paragraph_id, chunk) for chunk in node.chunks
-                )
-            elif node.old_paragraph_id != final_paragraph_id:
-                for chunk in node.chunks:
-                    unmodified_updates[chunk.chunk_id] = final_paragraph_id
-
-        # Prevalidate both halves of Step 8 before the first Step 7 write.
-        paragraph_map.validate_document_replacement(document_id, final_chunk_mappings)
-        document_map.validate_update(document_id, final_paragraph_data)
+        unchanged_before = {
+            paragraph_id: chunk_ids
+            for paragraph_id, chunk_ids in old_chunks_by_paragraph.items()
+            if paragraph_id not in union_ids
+        }
+        unchanged_after = {
+            paragraph_id: chunk_ids
+            for paragraph_id, chunk_ids in final_chunk_mappings.items()
+            if paragraph_id not in union_ids
+        }
+        add_count("final_paragraph_count", len(final_paragraph_data))
+        add_count("final_chunk_count", len(final_chunk_ids))
+        add_count("new_chunk_count", len(new_chunks))
+        add_count(
+            "retained_chunk_count", len(final_chunk_ids.intersection(existing_chunk_ids))
+        )
+        add_count("updated_retained_chunk_count", len(unmodified_updates))
+        add_count("changed_old_new_intersection_count", len(targeted_ids & final_chunk_ids))
+        set_flag(
+            "unchanged_ordered_chunk_ids_retained",
+            unchanged_before == unchanged_after,
+        )
+        set_flag("changed_old_chunk_ids_reused", bool(targeted_ids & final_chunk_ids))
+        set_flag("changed_new_chunks_nonempty", bool(new_chunks))
+        set_mapping_digest("after_paragraph_mapping", final_chunk_mappings)
+        set_sample(
+            "final_chunk_ids", sorted(final_chunk_ids), exact_count=len(final_chunk_ids)
+        )
 
         failed_stage = "step_7a"
         for final_paragraph_id, chunk in new_chunks:
             attempted_insert_ids.append(chunk.chunk_id)
-            collection.insert_chunk(
-                document_id,
-                final_paragraph_id,
-                chunk.chunk_id,
-                chunk.raw_text,
-                chunk.late_interaction,
-                chunk.mmr_diversity,
-            )
+            set_flag("weaviate_mutation_executed", True)
+            with observe_stage("save.weaviate_insert"):
+                collection.insert_chunk(
+                    document_id,
+                    final_paragraph_id,
+                    chunk.chunk_id,
+                    chunk.raw_text,
+                    chunk.late_interaction,
+                    chunk.mmr_diversity,
+                )
             inserted_ids.append(chunk.chunk_id)
+            add_count("weaviate_insert_count", 1)
 
         failed_stage = "step_7b"
         if unmodified_updates:
             attempted_retained_ids.extend(unmodified_updates)
             try:
-                collection.update_paragraph_ids(unmodified_updates)
+                set_flag("weaviate_mutation_executed", True)
+                with observe_stage("save.weaviate_metadata_update"):
+                    collection.update_paragraph_ids(unmodified_updates)
                 updated_retained_ids.extend(unmodified_updates)
-                collection.verify_paragraph_ids(unmodified_updates)
+                add_count("weaviate_metadata_update_count", len(unmodified_updates))
+                with observe_stage("save.weaviate_metadata_verify"):
+                    collection.verify_paragraph_ids(unmodified_updates)
             except PartialParagraphUpdateError as exc:
                 updated_retained_ids.extend(exc.completed_chunk_ids)
                 raise
 
         failed_stage = "step_8"
-        paragraph_map.replace_document(document_id, final_chunk_mappings)
-        document_map.update_paragraphs(document_id, final_paragraph_data)
+        with observe_stage("save.paragraph_map_commit"):
+            paragraph_map.replace_document(document_id, final_chunk_mappings)
+        with observe_stage("save.document_map_commit"):
+            document_map.update_paragraphs(document_id, final_paragraph_data)
     except Exception as exc:
         recovery_errors, unresolved = _recover_save(
             collection=collection,

@@ -46,6 +46,19 @@ from backend.mappings._common import positive_paragraph_id, validated_user_id
 from backend.processing.file_reader import read_text_files
 from backend.services import AppServices
 from backend.wizard.crud import create_wizard, delete_wizard
+from backend.wizard.diagnostics import (
+    TRACE_OPERATION_HEADER,
+    TRACE_SESSION_HEADER,
+    activate_operation,
+    add_count,
+    attach_task,
+    begin_request_operation,
+    fail_operation_on_error,
+    finish_operation,
+    observe_stage,
+    operation_lifecycle,
+    set_flag,
+)
 from backend.wizard.save import save_wizard
 
 
@@ -100,6 +113,8 @@ def _modified_paragraph_ids(
 
 def _read_uploaded_text(file_paths: list[str]) -> str:
     contents = [read_text_files([file_path]) for file_path in file_paths]
+    add_count("upload.decoded_file_count", len(contents))
+    add_count("upload.decoded_character_count", sum(len(item) for item in contents))
     if not any(content != "" for content in contents):
         raise _EmptyUploadError("all uploaded files are empty")
     return TEXT_FILE_JOIN_SEPARATOR.join(contents)
@@ -112,6 +127,7 @@ def _copy_uploads_with_limits(
     paths: list[str] = []
     total_bytes = 0
     for index, upload_file in enumerate(files):
+        add_count("upload.file_count", 1)
         suffix = Path(upload_file.filename or "").suffix
         path = Path(directory) / f"upload-{index}{suffix}"
         file_bytes = 0
@@ -122,6 +138,7 @@ def _copy_uploads_with_limits(
                     break
                 file_bytes += len(chunk)
                 total_bytes += len(chunk)
+                add_count("upload.byte_count", len(chunk))
                 if file_bytes > UPLOAD_MAX_FILE_BYTES:
                     raise _UploadTooLargeError("file upload limit exceeded")
                 if total_bytes > UPLOAD_MAX_TOTAL_BYTES:
@@ -256,44 +273,67 @@ def build_wizard_router(
         services: AppServices = Depends(get_services),
     ) -> TaskResource:
         correlation_id = request_id(request)
-        try:
-            runtime = services.require_wizard_embedding()
-        except RuntimeError as exc:
-            log_internal_error(
-                "Wizard embedding runtime is unavailable",
-                correlation_id,
-                user_id=body.user_id,
-                wizard_id=wizard_id,
-                collection_type=collection_type,
-            )
-            raise service_unavailable(correlation_id) from exc
-        try:
-            runtime.document_map(body.user_id, collection_type).get_paragraph_data(
-                wizard_id
-            )
-        except KeyError as exc:
-            raise not_found("wizard", correlation_id) from exc
-        except (TypeError, ValueError) as exc:
-            raise validation_error(str(exc), correlation_id) from exc
-        await _ensure_collections(services, body.user_id, correlation_id)
-
-        async def work() -> None:
-            await asyncio.to_thread(
-                save_wizard,
-                body.user_id,
-                wizard_id,
-                collection_type,
-                body.current_text,
-                body.modified_paragraph_ids,
-                runtime=runtime,
-            )
-
-        task_id = await services.task_queue.enqueue(
-            body.user_id,
-            f"save_{collection_type}_wizard",
-            work,
+        trace_handle = begin_request_operation(
+            user_id=body.user_id,
+            session_id=request.headers.get(TRACE_SESSION_HEADER),
+            operation_id=request.headers.get(TRACE_OPERATION_HEADER),
+            kind="save",
+            collection_type=collection_type,
+            wizard_id=wizard_id,
         )
-        return _task_resource(services.task_queue.get(task_id, body.user_id))
+        with fail_operation_on_error(trace_handle), activate_operation(trace_handle):
+            with observe_stage("api.lookup_validation"):
+                try:
+                    runtime = services.require_wizard_embedding()
+                except RuntimeError as exc:
+                    log_internal_error(
+                        "Wizard embedding runtime is unavailable",
+                        correlation_id,
+                        user_id=body.user_id,
+                        wizard_id=wizard_id,
+                        collection_type=collection_type,
+                    )
+                    raise service_unavailable(correlation_id) from exc
+                try:
+                    runtime.document_map(
+                        body.user_id, collection_type
+                    ).get_paragraph_data(wizard_id)
+                except KeyError as exc:
+                    raise not_found("wizard", correlation_id) from exc
+                except (TypeError, ValueError) as exc:
+                    raise validation_error(str(exc), correlation_id) from exc
+            with observe_stage("collection.preparation"):
+                await _ensure_collections(services, body.user_id, correlation_id)
+
+            async def work() -> None:
+                with activate_operation(trace_handle):
+                    try:
+                        await asyncio.to_thread(
+                            save_wizard,
+                            body.user_id,
+                            wizard_id,
+                            collection_type,
+                            body.current_text,
+                            body.modified_paragraph_ids,
+                            runtime=runtime,
+                        )
+                    except BaseException:
+                        finish_operation(trace_handle, "failed")
+                        raise
+                    else:
+                        finish_operation(trace_handle, "succeeded")
+
+            with observe_stage("enqueue"):
+                task_id = await services.task_queue.enqueue(
+                    body.user_id,
+                    f"save_{collection_type}_wizard",
+                    work,
+                )
+            add_count("enqueue_count", 1)
+            attach_task(trace_handle, task_id)
+            set_flag("task_enqueued", True)
+            set_flag("task_id_present", True)
+            return _task_resource(services.task_queue.get(task_id, body.user_id))
 
     @router.delete(
         "/wizards/{wizard_id}",
@@ -307,31 +347,54 @@ def build_wizard_router(
         services: AppServices = Depends(get_services),
     ) -> TaskResource:
         correlation_id = request_id(request)
-        try:
-            services.wizard_runtime.document_map(
-                user_id, collection_type
-            ).get_paragraph_data(wizard_id)
-        except KeyError as exc:
-            raise not_found("wizard", correlation_id) from exc
-        except (TypeError, ValueError) as exc:
-            raise validation_error(str(exc), correlation_id) from exc
-        await _ensure_collections(services, user_id, correlation_id)
-
-        async def work() -> None:
-            await asyncio.to_thread(
-                delete_wizard,
-                user_id,
-                wizard_id,
-                collection_type,
-                runtime=services.wizard_runtime,
-            )
-
-        task_id = await services.task_queue.enqueue(
-            user_id,
-            f"delete_{collection_type}_wizard",
-            work,
+        trace_handle = begin_request_operation(
+            user_id=user_id,
+            session_id=request.headers.get(TRACE_SESSION_HEADER),
+            operation_id=request.headers.get(TRACE_OPERATION_HEADER),
+            kind="delete",
+            collection_type=collection_type,
+            wizard_id=wizard_id,
         )
-        return _task_resource(services.task_queue.get(task_id, user_id))
+        with fail_operation_on_error(trace_handle), activate_operation(trace_handle):
+            with observe_stage("api.lookup_validation"):
+                try:
+                    services.wizard_runtime.document_map(
+                        user_id, collection_type
+                    ).get_paragraph_data(wizard_id)
+                except KeyError as exc:
+                    raise not_found("wizard", correlation_id) from exc
+                except (TypeError, ValueError) as exc:
+                    raise validation_error(str(exc), correlation_id) from exc
+            with observe_stage("collection.preparation"):
+                await _ensure_collections(services, user_id, correlation_id)
+
+            async def work() -> None:
+                with activate_operation(trace_handle):
+                    try:
+                        await asyncio.to_thread(
+                            delete_wizard,
+                            user_id,
+                            wizard_id,
+                            collection_type,
+                            runtime=services.wizard_runtime,
+                        )
+                    except BaseException:
+                        finish_operation(trace_handle, "failed")
+                        raise
+                    else:
+                        finish_operation(trace_handle, "succeeded")
+
+            with observe_stage("enqueue"):
+                task_id = await services.task_queue.enqueue(
+                    user_id,
+                    f"delete_{collection_type}_wizard",
+                    work,
+                )
+            add_count("enqueue_count", 1)
+            attach_task(trace_handle, task_id)
+            set_flag("task_enqueued", True)
+            set_flag("task_id_present", True)
+            return _task_resource(services.task_queue.get(task_id, user_id))
 
     @router.post(
         "/wizards/{wizard_id}/upload",
@@ -347,81 +410,106 @@ def build_wizard_router(
         services: AppServices = Depends(get_services),
     ) -> WizardUploadResource:
         correlation_id = request_id(request)
-        if not files:
-            raise validation_error("at least one file is required", correlation_id)
-        try:
-            document_map = services.wizard_runtime.document_map(
-                user_id, collection_type
-            )
-            saved_text = document_map.get_full_text(wizard_id)
-            paragraph_ids = document_map.get_paragraphs(wizard_id)
-        except KeyError as exc:
-            raise not_found("wizard", correlation_id) from exc
-        except (TypeError, ValueError) as exc:
-            raise validation_error(str(exc), correlation_id) from exc
-
-        for upload_file in files:
-            filename = upload_file.filename or ""
-            if Path(filename).suffix.lower() not in SUPPORTED_FILE_EXTENSIONS:
-                raise public_http_error(
-                    status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-                    "UNSUPPORTED_FILE_TYPE",
-                    "One or more uploaded files use an unsupported type.",
-                    correlation_id,
-                )
-
-        try:
-            modified = _modified_paragraph_ids(
-                modified_paragraph_ids,
-                paragraph_ids,
-            )
-        except (TypeError, ValueError) as exc:
-            raise validation_error(str(exc), correlation_id) from exc
-
-        with tempfile.TemporaryDirectory(prefix="rag-upload-") as directory:
-            try:
-                paths = await asyncio.to_thread(
-                    _copy_uploads_with_limits,
-                    files,
-                    directory,
-                )
-                uploaded_text = await asyncio.to_thread(_read_uploaded_text, paths)
-            except _UploadTooLargeError as exc:
-                raise public_http_error(
-                    status.HTTP_413_CONTENT_TOO_LARGE,
-                    "UPLOAD_TOO_LARGE",
-                    "The uploaded files exceed the configured size limit.",
-                    correlation_id,
-                ) from exc
-            except _EmptyUploadError as exc:
-                raise public_http_error(
-                    status.HTTP_422_UNPROCESSABLE_CONTENT,
-                    "EMPTY_UPLOAD",
-                    "At least one uploaded file must contain text.",
-                    correlation_id,
-                ) from exc
-            except UnicodeDecodeError as exc:
-                raise public_http_error(
-                    status.HTTP_422_UNPROCESSABLE_CONTENT,
-                    "INVALID_TEXT_ENCODING",
-                    "An uploaded file is not valid configured text.",
-                    correlation_id,
-                ) from exc
-
-        base_text = saved_text if current_text is None else current_text
-        if base_text and uploaded_text:
-            updated_text = base_text + TEXT_FILE_JOIN_SEPARATOR + uploaded_text
-        else:
-            updated_text = base_text + uploaded_text
-        modified = sorted({*modified, paragraph_ids[-1]})
-        return WizardUploadResource(
-            wizard_id=wizard_id,
+        trace_handle = begin_request_operation(
             user_id=user_id,
+            session_id=request.headers.get(TRACE_SESSION_HEADER),
+            operation_id=request.headers.get(TRACE_OPERATION_HEADER),
+            kind="upload",
             collection_type=collection_type,
-            full_text=updated_text,
-            paragraph_ids=paragraph_ids,
-            modified_paragraph_ids=modified,
+            wizard_id=wizard_id,
         )
+        with (
+            activate_operation(trace_handle),
+            operation_lifecycle(trace_handle),
+            observe_stage("upload.server_total"),
+        ):
+            with observe_stage("api.lookup_validation"):
+                if not files:
+                    raise validation_error("at least one file is required", correlation_id)
+                try:
+                    document_map = services.wizard_runtime.document_map(
+                        user_id, collection_type
+                    )
+                    saved_text = document_map.get_full_text(wizard_id)
+                    paragraph_ids = document_map.get_paragraphs(wizard_id)
+                except KeyError as exc:
+                    raise not_found("wizard", correlation_id) from exc
+                except (TypeError, ValueError) as exc:
+                    raise validation_error(str(exc), correlation_id) from exc
+
+                for upload_file in files:
+                    filename = upload_file.filename or ""
+                    if Path(filename).suffix.lower() not in SUPPORTED_FILE_EXTENSIONS:
+                        raise public_http_error(
+                            status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                            "UNSUPPORTED_FILE_TYPE",
+                            "One or more uploaded files use an unsupported type.",
+                            correlation_id,
+                        )
+
+                try:
+                    modified = _modified_paragraph_ids(
+                        modified_paragraph_ids,
+                        paragraph_ids,
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise validation_error(str(exc), correlation_id) from exc
+
+            with tempfile.TemporaryDirectory(prefix="rag-upload-") as directory:
+                try:
+                    with observe_stage("upload.multipart_copy"):
+                        paths = await asyncio.to_thread(
+                            _copy_uploads_with_limits,
+                            files,
+                            directory,
+                        )
+                    with observe_stage("upload.file_decode_read"):
+                        uploaded_text = await asyncio.to_thread(
+                            _read_uploaded_text, paths
+                        )
+                except _UploadTooLargeError as exc:
+                    raise public_http_error(
+                        status.HTTP_413_CONTENT_TOO_LARGE,
+                        "UPLOAD_TOO_LARGE",
+                        "The uploaded files exceed the configured size limit.",
+                        correlation_id,
+                    ) from exc
+                except _EmptyUploadError as exc:
+                    raise public_http_error(
+                        status.HTTP_422_UNPROCESSABLE_CONTENT,
+                        "EMPTY_UPLOAD",
+                        "At least one uploaded file must contain text.",
+                        correlation_id,
+                    ) from exc
+                except UnicodeDecodeError as exc:
+                    raise public_http_error(
+                        status.HTTP_422_UNPROCESSABLE_CONTENT,
+                        "INVALID_TEXT_ENCODING",
+                        "An uploaded file is not valid configured text.",
+                        correlation_id,
+                    ) from exc
+
+            with observe_stage("upload.draft_merge"):
+                base_text = saved_text if current_text is None else current_text
+                if base_text and uploaded_text:
+                    updated_text = base_text + TEXT_FILE_JOIN_SEPARATOR + uploaded_text
+                else:
+                    updated_text = base_text + uploaded_text
+                modified = sorted({*modified, paragraph_ids[-1]})
+            set_flag("task_enqueued", False)
+            set_flag("task_id_present", False)
+            set_flag("save_delete_executed", False)
+            set_flag("lateon_executed", False)
+            set_flag("gte_executed", False)
+            set_flag("weaviate_mutation_executed", False)
+            return WizardUploadResource(
+                wizard_id=wizard_id,
+                user_id=user_id,
+                collection_type=collection_type,
+                full_text=updated_text,
+                paragraph_ids=paragraph_ids,
+                modified_paragraph_ids=modified,
+            )
 
     return router
 

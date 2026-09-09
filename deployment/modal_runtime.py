@@ -33,6 +33,16 @@ GRANITE_MODEL_VOLUME_NAME = os.getenv(
     "rag-granite-models",
 )
 SECRET_NAME = os.getenv("MODAL_RAG_SECRET", "rag-runtime-secrets")
+WIZARD_DIAGNOSTICS_ENABLED = os.getenv(
+    "WIZARD_DIAGNOSTICS_ENABLED", "false"
+).strip().lower()
+if WIZARD_DIAGNOSTICS_ENABLED not in {"true", "false"}:
+    raise ValueError("WIZARD_DIAGNOSTICS_ENABLED must be true or false")
+RAG_DIAGNOSTIC_USER_ID = os.getenv("RAG_DIAGNOSTIC_USER_ID", "")
+if WIZARD_DIAGNOSTICS_ENABLED == "true" and not RAG_DIAGNOSTIC_USER_ID:
+    raise ValueError(
+        "RAG_DIAGNOSTIC_USER_ID is required when Wizard diagnostics are enabled"
+    )
 
 RUNTIME_MODEL_ROOT = Path("/opt/runtime-models")
 GRANITE_MODEL_ROOT = Path("/opt/granite-models")
@@ -84,7 +94,20 @@ runtime_environment = {
     "QWEN_MODEL_PATH": "qwen3-4b-awq",
     "QWEN_SGLANG_SERVED_MODEL": "qwen3-4b-awq",
     "CORS_ALLOWED_ORIGINS": "*",
+    # Keep ordinary and diagnostic deployments on the same effective upload
+    # contract. The launcher supplies the loaded .env to this module.
+    "SUPPORTED_FILE_EXTENSIONS": os.getenv(
+        "SUPPORTED_FILE_EXTENSIONS", ".txt,.md,.csv,.json,.xml,.log"
+    ),
+    "TEXT_FILE_ENCODING": os.getenv("TEXT_FILE_ENCODING", "utf-8-sig"),
+    "TEXT_FILE_JOIN_SEPARATOR": os.getenv("TEXT_FILE_JOIN_SEPARATOR", "\n\n"),
+    "UPLOAD_MAX_FILE_BYTES": os.getenv("UPLOAD_MAX_FILE_BYTES", "10485760"),
+    "UPLOAD_MAX_TOTAL_BYTES": os.getenv("UPLOAD_MAX_TOTAL_BYTES", "26214400"),
+    "UPLOAD_READ_CHUNK_BYTES": os.getenv("UPLOAD_READ_CHUNK_BYTES", "65536"),
+    "WIZARD_DIAGNOSTICS_ENABLED": WIZARD_DIAGNOSTICS_ENABLED,
 }
+if WIZARD_DIAGNOSTICS_ENABLED == "true":
+    runtime_environment["RAG_DIAGNOSTIC_USER_ID"] = RAG_DIAGNOSTIC_USER_ID
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
