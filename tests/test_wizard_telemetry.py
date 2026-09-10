@@ -15,14 +15,18 @@ from backend.wizard.diagnostics import (
     DiagnosticTraceRegistry,
     TRACE_SAMPLE_LIMIT,
     TRACE_SESSION_MAX_OPERATIONS,
+    TRACE_TEXT_MAX_UTF8_BYTES,
     activate_operation,
+    active_trace_handle,
     add_count,
+    attach_related_task,
     install_registry,
     mapping_checkpoint,
     mapping_digest,
     mapping_membership_digest,
     observe_stage,
     set_sample,
+    set_text,
     uninstall_registry,
 )
 from deployment.wizard_diagnostic import OperationRecorder, WizardDiagnosticError
@@ -161,6 +165,50 @@ def test_registry_is_single_session_bounded_and_get_is_non_destructive() -> None
         registry.snapshot("wizard_diagnostic", session_id)
 
 
+def test_chat_trace_related_tasks_are_fixed_bounded_and_context_correlated() -> None:
+    registry = DiagnosticTraceRegistry("wizard_diagnostic")
+    session_id = str(uuid4())
+    operation_id = str(uuid4())
+    registry.start("wizard_diagnostic", session_id, "run-related")
+    handle = registry.begin_operation(
+        user_id="wizard_diagnostic",
+        session_id=session_id,
+        operation_id=operation_id,
+        kind="chat_query",
+        collection_type="conversations",
+        wizard_id=str(uuid4()),
+    )
+    assert handle is not None
+    persistence = str(uuid4())
+    title = str(uuid4())
+    install_registry(registry)
+    try:
+        with activate_operation(handle):
+            assert active_trace_handle() == handle
+            attach_related_task(handle, "conversation_persistence", persistence)
+            attach_related_task(handle, "session_title", title)
+        assert active_trace_handle() is None
+    finally:
+        uninstall_registry(registry)
+
+    operation = registry.snapshot(
+        "wizard_diagnostic", session_id, operation_id
+    )["operations"][0]
+    assert operation["task_id"] is None
+    assert operation["related_tasks"] == {
+        "conversation_persistence": persistence,
+        "session_title": title,
+    }
+
+    with pytest.raises(ValueError, match="unknown"):
+        registry.attach_related_task(handle, "unknown", str(uuid4()))
+    with pytest.raises(ValueError, match="already attached"):
+        registry.attach_related_task(
+            handle, "conversation_persistence", str(uuid4())
+        )
+    assert registry.snapshot("wizard_diagnostic", session_id)["trace_faulted"] is False
+
+
 def test_observation_faults_are_contained_and_mark_the_active_trace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -190,6 +238,39 @@ def test_observation_faults_are_contained_and_mark_the_active_trace(
     finally:
         uninstall_registry(registry)
     assert registry.snapshot("wizard_diagnostic", session_id)["trace_faulted"] is True
+
+
+def test_chat_trace_text_is_bounded_without_affecting_the_operation() -> None:
+    registry = DiagnosticTraceRegistry("wizard_diagnostic")
+    session_id = str(uuid4())
+    operation_id = str(uuid4())
+    registry.start("wizard_diagnostic", session_id, "run-1")
+    handle = registry.begin_operation(
+        user_id="wizard_diagnostic",
+        session_id=session_id,
+        operation_id=operation_id,
+        kind="chat_query",
+        collection_type="conversations",
+        wizard_id=str(uuid4()),
+    )
+    assert handle is not None
+    install_registry(registry)
+    try:
+        with activate_operation(handle):
+            set_text("granite_rewritten_query", "valid query")
+            set_text(
+                "oversized_query",
+                "x" * (TRACE_TEXT_MAX_UTF8_BYTES + 1),
+            )
+    finally:
+        uninstall_registry(registry)
+
+    operation = registry.snapshot(
+        "wizard_diagnostic", session_id, operation_id
+    )["operations"][0]
+    assert operation["texts"] == {"granite_rewritten_query": "valid query"}
+    assert operation["flags"]["granite_rewritten_query_truncated"] is False
+    assert operation["flags"]["oversized_query_truncated"] is True
 
 
 def test_mapping_checkpoint_is_bounded_and_has_ordered_and_membership_digests() -> None:

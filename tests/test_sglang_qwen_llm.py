@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import replace
 import json
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -18,6 +19,13 @@ from backend.providers.granite_query_rewriter import RoleRoutingLLMClient
 from backend.providers.sglang_qwen_llm import (
     SGLangQwenError,
     SGLangQwenLLMClient,
+)
+from backend.wizard.diagnostics import (
+    DiagnosticTraceRegistry,
+    activate_operation,
+    activate_title_provider,
+    install_registry,
+    uninstall_registry,
 )
 
 
@@ -128,8 +136,9 @@ def _completion(
     model: str = QWEN_SGLANG.served_model,
     reasoning_content: str | None = None,
     finish_reason: str = "stop",
+    usage: object | None = None,
 ) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "model": model,
         "choices": [
             {
@@ -141,6 +150,9 @@ def _completion(
             }
         ],
     }
+    if usage is not None:
+        payload["usage"] = usage
+    return payload
 
 
 def _event(
@@ -149,21 +161,63 @@ def _event(
     finish_reason: str | None = None,
     reasoning_content: str | None = None,
     model: str = QWEN_SGLANG.served_model,
+    usage: object | None = None,
 ) -> str:
-    return "data: " + json.dumps(
-        {
-            "model": model,
-            "choices": [
-                {
-                    "delta": {
-                        "content": content,
-                        "reasoning_content": reasoning_content,
-                    },
-                    "finish_reason": finish_reason,
-                }
-            ],
-        }
+    payload: dict[str, object] = {
+        "model": model,
+        "choices": [
+            {
+                "delta": {
+                    "content": content,
+                    "reasoning_content": reasoning_content,
+                },
+                "finish_reason": finish_reason,
+            }
+        ],
+    }
+    if usage is not None:
+        payload["usage"] = usage
+    return "data: " + json.dumps(payload)
+
+
+def _trace_stream(
+    client: SGLangQwenLLMClient,
+) -> tuple[list[str], dict[str, object]]:
+    registry = DiagnosticTraceRegistry("diagnostic_user")
+    session_id = str(uuid4())
+    operation_id = str(uuid4())
+    registry.start("diagnostic_user", session_id, "run")
+    handle = registry.begin_operation(
+        user_id="diagnostic_user",
+        session_id=session_id,
+        operation_id=operation_id,
+        kind="chat_query",
+        collection_type="conversations",
+        wizard_id=str(uuid4()),
     )
+    assert handle is not None
+
+    async def collect() -> list[str]:
+        return [
+            item
+            async for item in client.stream(
+                "Answer prompt",
+                model=PRIMARY_GENERATOR.model,
+                reasoning="low",
+                max_output_tokens=1800,
+            )
+        ]
+
+    install_registry(registry)
+    try:
+        with activate_operation(handle):
+            chunks = asyncio.run(collect())
+    finally:
+        uninstall_registry(registry)
+    operation = registry.snapshot(
+        "diagnostic_user", session_id, operation_id
+    )["operations"][0]
+    return chunks, operation
 
 
 def _client(
@@ -217,6 +271,106 @@ def test_title_completion_uses_qwen_non_thinking_contract() -> None:
         "stream": False,
         "chat_template_kwargs": {"enable_thinking": False},
     }
+
+
+@pytest.mark.parametrize(
+    ("usage", "available", "valid"),
+    [
+        (None, False, True),
+        (
+            {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14},
+            True,
+            True,
+        ),
+        (
+            {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 99},
+            True,
+            False,
+        ),
+    ],
+)
+def test_title_completion_trace_observes_same_request_and_optional_usage(
+    usage: object | None,
+    available: bool,
+    valid: bool,
+) -> None:
+    client, sync_client, _ = _client(completion=_completion(usage=usage))
+    registry = DiagnosticTraceRegistry("diagnostic_user")
+    session_id = str(uuid4())
+    operation_id = str(uuid4())
+    registry.start("diagnostic_user", session_id, "run-title")
+    handle = registry.begin_operation(
+        user_id="diagnostic_user",
+        session_id=session_id,
+        operation_id=operation_id,
+        kind="chat_query",
+        collection_type="conversations",
+        wizard_id=str(uuid4()),
+    )
+    assert handle is not None
+    install_registry(registry)
+    try:
+        with activate_operation(handle), activate_title_provider():
+            result = client.complete(
+                "Create a title", model=SESSION_TITLE_GENERATOR.model
+            )
+    finally:
+        uninstall_registry(registry)
+
+    operation = registry.snapshot(
+        "diagnostic_user", session_id, operation_id
+    )["operations"][0]
+    assert result == "Reliable RAG Grounding"
+    assert len(sync_client.calls) == 1
+    assert operation["stages"]["chat.title_qwen_http"]["call_count"] == 1
+    assert operation["stages"]["chat.title_qwen_total"]["call_count"] == 1
+    assert operation["counts"]["title_qwen_attempt_count"] == 1
+    assert operation["flags"]["title_qwen_usage_available"] is available
+    assert operation["flags"]["title_qwen_usage_valid"] is valid
+    assert operation["texts"]["title_qwen_observed_model"] == QWEN_SGLANG.served_model
+    assert "Create a title" not in str(operation)
+
+
+def test_title_completion_trace_accumulates_existing_transient_retry() -> None:
+    request = httpx.Request("POST", "http://qwen")
+    timeout = httpx.ReadTimeout("retry", request=request)
+    sync_client = RecordingSyncClient(
+        _completion(), attempts=[timeout, _completion("Recovered Title Here")]
+    )
+    client = SGLangQwenLLMClient(
+        QWEN_SGLANG,
+        sync_client=sync_client,
+        async_client=RecordingAsyncClient([]),
+    )
+    registry = DiagnosticTraceRegistry("diagnostic_user")
+    session_id = str(uuid4())
+    operation_id = str(uuid4())
+    registry.start("diagnostic_user", session_id, "run-title-retry")
+    handle = registry.begin_operation(
+        user_id="diagnostic_user",
+        session_id=session_id,
+        operation_id=operation_id,
+        kind="chat_query",
+        collection_type="conversations",
+        wizard_id=str(uuid4()),
+    )
+    assert handle is not None
+    install_registry(registry)
+    try:
+        with activate_operation(handle), activate_title_provider():
+            result = client.complete("title", model=SESSION_TITLE_GENERATOR.model)
+    finally:
+        uninstall_registry(registry)
+
+    operation = registry.snapshot(
+        "diagnostic_user", session_id, operation_id
+    )["operations"][0]
+    assert result == "Recovered Title Here"
+    assert len(sync_client.calls) == 2
+    assert operation["stages"]["chat.title_qwen_http"]["call_count"] == 2
+    assert operation["stages"]["chat.title_qwen_http"]["failure_count"] == 1
+    assert operation["counts"]["title_qwen_attempt_count"] == 2
+    assert operation["counts"]["title_qwen_retry_count"] == 1
 
 
 def test_answer_stream_preserves_chunk_order_and_newlines() -> None:
@@ -550,3 +704,135 @@ def test_role_router_keeps_granite_rewrite_and_delegates_qwen_roles() -> None:
     assert granite.calls == [("rewrite", QUERY_REWRITER.model)]
     assert len(sync_client.calls) == 1
     assert len(async_client.calls) == 1
+
+
+@pytest.mark.parametrize("with_usage", [False, True])
+def test_stream_trace_observes_same_request_and_optional_usage(
+    with_usage: bool,
+) -> None:
+    usage = (
+        {
+            "prompt_tokens": 11,
+            "completion_tokens": 2,
+            "total_tokens": 13,
+            "prompt_tokens_details": {"cached_tokens": 3},
+        }
+        if with_usage
+        else None
+    )
+    client, _, async_client = _client(
+        lines=[
+            _event("first\n"),
+            _event("second"),
+            _event(None, finish_reason="stop", usage=usage),
+            "data: [DONE]",
+        ]
+    )
+
+    chunks, operation = _trace_stream(client)
+
+    assert chunks == ["first\n", "second"]
+    assert len(async_client.calls) == 1
+    body = async_client.calls[0][2]["json"]
+    assert isinstance(body, Mapping)
+    assert "stream_options" not in body
+    assert body["messages"] == [{"role": "user", "content": "Answer prompt"}]
+    assert operation["counts"]["qwen_attempt_count"] == 1
+    assert operation["counts"]["qwen_retry_count"] == 0
+    assert operation["counts"]["qwen_answer_chunk_count"] == 2
+    assert operation["flags"]["qwen_usage_available"] is with_usage
+    assert operation["flags"]["qwen_usage_valid"] is True
+    assert operation["texts"]["qwen_observed_model"] == QWEN_SGLANG.served_model
+    assert operation["texts"]["qwen_finish_reason"] == "stop"
+    assert operation["stages"]["chat.qwen_http"]["call_count"] == 1
+    assert operation["stages"]["chat.qwen_ttft"]["call_count"] == 1
+    assert operation["stages"]["chat.qwen_generation"]["call_count"] == 1
+    assert operation["stages"]["chat.qwen_stream_total"]["call_count"] == 1
+    serialized = json.dumps(operation, sort_keys=True)
+    assert "Answer prompt" not in serialized
+    assert "first\\n" not in serialized
+    if with_usage:
+        assert operation["counts"]["qwen_final_total_tokens"] == 13
+        assert operation["counts"]["qwen_final_cached_prompt_tokens"] == 3
+    else:
+        assert "qwen_final_total_tokens" not in operation["counts"]
+
+
+def test_stream_trace_accumulates_the_existing_pre_content_retry() -> None:
+    timeout = httpx.ReadTimeout(
+        "provider detail",
+        request=httpx.Request("POST", "https://qwen.invalid"),
+    )
+    async_client = RecordingAsyncClient(
+        [],
+        attempts=[
+            ([], timeout),
+            (
+                [
+                    _event("recovered"),
+                    _event(None, finish_reason="stop"),
+                    "data: [DONE]",
+                ],
+                None,
+            ),
+        ],
+    )
+    client = SGLangQwenLLMClient(
+        QWEN_SGLANG,
+        sync_client=RecordingSyncClient(_completion()),
+        async_client=async_client,
+    )
+
+    chunks, operation = _trace_stream(client)
+
+    assert chunks == ["recovered"]
+    assert len(async_client.calls) == 2
+    assert operation["counts"]["qwen_attempt_count"] == 2
+    assert operation["counts"]["qwen_retry_count"] == 1
+    assert operation["counts"]["qwen_transient_failure_count"] == 1
+    assert operation["stages"]["chat.qwen_http"]["call_count"] == 2
+    assert operation["stages"]["chat.qwen_http"]["failure_count"] == 1
+
+
+def test_malformed_optional_usage_faults_only_trace_evidence() -> None:
+    client, _, async_client = _client(
+        lines=[
+            _event("answer"),
+            _event(
+                None,
+                finish_reason="stop",
+                usage={
+                    "prompt_tokens": 5,
+                    "completion_tokens": 1,
+                    "total_tokens": 99,
+                },
+            ),
+            "data: [DONE]",
+        ]
+    )
+
+    chunks, operation = _trace_stream(client)
+
+    assert chunks == ["answer"]
+    assert len(async_client.calls) == 1
+    assert operation["flags"]["qwen_usage_available"] is True
+    assert operation["flags"]["qwen_usage_valid"] is False
+    assert "qwen_final_total_tokens" not in operation["counts"]
+
+
+def test_trace_encoding_fault_does_not_change_provider_output() -> None:
+    content = "\ud800"
+    client, _, async_client = _client(
+        lines=[
+            _event(content),
+            _event(None, finish_reason="stop"),
+            "data: [DONE]",
+        ]
+    )
+
+    chunks, operation = _trace_stream(client)
+
+    assert chunks == [content]
+    assert len(async_client.calls) == 1
+    assert operation["stages"]["chat.qwen_http"]["call_count"] == 1
+    assert operation["counts"]["qwen_answer_chunk_count"] == 0

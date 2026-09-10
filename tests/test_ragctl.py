@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import stat
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -530,6 +531,213 @@ def test_diagnostic_interruption_after_startup_always_runs_final_down(
 
     with pytest.raises(KeyboardInterrupt):
         ragctl.diagnose_wizard(config, runner, fixtures)
+
+    assert events == ["down", "up", "down"]
+
+
+def _prepare_e2e_test(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[dict[str, str], FakeRunner, list[str], Path]:
+    from deployment import e2e_diagnostic, e2e_diagnostic_api, wizard_diagnostic
+
+    config = _config()
+    config["RAG_DIAGNOSTIC_USER_ID"] = "wizard_diagnostic"
+    runner = FakeRunner(config)
+    events: list[str] = []
+    queries = tmp_path / "queries.py"
+    queries.write_text('QUERIES = ["one", "two"]\n', encoding="utf-8")
+    output = tmp_path / "e2e-output"
+    request_path = output / "run" / "requests.jsonl"
+    request_path.parent.mkdir(parents=True)
+    request_path.touch()
+    summary_path = request_path.with_name("summary.json")
+
+    monkeypatch.setattr(ragctl, "E2E_DIAGNOSTICS_PATH", output)
+    monkeypatch.setattr(
+        ragctl, "WIZARD_CORPUS_STATE_PATH", tmp_path / "corpus-state.json"
+    )
+    monkeypatch.setattr(
+        ragctl, "WIZARD_CORPUS_LOCK_PATH", tmp_path / "corpus-state.lock"
+    )
+    monkeypatch.setattr(ragctl, "read_runtime_url", lambda *_: "https://runtime")
+    monkeypatch.setattr(ragctl, "_runtime_headers", lambda *_: {"auth": "hidden"})
+    corpus_state = object()
+    active = object()
+    monkeypatch.setattr(
+        wizard_diagnostic, "load_corpus_state", lambda *_: corpus_state
+    )
+    monkeypatch.setattr(
+        e2e_diagnostic,
+        "validate_reusable_corpus_state",
+        lambda *_: active,
+    )
+    monkeypatch.setattr(
+        e2e_diagnostic,
+        "create_e2e_run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            run_id="run",
+            directory=request_path.parent,
+            requests_path=request_path,
+            summary_path=summary_path,
+        ),
+    )
+    monkeypatch.setattr(e2e_diagnostic, "update_e2e_summary", lambda *_, **__: None)
+
+    def run_phase(*args: object, **kwargs: object) -> None:
+        progress = args[-1]
+        progress["physical_corpus_status"] = "succeeded"  # type: ignore[index]
+        progress["trace_status"] = "succeeded"  # type: ignore[index]
+        progress["trace_deleted"] = True  # type: ignore[index]
+        events.append("diagnostic")
+
+    monkeypatch.setattr(e2e_diagnostic_api, "run_e2e_phase_2d", run_phase)
+    return config, runner, events, queries
+
+
+def test_e2e_parser_defaults_and_selection_flags() -> None:
+    cli = ragctl.parser()
+    defaults = cli.parse_args(
+        ["diagnose", "e2e", "--queries", "diagnostics/queries.py"]
+    )
+    selected = cli.parse_args(
+        [
+            "diagnose",
+            "e2e",
+            "--queries",
+            "diagnostics/queries.py",
+            "--start",
+            "3",
+            "--limit",
+            "5",
+            "--continuous",
+        ]
+    )
+
+    assert defaults.diagnostic == "e2e"
+    assert defaults.queries == Path("diagnostics/queries.py")
+    assert defaults.start == 0
+    assert defaults.limit is None
+    assert defaults.continuous is False
+    assert selected.start == 3
+    assert selected.limit == 5
+    assert selected.continuous is True
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--start", "-1"],
+        ["--start", "no"],
+        ["--limit", "0"],
+        ["--limit", "-1"],
+        ["--limit", "no"],
+    ],
+)
+def test_e2e_parser_rejects_invalid_slice_values(arguments: list[str]) -> None:
+    with pytest.raises(SystemExit):
+        ragctl.parser().parse_args(
+            [
+                "diagnose",
+                "e2e",
+                "--queries",
+                "diagnostics/queries.py",
+                *arguments,
+            ]
+        )
+
+
+def test_e2e_lifecycle_is_down_up_diagnostic_down_and_traced_runtime(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config, runner, events, queries = _prepare_e2e_test(monkeypatch, tmp_path)
+    monkeypatch.setattr(ragctl, "down", lambda *_: events.append("down"))
+
+    def diagnostic_up(*_: object, **kwargs: object) -> None:
+        assert kwargs == {"wizard_diagnostic_user_id": "wizard_diagnostic"}
+        events.append("up")
+
+    monkeypatch.setattr(ragctl, "up", diagnostic_up)
+
+    ragctl.diagnose_e2e(config, runner, queries, start=1, limit=1)
+
+    assert events == ["down", "up", "diagnostic", "down"]
+
+
+def test_e2e_preflight_failure_happens_before_lifecycle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config, runner, events, _ = _prepare_e2e_test(monkeypatch, tmp_path)
+    monkeypatch.setattr(ragctl, "down", lambda *_: events.append("down"))
+    monkeypatch.setattr(ragctl, "up", lambda *_: events.append("up"))
+
+    with pytest.raises(ValueError, match="does not exist"):
+        ragctl.diagnose_e2e(config, runner, tmp_path / "missing.py")
+
+    assert events == []
+
+
+def test_e2e_trace_capacity_is_checked_before_lifecycle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config, runner, events, queries = _prepare_e2e_test(monkeypatch, tmp_path)
+    queries.write_text(
+        "QUERIES = " + repr([f"query-{index}" for index in range(257)]) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ragctl, "down", lambda *_: events.append("down"))
+    monkeypatch.setattr(ragctl, "up", lambda *_, **__: events.append("up"))
+
+    with pytest.raises(ragctl.RagCtlError, match="trace capacity"):
+        ragctl.diagnose_e2e(config, runner, queries)
+
+    assert events == []
+
+
+def test_e2e_failed_up_does_not_add_duplicate_shutdown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config, runner, events, queries = _prepare_e2e_test(monkeypatch, tmp_path)
+    monkeypatch.setattr(ragctl, "down", lambda *_: events.append("down"))
+
+    def failed_up(*_: object, **__: object) -> None:
+        events.extend(("up", "up-owned-cleanup"))
+        raise ragctl.RagCtlError("startup")
+
+    monkeypatch.setattr(ragctl, "up", failed_up)
+
+    with pytest.raises(ragctl.RagCtlError, match="startup"):
+        ragctl.diagnose_e2e(config, runner, queries)
+
+    assert events == ["down", "up", "up-owned-cleanup"]
+
+
+def test_e2e_phase_failure_and_interruption_always_run_final_down(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from deployment import e2e_diagnostic_api
+
+    config, runner, events, queries = _prepare_e2e_test(monkeypatch, tmp_path)
+    monkeypatch.setattr(ragctl, "down", lambda *_: events.append("down"))
+    monkeypatch.setattr(ragctl, "up", lambda *_, **__: events.append("up"))
+    monkeypatch.setattr(
+        e2e_diagnostic_api,
+        "run_e2e_phase_2d",
+        lambda *_, **__: (_ for _ in ()).throw(ValueError("requests")),
+    )
+
+    with pytest.raises(ValueError, match="requests"):
+        ragctl.diagnose_e2e(config, runner, queries)
+
+    assert events == ["down", "up", "down"]
+
+    events.clear()
+    monkeypatch.setattr(
+        e2e_diagnostic_api,
+        "run_e2e_phase_2d",
+        lambda *_, **__: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+    with pytest.raises(KeyboardInterrupt):
+        ragctl.diagnose_e2e(config, runner, queries)
 
     assert events == ["down", "up", "down"]
 

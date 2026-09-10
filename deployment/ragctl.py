@@ -32,6 +32,7 @@ STATE_PATH = PROJECT_ROOT / ".local" / "rag-state.json"
 WIZARD_DIAGNOSTICS_PATH = PROJECT_ROOT / ".local" / "diagnostics" / "wizard"
 WIZARD_CORPUS_STATE_PATH = WIZARD_DIAGNOSTICS_PATH / "corpus-state.json"
 WIZARD_CORPUS_LOCK_PATH = WIZARD_DIAGNOSTICS_PATH / "corpus-state.lock"
+E2E_DIAGNOSTICS_PATH = PROJECT_ROOT / ".local" / "diagnostics" / "e2e"
 COMPOSE_FILE = PROJECT_ROOT / "deployment" / "compose.weaviate-secure.yaml"
 CERT_DIR = PROJECT_ROOT / ".local" / "tailscale-certs"
 CERT_PATH = CERT_DIR / "weaviate.pem"
@@ -1339,6 +1340,244 @@ def diagnose_wizard(
         )
 
 
+def diagnose_e2e(
+    config: Mapping[str, str],
+    runner: CommandRunner,
+    queries_path: Path,
+    *,
+    start: int = 0,
+    limit: int | None = None,
+    continuous: bool = False,
+) -> None:
+    """Run Phase 2D queries against the retained, verified Phase 1 corpus."""
+
+    validate_config(config)
+    from backend.wizard.diagnostics import TRACE_SESSION_MAX_OPERATIONS
+    from deployment.e2e_diagnostic import (
+        RequestRecorder,
+        create_e2e_run,
+        load_query_selection,
+        update_e2e_summary,
+        validate_reusable_corpus_state,
+    )
+    from deployment.e2e_diagnostic_api import run_e2e_phase_2d
+    from deployment.wizard_diagnostic import (
+        corpus_state_lock,
+        load_corpus_state,
+        validate_diagnostic_user,
+    )
+
+    diagnostic_user_id, _ = validate_diagnostic_user(config)
+    selection = load_query_selection(
+        queries_path,
+        PROJECT_ROOT,
+        start=start,
+        limit=limit,
+    )
+    if len(selection.selected) > TRACE_SESSION_MAX_OPERATIONS:
+        raise RagCtlError(
+            "E2E selection exceeds the bounded diagnostic trace capacity"
+        )
+    with corpus_state_lock(WIZARD_CORPUS_LOCK_PATH):
+        corpus_state = load_corpus_state(
+            WIZARD_CORPUS_STATE_PATH,
+            diagnostic_user_id,
+        )
+        active = validate_reusable_corpus_state(corpus_state, diagnostic_user_id)
+        if corpus_state is None:  # pragma: no cover - validator owns this invariant.
+            raise RagCtlError("Phase 1 corpus state is unavailable")
+        run = create_e2e_run(
+            E2E_DIAGNOSTICS_PATH,
+            diagnostic_user_id,
+            selection,
+            active,
+            continuous=continuous,
+        )
+        recorder = RequestRecorder(run.requests_path)
+        progress: dict[str, object] = {
+            "physical_corpus_status": "pending",
+            "trace_status": "not_started",
+            "trace_deleted": False,
+        }
+        print(f"E2E diagnostic run: {run.run_id}", flush=True)
+        print(f"Artifacts: {run.directory}", flush=True)
+
+        try:
+            down(config, runner)
+        except KeyboardInterrupt:
+            update_e2e_summary(
+                run,
+                recorder,
+                status="interrupted",
+                pre_down_status="interrupted",
+                up_status="not_started",
+                down_status="not_started",
+                physical_corpus_status=progress["physical_corpus_status"],
+                trace_status=str(progress["trace_status"]),
+                trace_deleted=bool(progress["trace_deleted"]),
+                failure_stage="pre_down",
+                finished=True,
+            )
+            raise
+        except BaseException:
+            update_e2e_summary(
+                run,
+                recorder,
+                status="failed",
+                pre_down_status="failed",
+                up_status="not_started",
+                down_status="not_started",
+                physical_corpus_status=progress["physical_corpus_status"],
+                trace_status=str(progress["trace_status"]),
+                trace_deleted=bool(progress["trace_deleted"]),
+                failure_stage="pre_down",
+                finished=True,
+            )
+            raise
+
+        update_e2e_summary(
+            run,
+            recorder,
+            status="running",
+            pre_down_status="succeeded",
+            up_status="pending",
+            down_status="pending",
+            physical_corpus_status=progress["physical_corpus_status"],
+            trace_status=str(progress["trace_status"]),
+            trace_deleted=bool(progress["trace_deleted"]),
+        )
+        try:
+            up(
+                config,
+                runner,
+                wizard_diagnostic_user_id=diagnostic_user_id,
+            )
+        except KeyboardInterrupt:
+            update_e2e_summary(
+                run,
+                recorder,
+                status="interrupted",
+                pre_down_status="succeeded",
+                up_status="interrupted",
+                down_status="managed_by_up_failure_cleanup",
+                physical_corpus_status=progress["physical_corpus_status"],
+                trace_status=str(progress["trace_status"]),
+                trace_deleted=bool(progress["trace_deleted"]),
+                failure_stage="up",
+                finished=True,
+            )
+            raise
+        except BaseException:
+            update_e2e_summary(
+                run,
+                recorder,
+                status="failed",
+                pre_down_status="succeeded",
+                up_status="failed",
+                down_status="managed_by_up_failure_cleanup",
+                physical_corpus_status=progress["physical_corpus_status"],
+                trace_status=str(progress["trace_status"]),
+                trace_deleted=bool(progress["trace_deleted"]),
+                failure_stage="up",
+                finished=True,
+            )
+            raise
+
+        phase_error: BaseException | None = None
+        try:
+            update_e2e_summary(
+                run,
+                recorder,
+                status="running",
+                pre_down_status="succeeded",
+                up_status="succeeded",
+                down_status="pending",
+                physical_corpus_status=progress["physical_corpus_status"],
+                trace_status=str(progress["trace_status"]),
+                trace_deleted=bool(progress["trace_deleted"]),
+            )
+            run_e2e_phase_2d(
+                read_runtime_url(config),
+                _runtime_headers(config),
+                config,
+                corpus_state,
+                active,
+                selection,
+                recorder,
+                progress,
+                continuous=continuous,
+                run_id=run.run_id,
+            )
+        except BaseException as exc:
+            phase_error = exc
+
+        try:
+            down(config, runner)
+        except BaseException as down_error:
+            if phase_error is not None:
+                down_error.add_note(
+                    "Phase 2D also failed before shutdown: " + repr(phase_error)
+                )
+            interrupted = isinstance(down_error, KeyboardInterrupt)
+            update_e2e_summary(
+                run,
+                recorder,
+                status="interrupted" if interrupted else "failed",
+                pre_down_status="succeeded",
+                up_status="succeeded",
+                down_status="interrupted" if interrupted else "failed",
+                physical_corpus_status=progress["physical_corpus_status"],
+                trace_status=str(progress["trace_status"]),
+                trace_deleted=bool(progress["trace_deleted"]),
+                failure_stage="down",
+                finished=True,
+            )
+            raise
+
+        if phase_error is not None:
+            interrupted = isinstance(phase_error, KeyboardInterrupt)
+            update_e2e_summary(
+                run,
+                recorder,
+                status="interrupted" if interrupted else "failed",
+                pre_down_status="succeeded",
+                up_status="succeeded",
+                down_status="succeeded",
+                physical_corpus_status=progress["physical_corpus_status"],
+                trace_status=str(progress["trace_status"]),
+                trace_deleted=bool(progress["trace_deleted"]),
+                failure_stage=(
+                    "corpus"
+                    if progress["physical_corpus_status"] != "succeeded"
+                    else (
+                        "trace"
+                        if progress["trace_status"] == "failed"
+                        or not progress["trace_deleted"]
+                        else "requests"
+                    )
+                ),
+                finished=True,
+            )
+            raise phase_error
+
+        update_e2e_summary(
+            run,
+            recorder,
+            status="succeeded",
+            pre_down_status="succeeded",
+            up_status="succeeded",
+            down_status="succeeded",
+            physical_corpus_status=progress["physical_corpus_status"],
+            trace_status=str(progress["trace_status"]),
+            trace_deleted=bool(progress["trace_deleted"]),
+            finished=True,
+        )
+        print(
+            f"E2E diagnostic Phase 2D completed: {recorder.succeeded} request(s).",
+            flush=True,
+        )
+
+
 def iter_sse(lines: Iterable[str]) -> Iterator[tuple[str, object]]:
     event_name = "message"
     data_lines: list[str] = []
@@ -1563,6 +1802,26 @@ def status(config: Mapping[str, str], runner: CommandRunner) -> None:
     print(f"  Authenticated RAG health: {'200 ready' if ready else 'not ready'}")
 
 
+def _non_negative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return parsed
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
 def parser() -> argparse.ArgumentParser:
     cli = argparse.ArgumentParser(
         prog="./rag",
@@ -1601,6 +1860,32 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="replace the recorded corpus before retiring its old documents",
     )
+    e2e_parser = diagnostics.add_parser(
+        "e2e", help="run sequential queries against the retained Phase 1 corpus"
+    )
+    e2e_parser.add_argument(
+        "--queries",
+        type=Path,
+        required=True,
+        help="Python file containing one literal QUERIES list",
+    )
+    e2e_parser.add_argument(
+        "--start",
+        type=_non_negative_int,
+        default=0,
+        help="zero-based query offset (default: 0)",
+    )
+    e2e_parser.add_argument(
+        "--limit",
+        type=_positive_int,
+        default=None,
+        help="maximum number of queries (default: all remaining)",
+    )
+    e2e_parser.add_argument(
+        "--continuous",
+        action="store_true",
+        help="reuse one chat session for every selected query",
+    )
     return cli
 
 
@@ -1629,6 +1914,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 runner,
                 args.fixtures,
                 reseed_corpus=args.reseed_corpus,
+            )
+        elif args.command == "diagnose" and args.diagnostic == "e2e":
+            diagnose_e2e(
+                config,
+                runner,
+                args.queries,
+                start=args.start,
+                limit=args.limit,
+                continuous=args.continuous,
             )
         else:  # pragma: no cover - argparse owns this invariant
             raise RagCtlError(f"Unknown command: {args.command}")

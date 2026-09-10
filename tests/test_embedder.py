@@ -14,8 +14,16 @@ from backend.rag.embedder import (
     embed_chunks,
     embed_conversation_background,
     embed_text,
+    embed_conversation,
 )
 from backend.rag.runtime import RAGRuntime, RerankResult
+from backend.wizard.diagnostics import (
+    DiagnosticTraceRegistry,
+    activate_operation,
+    install_registry,
+    uninstall_registry,
+)
+from uuid import uuid4
 
 
 CONVERSATION_ID = "81000000-0000-0000-0000-000000000001"
@@ -228,6 +236,63 @@ def test_background_embedding_returns_observable_task_and_inserts_labeled_text()
     assert collection.inserts == [
         (CONVERSATION_ID, raw_text, [raw_text], [[_lateon_row(1.0)]], [0.4, 0.6])
     ]
+
+
+def test_conversation_persistence_trace_observes_existing_concurrent_work_once() -> None:
+    embeddings = FakeEmbeddings(single=[0.25] * 768)
+    collection = FakeConversationCollection()
+    raw_text = "Question:\nQuestion\n\nAnswer:\nAnswer"
+    segmenter = LosslessSegmenter(["Question:\nQuestion\n\n", "Answer:\nAnswer"])
+    multi_vectors = FakeMultiVectors()
+    runtime, users = _runtime(
+        embeddings,
+        collection,
+        multi_vectors=multi_vectors,
+        segmenter=segmenter,
+    )
+    registry = DiagnosticTraceRegistry("usr_test")
+    session_id = str(uuid4())
+    operation_id = str(uuid4())
+    registry.start("usr_test", session_id, "run-persistence")
+    handle = registry.begin_operation(
+        user_id="usr_test",
+        session_id=session_id,
+        operation_id=operation_id,
+        kind="chat_query",
+        collection_type="conversations",
+        wizard_id=str(uuid4()),
+    )
+    assert handle is not None
+    install_registry(registry)
+    try:
+        with activate_operation(handle):
+            asyncio.run(
+                embed_conversation(
+                    "usr_test",
+                    CONVERSATION_ID,
+                    "Question",
+                    "Answer",
+                    runtime=runtime,
+                )
+            )
+    finally:
+        uninstall_registry(registry)
+
+    operation = registry.snapshot("usr_test", session_id, operation_id)["operations"][0]
+    stages = operation["stages"]
+    counts = operation["counts"]
+    assert stages["chat.persistence_segmentation"]["call_count"] == 1
+    assert stages["chat.persistence_embeddings_fork_join"]["call_count"] == 1
+    assert stages["chat.persistence_lateon"]["call_count"] == 1
+    assert stages["chat.persistence_gte"]["call_count"] == 1
+    assert stages["chat.persistence_storage_total"]["call_count"] == 1
+    assert counts["persistence_segment_count"] == 2
+    assert counts["persistence_lateon_document_count"] == 2
+    assert counts["persistence_gte_vector_count"] == 1
+    assert users == ["usr_test"]
+    assert multi_vectors.document_calls == [segmenter.segments]
+    assert embeddings.single_calls == [(raw_text, EMBEDDING_MODEL)]
+    assert len(collection.inserts) == 1
 
 
 def test_multi_vector_contract_validates_shape_finiteness_and_dimensions() -> None:

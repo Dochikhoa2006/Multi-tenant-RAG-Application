@@ -29,6 +29,14 @@ from backend.weaviate_client.models import (
     HydratedSearchResult,
     SearchResult,
 )
+from backend.wizard.diagnostics import (
+    DiagnosticTraceRegistry,
+    TRACE_OPERATION_HEADER,
+    TRACE_SESSION_HEADER,
+    framed_content_digest,
+    install_registry,
+    uninstall_registry,
+)
 
 
 USER_ID = "usr_api"
@@ -381,6 +389,120 @@ def test_chat_query_streams_json_sse_and_persists_only_complete_answer() -> None
     assert services.chat_registry.get_session(USER_ID, session_id).title == (
         "Useful Retrieval Session"
     )
+
+
+def test_chat_deep_trace_correlation_preserves_public_sse_and_call_counts() -> None:
+    services, _, embeddings, writer, _, bundle = _services()
+    app = create_app(services)
+    registry = DiagnosticTraceRegistry(USER_ID)
+    trace_session = str(uuid4())
+    operation_id = str(uuid4())
+    registry.start(USER_ID, trace_session, "run")
+    install_registry(registry)
+    try:
+        with TestClient(app) as client:
+            session_id = client.post(
+                "/api/chat/sessions", json={"user_id": USER_ID}
+            ).json()["session_id"]
+            response = client.post(
+                "/api/chat/query",
+                headers={
+                    TRACE_SESSION_HEADER: trace_session,
+                    TRACE_OPERATION_HEADER: operation_id,
+                },
+                json={
+                    "user_id": USER_ID,
+                    "session_id": session_id,
+                    "question": "original question",
+                },
+            )
+    finally:
+        uninstall_registry(registry)
+
+    assert response.status_code == 200
+    assert [name for name, _ in _events(response.text)] == [
+        "token",
+        "token",
+        "telemetry",
+        "done",
+    ]
+    operation = registry.snapshot(USER_ID, trace_session, operation_id)[
+        "operations"
+    ][0]
+    assert operation["kind"] == "chat_query"
+    assert operation["wizard_id"] == session_id
+    assert operation["outcome"] == "succeeded"
+    assert operation["task_id"] is None
+    assert set(operation["related_tasks"]) == {
+        "conversation_persistence",
+        "session_title",
+    }
+    assert all(
+        str(UUID(task_id)) == task_id
+        for task_id in operation["related_tasks"].values()
+    )
+    assert operation["counts"]["original_query_lateon_rows"] == 1
+    assert operation["counts"]["original_query_lateon_dimension"] == (
+        LATEON_EMBEDDING_DIMENSION
+    )
+    assert operation["counts"]["sse_token_event_count"] == 2
+    assert operation["counts"]["sse_telemetry_event_count"] == 1
+    assert operation["counts"]["sse_done_event_count"] == 1
+    assert operation["counts"]["sse_error_event_count"] == 0
+    assert operation["counts"]["sse_first_token_ordinal"] == 1
+    assert operation["counts"]["sse_last_token_ordinal"] == 2
+    assert operation["counts"]["sse_telemetry_ordinal"] == 3
+    assert operation["counts"]["sse_done_ordinal"] == 4
+    assert operation["counts"]["sse_total_event_count"] == 4
+    assert operation["flags"]["sse_success_order_valid"] is True
+    assert operation["texts"]["sse_terminal_event"] == "done"
+    assert operation["digests"]["sse_answer_chunks_sha256"] == (
+        framed_content_digest(
+            "chat-qwen-answer-chunks-v1", (b"first ", b"second")
+        )
+    )
+    for stage in (
+        "chat.endpoint_pre_pipeline_total",
+        "chat.api_validation_session",
+        "chat.runtime_setup",
+        "chat.collection_factory",
+        "chat.session_stream_reservation",
+        "chat.collection_ensure",
+        "chat.original_query_lateon",
+        "chat.conversation_hybrid",
+        "chat.conversation_bge",
+        "chat.conversation_collapse",
+        "chat.conversation_relevance_floor",
+        "chat.conversation_adaptive_k",
+        "chat.conversation_hydration",
+        "chat.conversation_mmr",
+        "chat.conversation_finalize",
+        "chat.conversation_registry_update",
+        "chat.persistence_enqueue",
+        "chat.persistence_task_execution",
+        "chat.persistence_segmentation",
+        "chat.persistence_embeddings_fork_join",
+        "chat.persistence_lateon",
+        "chat.persistence_gte",
+        "chat.persistence_collection_factory",
+        "chat.persistence_storage_total",
+        "chat.title_enqueue",
+        "chat.title_task_execution",
+        "chat.title_snapshot",
+        "chat.title_transcript_render",
+        "chat.title_context_build",
+        "chat.title_prompt_build",
+        "chat.title_runtime_setup",
+        "chat.title_generation",
+        "chat.title_validation",
+        "chat.title_registry_update",
+    ):
+        assert operation["stages"][stage]["call_count"] == 1
+    assert len(bundle.conversations.calls) == 1
+    assert len(bundle.knowledge_facts.calls) == 1
+    assert len(bundle.policy.calls) == 1
+    assert len(embeddings.calls) == 1
+    assert len(writer.inserted) == 1
 
 
 def test_title_enqueue_failure_does_not_invalidate_completed_answer(

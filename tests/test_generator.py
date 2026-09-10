@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Sequence
+import json
+from uuid import uuid4
 
 import pytest
 from backend.model_config import PRIMARY_GENERATOR, TOKEN_BUDGETS
 from backend.prompts import ANSWER_GENERATION_PROMPT
 from backend.rag.generator import generate_answer_stream
 from backend.rag.runtime import RAGRuntime, RerankResult
+from backend.wizard.diagnostics import (
+    DiagnosticTraceRegistry,
+    activate_operation,
+    install_registry,
+    uninstall_registry,
+)
 
 
 class FakeLLM:
@@ -70,7 +78,18 @@ class WordTokenizer:
         return list(range(len(text.split())))
 
 
-def _runtime(llm: FakeLLM) -> RAGRuntime:
+class CountingWordTokenizer(WordTokenizer):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def encode(self, text: str) -> list[int]:
+        self.calls += 1
+        return super().encode(text)
+
+
+def _runtime(
+    llm: FakeLLM, *, tokenizer: WordTokenizer | None = None
+) -> RAGRuntime:
     return RAGRuntime(
         llm,
         DummyEmbeddings(),
@@ -78,17 +97,22 @@ def _runtime(llm: FakeLLM) -> RAGRuntime:
         lambda user_id: object(),
         multi_vectors=DummyMultiVectors(),
         conversation_segmenter=DummySegmenter(),
-        tokenizer=WordTokenizer(),
+        tokenizer=tokenizer or WordTokenizer(),
     )
 
 
-async def _collect(llm: FakeLLM, *, knowledge: list[dict[str, str]] | None = None) -> list[str]:
+async def _collect(
+    llm: FakeLLM,
+    *,
+    knowledge: list[dict[str, object]] | None = None,
+    policy: list[dict[str, object]] | None = None,
+) -> list[str]:
     return [
         chunk
         async for chunk in generate_answer_stream(
             "Explain retrieval for this architecture",
             knowledge or [{"raw_text": "Knowledge fact one."}],
-            [{"raw_text": "Policy guideline one."}],
+            policy or [{"raw_text": "Policy guideline one."}],
             runtime=_runtime(llm),
         )
     ]
@@ -238,3 +262,171 @@ def test_fixed_prompt_and_query_over_total_budget_is_rejected() -> None:
     with pytest.raises(ValueError, match="fixed answer prompt"):
         asyncio.run(scenario())
     assert llm.calls == []
+
+
+def test_generator_trace_proves_exact_final_context_without_extra_llm_calls() -> None:
+    knowledge_id = str(uuid4())
+    policy_id = str(uuid4())
+    knowledge_text = "trace-only knowledge content"
+    policy_text = "trace-only policy content"
+    llm = FakeLLM(["answer"])
+    registry = DiagnosticTraceRegistry("diagnostic_user")
+    session_id = str(uuid4())
+    operation_id = str(uuid4())
+    registry.start("diagnostic_user", session_id, "run")
+    handle = registry.begin_operation(
+        user_id="diagnostic_user",
+        session_id=session_id,
+        operation_id=operation_id,
+        kind="chat_query",
+        collection_type="conversations",
+        wizard_id=str(uuid4()),
+    )
+    assert handle is not None
+    install_registry(registry)
+    try:
+        with activate_operation(handle):
+            chunks = asyncio.run(
+                _collect(
+                    llm,
+                    knowledge=[
+                        {
+                            "object_id": knowledge_id,
+                            "raw_text": knowledge_text,
+                            "rerank_score": 0.9,
+                        }
+                    ],
+                    policy=[
+                        {
+                            "object_id": policy_id,
+                            "raw_text": policy_text,
+                            "rerank_score": 0.8,
+                        }
+                    ],
+                )
+            )
+    finally:
+        uninstall_registry(registry)
+
+    assert chunks == ["answer"]
+    assert len(llm.calls) == 1
+    operation = registry.snapshot(
+        "diagnostic_user", session_id, operation_id
+    )["operations"][0]
+    assert operation["stages"]["chat.qwen_prompt_construction"]["call_count"] == 1
+    assert operation["counts"]["qwen_knowledge_used_count"] == 1
+    assert operation["counts"]["qwen_policy_used_count"] == 1
+    assert operation["samples"]["qwen_knowledge_used_ids"]["items"] == [
+        knowledge_id
+    ]
+    assert operation["samples"]["qwen_policy_used_ids"]["items"]
+    assert operation["digests"]["qwen_constructed_prompt_sha256"] == operation[
+        "digests"
+    ]["qwen_stream_prompt_sha256"]
+    serialized = json.dumps(operation, sort_keys=True)
+    assert knowledge_text not in serialized
+    assert policy_text not in serialized
+
+
+def test_generator_trace_fault_cannot_change_an_accepted_context_contract() -> None:
+    llm = FakeLLM(["answer"])
+    registry = DiagnosticTraceRegistry("diagnostic_user")
+    session_id = str(uuid4())
+    operation_id = str(uuid4())
+    registry.start("diagnostic_user", session_id, "run")
+    handle = registry.begin_operation(
+        user_id="diagnostic_user",
+        session_id=session_id,
+        operation_id=operation_id,
+        kind="chat_query",
+        collection_type="conversations",
+        wizard_id=str(uuid4()),
+    )
+    assert handle is not None
+    install_registry(registry)
+    try:
+        with activate_operation(handle):
+            chunks = asyncio.run(_collect(llm))
+    finally:
+        uninstall_registry(registry)
+
+    assert chunks == ["answer"]
+    assert len(llm.calls) == 1
+    assert registry.snapshot("diagnostic_user", session_id)["trace_faulted"] is True
+
+
+def test_generator_trace_uses_the_single_budgeted_prompt_without_retokenizing() -> None:
+    knowledge = [
+        {
+            "object_id": str(uuid4()),
+            "raw_text": (f"knowledge-{index} " * size).strip(),
+            "rerank_score": score,
+        }
+        for index, size, score in ((1, 1800, 0.9), (2, 600, 0.1))
+    ]
+    policy = [
+        {
+            "object_id": str(uuid4()),
+            "raw_text": ("policy " * 740).strip(),
+            "rerank_score": 0.5,
+        }
+    ]
+
+    def run(traced: bool) -> tuple[FakeLLM, CountingWordTokenizer, dict | None]:
+        llm = FakeLLM(["answer"])
+        tokenizer = CountingWordTokenizer()
+        runtime = _runtime(llm, tokenizer=tokenizer)
+
+        async def collect() -> list[str]:
+            return [
+                chunk
+                async for chunk in generate_answer_stream(
+                    ("query " * 600).strip(),
+                    knowledge,
+                    policy,
+                    runtime=runtime,
+                )
+            ]
+
+        if not traced:
+            assert asyncio.run(collect()) == ["answer"]
+            return llm, tokenizer, None
+        registry = DiagnosticTraceRegistry("diagnostic_user")
+        session_id = str(uuid4())
+        operation_id = str(uuid4())
+        registry.start("diagnostic_user", session_id, "run")
+        handle = registry.begin_operation(
+            user_id="diagnostic_user",
+            session_id=session_id,
+            operation_id=operation_id,
+            kind="chat_query",
+            collection_type="conversations",
+            wizard_id=str(uuid4()),
+        )
+        assert handle is not None
+        install_registry(registry)
+        try:
+            with activate_operation(handle):
+                assert asyncio.run(collect()) == ["answer"]
+        finally:
+            uninstall_registry(registry)
+        operation = registry.snapshot(
+            "diagnostic_user", session_id, operation_id
+        )["operations"][0]
+        return llm, tokenizer, operation
+
+    normal_llm, normal_tokenizer, _ = run(False)
+    traced_llm, traced_tokenizer, operation = run(True)
+
+    assert operation is not None
+    assert normal_tokenizer.calls == traced_tokenizer.calls
+    assert len(normal_llm.calls) == len(traced_llm.calls) == 1
+    prompt = traced_llm.calls[0]["prompt"]
+    used_knowledge = [
+        item["object_id"] for item in knowledge if item["raw_text"] in prompt
+    ]
+    used_policy = [item["object_id"] for item in policy if item["raw_text"] in prompt]
+    assert operation["samples"]["qwen_knowledge_used_ids"]["items"] == (
+        used_knowledge
+    )
+    assert operation["samples"]["qwen_policy_used_ids"]["items"] == used_policy

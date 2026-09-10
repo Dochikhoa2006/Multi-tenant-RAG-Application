@@ -27,6 +27,17 @@ from backend.providers.granite_query_rewriter import (
     validate_granite_checkpoint,
 )
 from backend.rag.query_rewrite_contract import QueryRewritePrompt
+from backend.wizard.diagnostics import (
+    TRACE_SAMPLE_LIMIT,
+    add_count,
+    observe_elapsed,
+    observe_stage,
+    set_flag,
+    set_framed_digest,
+    set_sample,
+    set_text,
+    trace_operation_active,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -351,6 +362,22 @@ class SGLangGraniteQueryRewriter:
             self.granite_config.response_prefill,
             continuation,
         )
+        if trace_operation_active():
+            set_flag("granite_strict_json", strict_json)
+            set_flag("granite_repair_applied", not strict_json)
+            add_count("granite_final_prompt_tokens", input_tokens)
+            add_count("granite_final_completion_tokens", completion_tokens)
+            if cached_tokens is None:
+                set_flag("granite_cached_tokens_available", False)
+            else:
+                set_flag("granite_cached_tokens_available", True)
+                add_count("granite_final_cached_prompt_tokens", cached_tokens)
+            set_framed_digest(
+                "granite_rewritten_query_sha256",
+                "chat-granite-rewritten-query-v1",
+                (result.encode("utf-8"),),
+            )
+            set_text("granite_rewritten_query", result)
         diagnostics = GraniteRewriteDiagnostics(
             rendered_input_tokens=input_tokens,
             generated_tokens=completion_tokens,
@@ -377,26 +404,102 @@ class SGLangGraniteQueryRewriter:
             raise ValueError("SGLang Granite adapter received an unexpected model identifier")
         if not isinstance(prompt, QueryRewritePrompt):
             raise TypeError("Granite query rewriting requires a structured QueryRewritePrompt")
-        messages, input_tokens, retained_pairs = self._bounded_messages(prompt)
+        with observe_stage("chat.granite_budgeting"):
+            messages, input_tokens, retained_pairs = self._bounded_messages(prompt)
         body = self._request_body(messages)
+        if trace_operation_active():
+            total_pairs = len(prompt.conversation_pairs)
+            retained = prompt.conversation_pairs[:retained_pairs]
+            add_count("granite_input_pair_count", total_pairs)
+            add_count("granite_retained_pair_count", retained_pairs)
+            add_count("granite_dropped_pair_count", total_pairs - retained_pairs)
+            add_count("granite_rendered_input_tokens", input_tokens)
+            for empty_count in (
+                "granite_transient_failure_count",
+                "granite_transient_retry_count",
+                "granite_format_failure_count",
+                "granite_format_retry_count",
+                "granite_usage_response_count",
+                "granite_prompt_tokens_total",
+                "granite_completion_tokens_total",
+                "granite_cached_prompt_tokens_total",
+            ):
+                add_count(empty_count, 0)
+            set_sample(
+                "granite_input_pair_ids",
+                (pair.object_id for pair in prompt.conversation_pairs),
+                exact_count=total_pairs,
+            )
+            set_sample(
+                "granite_retained_pair_ids",
+                (pair.object_id for pair in retained),
+                exact_count=retained_pairs,
+            )
+            set_flag(
+                "granite_input_pair_ids_proof_truncated",
+                total_pairs > TRACE_SAMPLE_LIMIT,
+            )
+            set_flag(
+                "granite_retained_pair_ids_proof_truncated",
+                retained_pairs > TRACE_SAMPLE_LIMIT,
+            )
+            conversation_messages = messages[: retained_pairs * 2]
+            set_framed_digest(
+                "granite_conversation_context_sha256",
+                "chat-granite-conversation-context-v1",
+                (
+                    value
+                    for message in conversation_messages
+                    for value in (
+                        message["role"].encode("utf-8"),
+                        message["content"].encode("utf-8"),
+                    )
+                ),
+            )
+            set_framed_digest(
+                "granite_request_messages_sha256",
+                "chat-granite-request-messages-v1",
+                (
+                    value
+                    for message in messages
+                    for value in (
+                        message["role"].encode("utf-8"),
+                        message["content"].encode("utf-8"),
+                    )
+                ),
+            )
         total_latency_ms = 0.0
         for attempt in range(2):
+            add_count("granite_attempt_count", 1)
             started = perf_counter()
             try:
                 payload = self._send(body)
             except _TransientSGLangQueryRewriteError as exc:
-                total_latency_ms += (perf_counter() - started) * 1000.0
+                attempt_latency_ms = (perf_counter() - started) * 1000.0
+                total_latency_ms += attempt_latency_ms
+                observe_elapsed(
+                    "chat.granite_http", attempt_latency_ms, failed=True
+                )
+                add_count("granite_transient_failure_count", 1)
                 if attempt == 0:
+                    add_count("granite_transient_retry_count", 1)
                     logger.warning(
                         "Retrying transient Granite query-rewrite request",
                         extra={"model": self.sglang_config.served_model},
                     )
                     continue
                 raise SGLangQueryRewriteError(str(exc)) from exc
-            total_latency_ms += (perf_counter() - started) * 1000.0
+            attempt_latency_ms = (perf_counter() - started) * 1000.0
+            total_latency_ms += attempt_latency_ms
+            observe_elapsed("chat.granite_http", attempt_latency_ms)
             continuation, prompt_tokens, completion_tokens, cached_tokens = (
                 self._response_content(payload, expected_prompt_tokens=input_tokens)
             )
+            add_count("granite_usage_response_count", 1)
+            add_count("granite_prompt_tokens_total", prompt_tokens)
+            add_count("granite_completion_tokens_total", completion_tokens)
+            if cached_tokens is not None:
+                add_count("granite_cached_prompt_tokens_total", cached_tokens)
             try:
                 return self._parse_continuation(
                     continuation,
@@ -408,7 +511,9 @@ class SGLangGraniteQueryRewriter:
                     latency_ms=total_latency_ms,
                 )
             except GraniteRewriteFormatError as exc:
+                add_count("granite_format_failure_count", 1)
                 if attempt == 0:
+                    add_count("granite_format_retry_count", 1)
                     logger.warning(
                         "Retrying unrepairable Granite formatting defect",
                         extra={"model": self.sglang_config.served_model},

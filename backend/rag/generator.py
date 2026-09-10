@@ -16,6 +16,18 @@ from backend.model_config import PRIMARY_GENERATOR, TEXT_PROCESSING, TOKEN_BUDGE
 from backend.prompts import ANSWER_GENERATION_PROMPT
 from backend.rag.retrieval import _budget_results
 from backend.rag.runtime import RAGRuntime, TimingObserver, Tokenizer, resolve_runtime
+from backend.wizard.diagnostics import (
+    TRACE_SAMPLE_LIMIT,
+    add_count,
+    framed_content_digest,
+    observe_elapsed,
+    observe_trace_metadata,
+    set_flag,
+    set_framed_digest,
+    set_sample,
+    trace_operation_active,
+    trace_utf8_bytes,
+)
 
 
 def _required_text(value: object, name: str) -> str:
@@ -132,6 +144,71 @@ def _drop_total_budget_tail(
         policy.pop()
 
 
+def _context_item_fingerprints(
+    items: Sequence[Mapping[str, Any]],
+) -> Sequence[str]:
+    if not trace_operation_active():
+        return ()
+    fingerprints: list[str] = []
+    for item in items:
+        object_id = str(item["object_id"])
+        digest = framed_content_digest(
+            "chat-kp-item-v1",
+            (object_id.encode("utf-8"), str(item["raw_text"]).encode("utf-8")),
+        )
+        fingerprints.append(f"{object_id}:{digest}")
+    return tuple(fingerprints)
+
+
+def _trace_final_prompt_context(
+    knowledge: Sequence[Mapping[str, Any]],
+    policy: Sequence[Mapping[str, Any]],
+    prompt: str,
+) -> None:
+    if not trace_operation_active():
+        return
+    for prefix, items in (("knowledge", knowledge), ("policy", policy)):
+        count = len(items)
+        add_count(f"qwen_{prefix}_used_count", count)
+        add_count(
+            f"qwen_{prefix}_context_utf8_bytes",
+            sum(len(str(item["raw_text"]).encode("utf-8")) for item in items)
+            + max(0, count - 1) * len("\n\n".encode("utf-8")),
+        )
+        set_sample(
+            f"qwen_{prefix}_used_ids",
+            (item["object_id"] for item in items),
+            exact_count=count,
+        )
+        set_sample(
+            f"qwen_{prefix}_used_item_fingerprints",
+            _context_item_fingerprints(items),
+            exact_count=count,
+        )
+        set_flag(
+            f"qwen_{prefix}_used_proof_truncated",
+            count > TRACE_SAMPLE_LIMIT,
+        )
+        set_framed_digest(
+            f"qwen_{prefix}_context_sha256",
+            f"chat-qwen-{prefix}-context-v1",
+            (
+                value
+                for item in items
+                for value in (
+                    str(item["object_id"]).encode("utf-8"),
+                    str(item["raw_text"]).encode("utf-8"),
+                )
+            ),
+        )
+    add_count("qwen_constructed_prompt_utf8_bytes", len(prompt.encode("utf-8")))
+    set_framed_digest(
+        "qwen_constructed_prompt_sha256",
+        "chat-qwen-prompt-v1",
+        (prompt.encode("utf-8"),),
+    )
+
+
 def _build_budgeted_prompt(
     query: str,
     knowledge_facts: object,
@@ -146,6 +223,9 @@ def _build_budgeted_prompt(
     while True:
         prompt = _answer_prompt(query, knowledge, policy)
         if len(tokenizer.encode(prompt)) <= TOKEN_BUDGETS.total_context_tokens:
+            observe_trace_metadata(
+                _trace_final_prompt_context, knowledge, policy, prompt
+            )
             return prompt
         _drop_total_budget_tail(knowledge, policy, tokenizer)
 
@@ -171,11 +251,22 @@ async def generate_answer_stream(
         policy_guidelines,
         tokenizer,
     )
+    prompt_elapsed = (perf_counter() - prompt_started) * 1000.0
     if timing_observer is not None:
         timing_observer(
             "prompt_construction",
-            (perf_counter() - prompt_started) * 1000.0,
+            prompt_elapsed,
         )
+    observe_elapsed("chat.qwen_prompt_construction", prompt_elapsed)
+    if trace_operation_active():
+        prompt_bytes = trace_utf8_bytes(prompt)
+        if prompt_bytes is not None:
+            add_count("qwen_stream_prompt_utf8_bytes", len(prompt_bytes))
+            set_framed_digest(
+                "qwen_stream_prompt_sha256",
+                "chat-qwen-prompt-v1",
+                (prompt_bytes,),
+            )
     stream = await asyncio.to_thread(
         partial(
             active_runtime.llm.stream,

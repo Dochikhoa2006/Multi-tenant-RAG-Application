@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 import logging
 import math
 from time import perf_counter
@@ -29,6 +29,17 @@ from backend.rag.runtime import (
     resolve_runtime,
 )
 from backend.weaviate_client.models import HydratedSearchResult, SearchResult
+from backend.wizard.diagnostics import (
+    TRACE_SAMPLE_LIMIT,
+    add_count,
+    framed_content_digest,
+    observe_elapsed,
+    observe_stage,
+    set_flag,
+    set_framed_digest,
+    set_sample,
+    trace_operation_active,
+)
 
 
 _COLLECTION_CONFIGS: dict[str, RetrievalConfig] = {
@@ -50,7 +61,32 @@ _RERANK_TIMING_PHASES = {
     "knowledge_facts": "knowledge_cross_encoder_rerank",
     "policy": "policy_cross_encoder_rerank",
 }
+_TRACE_COLLECTION_PREFIXES = {
+    "knowledge_facts": "knowledge",
+    "policy": "policy",
+}
 _LOGGER = logging.getLogger(__name__)
+
+
+def _context_item_fingerprints(
+    items: Sequence[Mapping[str, Any]],
+) -> Iterable[str]:
+    if not trace_operation_active():
+        return ()
+
+    def fingerprints() -> Iterable[str]:
+        for item in items:
+            object_id = str(item["object_id"])
+            digest = framed_content_digest(
+                "chat-kp-item-v1",
+                (
+                    object_id.encode("utf-8"),
+                    str(item["raw_text"]).encode("utf-8"),
+                ),
+            )
+            yield f"{object_id}:{digest}"
+
+    return fingerprints()
 
 
 def _required_text(value: object, name: str) -> str:
@@ -644,6 +680,7 @@ def retrieve(
     if not callable(getattr(collection_client, "hydrate_mmr_head", None)):
         raise TypeError("collection_client must provide hydrate_mmr_head()")
     config = _COLLECTION_CONFIGS[collection_type]
+    trace_prefix = _TRACE_COLLECTION_PREFIXES.get(collection_type)
     search_started = perf_counter()
     candidates = _hybrid_candidates(
         hybrid_search,
@@ -655,6 +692,29 @@ def retrieve(
     search_elapsed = (perf_counter() - search_started) * 1000.0
     if timing_observer is not None:
         timing_observer(_HYBRID_TIMING_PHASES[collection_type], search_elapsed)
+    if collection_type == "conversations":
+        observe_elapsed("chat.conversation_hybrid", search_elapsed)
+        add_count("conversation_hybrid_candidate_count", len(candidates))
+        add_count("conversation_hybrid_storage_call_count", 1)
+        set_sample(
+            "conversation_hybrid_segment_ids",
+            (candidate.object_id for candidate in candidates),
+            exact_count=len(candidates),
+        )
+        set_sample(
+            "conversation_hybrid_conversation_ids",
+            (candidate.canonical_id for candidate in candidates),
+            exact_count=len(candidates),
+        )
+    elif trace_prefix is not None:
+        observe_elapsed(f"chat.{trace_prefix}_hybrid", search_elapsed)
+        add_count(f"{trace_prefix}_hybrid_candidate_count", len(candidates))
+        add_count(f"{trace_prefix}_hybrid_storage_call_count", 1)
+        set_sample(
+            f"{trace_prefix}_hybrid_ids",
+            (candidate.object_id for candidate in candidates),
+            exact_count=len(candidates),
+        )
     active_runtime = resolve_runtime(runtime)
     rerank_started = perf_counter()
     reranked = _cross_encoder(candidates, query, config, active_runtime)
@@ -663,19 +723,155 @@ def retrieve(
         timing_observer(_RERANK_TIMING_PHASES[collection_type], rerank_elapsed)
 
     if collection_type == "conversations":
-        reranked = _collapse_conversations(reranked, config.candidate_count)
-    eligible = [
-        candidate
-        for candidate in reranked
-        if candidate["rerank_score"] >= config.adaptive_relevance_floor
-    ]
-    adaptive_count = _adaptive_k(eligible, config)
+        observe_elapsed("chat.conversation_bge", rerank_elapsed)
+        add_count("conversation_bge_input_count", len(candidates))
+        add_count("conversation_bge_result_count", len(reranked))
+        add_count("conversation_bge_model_call_count", 1 if candidates else 0)
+        set_flag("conversation_bge_scores_finite", True)
+        set_sample(
+            "conversation_bge_segment_ids",
+            (candidate["object_id"] for candidate in reranked),
+            exact_count=len(reranked),
+        )
+        reranked_segment_count = len(reranked)
+        with observe_stage("chat.conversation_collapse"):
+            reranked = _collapse_conversations(reranked, config.candidate_count)
+        add_count("conversation_collapse_input_count", reranked_segment_count)
+        add_count("conversation_collapse_result_count", len(reranked))
+        set_sample(
+            "conversation_collapsed_ids",
+            (candidate["object_id"] for candidate in reranked),
+            exact_count=len(reranked),
+        )
+        with observe_stage("chat.conversation_relevance_floor"):
+            eligible = [
+                candidate
+                for candidate in reranked
+                if candidate["rerank_score"] >= config.adaptive_relevance_floor
+            ]
+        add_count("conversation_relevance_input_count", len(reranked))
+        add_count("conversation_relevance_eligible_count", len(eligible))
+        set_sample(
+            "conversation_eligible_ids",
+            (candidate["object_id"] for candidate in eligible),
+            exact_count=len(eligible),
+        )
+        with observe_stage("chat.conversation_adaptive_k"):
+            adaptive_count = _adaptive_k(eligible, config)
+    else:
+        if trace_prefix is not None:
+            observe_elapsed(f"chat.{trace_prefix}_bge", rerank_elapsed)
+            add_count(f"{trace_prefix}_bge_input_count", len(candidates))
+            add_count(f"{trace_prefix}_bge_result_count", len(reranked))
+            add_count(
+                f"{trace_prefix}_bge_model_call_count",
+                1 if candidates else 0,
+            )
+            set_flag(f"{trace_prefix}_bge_scores_finite", True)
+            set_sample(
+                f"{trace_prefix}_bge_ids",
+                (candidate["object_id"] for candidate in reranked),
+                exact_count=len(reranked),
+            )
+            with observe_stage(f"chat.{trace_prefix}_relevance_floor"):
+                eligible = [
+                    candidate
+                    for candidate in reranked
+                    if candidate["rerank_score"]
+                    >= config.adaptive_relevance_floor
+                ]
+            add_count(f"{trace_prefix}_relevance_input_count", len(reranked))
+            add_count(f"{trace_prefix}_relevance_eligible_count", len(eligible))
+            set_sample(
+                f"{trace_prefix}_eligible_ids",
+                (candidate["object_id"] for candidate in eligible),
+                exact_count=len(eligible),
+            )
+            with observe_stage(f"chat.{trace_prefix}_adaptive_k"):
+                adaptive_count = _adaptive_k(eligible, config)
+        else:  # pragma: no cover - supported collection types are exhaustive.
+            eligible = [
+                candidate
+                for candidate in reranked
+                if candidate["rerank_score"] >= config.adaptive_relevance_floor
+            ]
+            adaptive_count = _adaptive_k(eligible, config)
     adaptive_pool = eligible[:adaptive_count]
-    hydrated_pool, mmr_usable = _hydrate_mmr_head(
-        collection_client,
-        adaptive_pool,
-        collection_type,
-    )
+    if collection_type == "conversations":
+        add_count("conversation_adaptive_eligible_count", len(eligible))
+        add_count("conversation_adaptive_selected_count", adaptive_count)
+        set_sample(
+            "conversation_adaptive_pool_ids",
+            (candidate["object_id"] for candidate in adaptive_pool),
+            exact_count=len(adaptive_pool),
+        )
+        with observe_stage("chat.conversation_hydration"):
+            hydrated_pool, mmr_usable = _hydrate_mmr_head(
+                collection_client,
+                adaptive_pool,
+                collection_type,
+            )
+        add_count("conversation_hydration_requested_count", len(adaptive_pool))
+        add_count("conversation_hydration_result_count", len(hydrated_pool))
+        add_count(
+            "conversation_hydration_quarantined_count",
+            len(adaptive_pool) - len(hydrated_pool),
+        )
+        add_count(
+            "conversation_hydration_storage_call_count",
+            1 if adaptive_pool else 0,
+        )
+        set_flag("conversation_mmr_usable", mmr_usable)
+        set_flag("conversation_hydration_values_finite", mmr_usable)
+        set_sample(
+            "conversation_hydrated_ids",
+            (candidate["object_id"] for candidate in hydrated_pool),
+            exact_count=len(hydrated_pool),
+        )
+    else:
+        if trace_prefix is not None:
+            add_count(f"{trace_prefix}_adaptive_eligible_count", len(eligible))
+            add_count(f"{trace_prefix}_adaptive_selected_count", adaptive_count)
+            set_sample(
+                f"{trace_prefix}_adaptive_pool_ids",
+                (candidate["object_id"] for candidate in adaptive_pool),
+                exact_count=len(adaptive_pool),
+            )
+            with observe_stage(f"chat.{trace_prefix}_hydration"):
+                hydrated_pool, mmr_usable = _hydrate_mmr_head(
+                    collection_client,
+                    adaptive_pool,
+                    collection_type,
+                )
+            add_count(
+                f"{trace_prefix}_hydration_requested_count",
+                len(adaptive_pool),
+            )
+            add_count(
+                f"{trace_prefix}_hydration_result_count",
+                len(hydrated_pool),
+            )
+            add_count(
+                f"{trace_prefix}_hydration_quarantined_count",
+                len(adaptive_pool) - len(hydrated_pool),
+            )
+            add_count(
+                f"{trace_prefix}_hydration_storage_call_count",
+                1 if adaptive_pool else 0,
+            )
+            set_flag(f"{trace_prefix}_mmr_usable", mmr_usable)
+            set_flag(f"{trace_prefix}_hydration_values_finite", mmr_usable)
+            set_sample(
+                f"{trace_prefix}_hydrated_ids",
+                (candidate["object_id"] for candidate in hydrated_pool),
+                exact_count=len(hydrated_pool),
+            )
+        else:  # pragma: no cover - supported collection types are exhaustive.
+            hydrated_pool, mmr_usable = _hydrate_mmr_head(
+                collection_client,
+                adaptive_pool,
+                collection_type,
+            )
     mmr_started = perf_counter()
     selected = (
         _mmr(hydrated_pool, config.final_count, config)
@@ -685,6 +881,26 @@ def retrieve(
     mmr_elapsed = (perf_counter() - mmr_started) * 1000.0
     if timing_observer is not None and collection_type == "conversations":
         timing_observer("conversation_mmr_rerank", mmr_elapsed)
+    if collection_type == "conversations":
+        observe_elapsed("chat.conversation_mmr", mmr_elapsed)
+        add_count("conversation_mmr_pool_count", len(hydrated_pool))
+        add_count("conversation_mmr_selected_count", len(selected))
+        set_flag("conversation_mmr_fallback", not mmr_usable)
+        set_sample(
+            "conversation_mmr_selected_ids",
+            (candidate["object_id"] for candidate in selected),
+            exact_count=len(selected),
+        )
+    elif trace_prefix is not None:
+        observe_elapsed(f"chat.{trace_prefix}_mmr", mmr_elapsed)
+        add_count(f"{trace_prefix}_mmr_pool_count", len(hydrated_pool))
+        add_count(f"{trace_prefix}_mmr_selected_count", len(selected))
+        set_flag(f"{trace_prefix}_mmr_fallback", not mmr_usable)
+        set_sample(
+            f"{trace_prefix}_mmr_selected_ids",
+            (candidate["object_id"] for candidate in selected),
+            exact_count=len(selected),
+        )
     _LOGGER.debug(
         "Unified retrieval selected adaptive context",
         extra={
@@ -696,13 +912,81 @@ def retrieve(
             "mmr_fallback": not mmr_usable,
         },
     )
-    selected = _final_results(selected, collection_type)
-    if collection_type in _CONTEXT_BUDGETS:
-        selected = _budget_results(
-            selected,
-            _CONTEXT_BUDGETS[collection_type],
-            tokenizer=active_runtime.tokenizer,
+    if collection_type == "conversations":
+        with observe_stage("chat.conversation_finalize"):
+            selected = _final_results(selected, collection_type)
+        add_count("conversation_final_count", len(selected))
+        set_sample(
+            "conversation_final_ids",
+            (item["object_id"] for item in selected),
+            exact_count=len(selected),
         )
+        set_framed_digest(
+            "conversation_final_context_sha256",
+            "chat-conversation-final-v1",
+            (
+                value
+                for item in selected
+                for value in (
+                    item["object_id"].encode("utf-8"),
+                    item["raw_text"].encode("utf-8"),
+                )
+            ),
+        )
+    else:
+        if trace_prefix is not None:
+            with observe_stage(f"chat.{trace_prefix}_finalize"):
+                selected = _final_results(selected, collection_type)
+        else:  # pragma: no cover - supported collection types are exhaustive.
+            selected = _final_results(selected, collection_type)
+    if collection_type in _CONTEXT_BUDGETS:
+        prebudget_count = len(selected)
+        if trace_prefix is not None:
+            with observe_stage(f"chat.{trace_prefix}_budgeting"):
+                selected = _budget_results(
+                    selected,
+                    _CONTEXT_BUDGETS[collection_type],
+                    tokenizer=active_runtime.tokenizer,
+                )
+        else:  # pragma: no cover - supported collection types are exhaustive.
+            selected = _budget_results(
+                selected,
+                _CONTEXT_BUDGETS[collection_type],
+                tokenizer=active_runtime.tokenizer,
+            )
+        if trace_prefix is not None:
+            add_count(f"{trace_prefix}_prebudget_count", prebudget_count)
+            add_count(f"{trace_prefix}_final_count", len(selected))
+            add_count(
+                f"{trace_prefix}_budget_dropped_count",
+                prebudget_count - len(selected),
+            )
+            set_sample(
+                f"{trace_prefix}_final_ids",
+                (item["object_id"] for item in selected),
+                exact_count=len(selected),
+            )
+            set_sample(
+                f"{trace_prefix}_final_item_fingerprints",
+                _context_item_fingerprints(selected),
+                exact_count=len(selected),
+            )
+            set_flag(
+                f"{trace_prefix}_final_proof_truncated",
+                len(selected) > TRACE_SAMPLE_LIMIT,
+            )
+            set_framed_digest(
+                f"{trace_prefix}_final_context_sha256",
+                f"chat-{trace_prefix}-final-v1",
+                (
+                    value
+                    for item in selected
+                    for value in (
+                        item["object_id"].encode("utf-8"),
+                        item["raw_text"].encode("utf-8"),
+                    )
+                ),
+            )
     return selected
 
 

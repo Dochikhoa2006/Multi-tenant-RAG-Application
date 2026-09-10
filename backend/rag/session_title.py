@@ -10,6 +10,14 @@ import re
 from backend.model_config import SESSION_TITLE_GENERATOR
 from backend.prompts import SESSION_TITLE_PROMPT
 from backend.rag.runtime import RAGRuntime, resolve_runtime
+from backend.wizard.diagnostics import (
+    activate_title_provider,
+    add_count,
+    observe_stage,
+    set_framed_digest,
+    set_text,
+    trace_utf8_bytes,
+)
 
 
 _TITLE_WORD = re.compile(r"[^\W_]+(?:[-'][^\W_]+)*", re.UNICODE)
@@ -55,17 +63,42 @@ async def generate_session_title(
     *,
     runtime: RAGRuntime | None = None,
 ) -> str:
-    conversations = _conversation_list(conversation_list)
-    prompt = SESSION_TITLE_PROMPT.format(conversation_list=conversations)
-    active_runtime = resolve_runtime(runtime)
-    response = await asyncio.to_thread(
-        partial(
-            active_runtime.llm.complete,
-            prompt,
-            model=SESSION_TITLE_GENERATOR.model,
+    with observe_stage("chat.title_context_build"):
+        conversations = _conversation_list(conversation_list)
+    add_count("title_conversation_count", len(conversation_list))
+    context_bytes = trace_utf8_bytes(conversations)
+    if context_bytes is not None:
+        add_count("title_context_utf8_bytes", len(context_bytes))
+        set_framed_digest(
+            "title_context_sha256",
+            "chat-title-context-v1",
+            (context_bytes,),
         )
-    )
-    return validate_session_title(response)
+    with observe_stage("chat.title_prompt_build"):
+        prompt = SESSION_TITLE_PROMPT.format(conversation_list=conversations)
+    prompt_bytes = trace_utf8_bytes(prompt)
+    if prompt_bytes is not None:
+        add_count("title_prompt_utf8_bytes", len(prompt_bytes))
+        set_framed_digest(
+            "title_prompt_sha256",
+            "chat-title-prompt-v1",
+            (prompt_bytes,),
+        )
+    with observe_stage("chat.title_runtime_setup"):
+        active_runtime = resolve_runtime(runtime)
+    with activate_title_provider():
+        with observe_stage("chat.title_generation"):
+            response = await asyncio.to_thread(
+                partial(
+                    active_runtime.llm.complete,
+                    prompt,
+                    model=SESSION_TITLE_GENERATOR.model,
+                )
+            )
+    with observe_stage("chat.title_validation"):
+        title = validate_session_title(response)
+    set_text("title", title)
+    return title
 
 
 __all__ = ["generate_session_title", "validate_session_title"]

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock
-from uuid import UUID, uuid5
+from uuid import UUID, uuid4, uuid5
 
 import pytest
 from weaviate.classes.config import DataType
@@ -33,6 +33,12 @@ from backend.weaviate_client.models import (
     SearchResult,
     UserIsolationError,
     WeaviateResponseError,
+)
+from backend.wizard.diagnostics import (
+    DiagnosticTraceRegistry,
+    activate_operation,
+    install_registry,
+    uninstall_registry,
 )
 
 
@@ -758,6 +764,49 @@ def test_insert_uses_deterministic_segment_uuid_and_both_named_vectors() -> None
             "mmr_diversity": [0.1, 0.2],
         },
     )
+
+
+def test_insert_trace_accumulates_existing_calls_without_extra_storage_work() -> None:
+    manager, _, collection = _manager_and_collection()
+    second_segment_id = str(uuid5(UUID(CONVERSATION_ID), "retrieval-segment:1"))
+    collection.data.insert.side_effect = [UUID(SEGMENT_ID), UUID(second_segment_id)]
+    conversations = ConversationCollection(manager, USER_ID)
+    registry = DiagnosticTraceRegistry(USER_ID)
+    session_id = str(uuid4())
+    operation_id = str(uuid4())
+    registry.start(USER_ID, session_id, "run-storage")
+    handle = registry.begin_operation(
+        user_id=USER_ID,
+        session_id=session_id,
+        operation_id=operation_id,
+        kind="chat_query",
+        collection_type="conversations",
+        wizard_id=str(uuid4()),
+    )
+    assert handle is not None
+    install_registry(registry)
+    try:
+        with activate_operation(handle):
+            conversations.insert(
+                CONVERSATION_ID,
+                "onetwo",
+                ["one", "two"],
+                [[_lateon_row(0.2)], [_lateon_row(0.3)]],
+                [0.1],
+            )
+    finally:
+        uninstall_registry(registry)
+
+    operation = registry.snapshot(USER_ID, session_id, operation_id)["operations"][0]
+    assert collection.data.insert.call_count == 2
+    assert operation["stages"]["chat.persistence_weaviate_insert"]["call_count"] == 2
+    assert operation["counts"]["persistence_weaviate_insert_attempt_count"] == 2
+    assert operation["counts"]["persistence_weaviate_insert_success_count"] == 2
+    assert operation["samples"]["persistence_segment_ids"] == {
+        "exact_count": 2,
+        "items": [SEGMENT_ID, second_segment_id],
+        "truncated": False,
+    }
 
 
 def test_partial_segment_write_is_compensated_before_failure_surfaces() -> None:

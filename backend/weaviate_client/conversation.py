@@ -29,6 +29,12 @@ from backend.weaviate_client.models import (
     SearchResult,
     WeaviateResponseError,
 )
+from backend.wizard.diagnostics import (
+    add_count,
+    observe_stage,
+    set_framed_digest,
+    set_sample,
+)
 
 
 class ConversationCollection(_CollectionBase):
@@ -100,32 +106,46 @@ class ConversationCollection(_CollectionBase):
             str(uuid5(namespace, f"retrieval-segment:{index}"))
             for index in range(len(segments))
         ]
+        add_count("persistence_weaviate_expected_insert_count", len(segment_ids))
+        set_sample(
+            "persistence_segment_ids",
+            segment_ids,
+            exact_count=len(segment_ids),
+        )
+        set_framed_digest(
+            "persistence_segment_ids_sha256",
+            "chat-conversation-persistence-segment-ids-v1",
+            (segment_id.encode("ascii") for segment_id in segment_ids),
+        )
         attempted: list[str] = []
         try:
             for index, (segment_id, segment_text, multi_vector) in enumerate(
                 zip(segment_ids, segments, vectors, strict=True)
             ):
                 attempted.append(segment_id)
-                inserted = self._collection.data.insert(
-                    properties={
-                        "user_id": self.user_id,
-                        "conversation_id": canonical_id,
-                        "segment_id": segment_id,
-                        "segment_index": index,
-                        "raw_text": text,
-                        "segment_text": segment_text,
-                    },
-                    uuid=segment_id,
-                    vector={
-                        LATE_INTERACTION_VECTOR_NAME: multi_vector,
-                        MMR_DIVERSITY_VECTOR_NAME: diversity,
-                    },
-                )
+                add_count("persistence_weaviate_insert_attempt_count", 1)
+                with observe_stage("chat.persistence_weaviate_insert"):
+                    inserted = self._collection.data.insert(
+                        properties={
+                            "user_id": self.user_id,
+                            "conversation_id": canonical_id,
+                            "segment_id": segment_id,
+                            "segment_index": index,
+                            "raw_text": text,
+                            "segment_text": segment_text,
+                        },
+                        uuid=segment_id,
+                        vector={
+                            LATE_INTERACTION_VECTOR_NAME: multi_vector,
+                            MMR_DIVERSITY_VECTOR_NAME: diversity,
+                        },
+                    )
                 inserted_id = _uuid_text(str(inserted), "inserted object UUID")
                 if inserted_id != segment_id:
                     raise WeaviateResponseError(
                         "inserted object UUID does not match segment_id"
                     )
+                add_count("persistence_weaviate_insert_success_count", 1)
         except Exception as write_error:
             try:
                 self._verified_delete(

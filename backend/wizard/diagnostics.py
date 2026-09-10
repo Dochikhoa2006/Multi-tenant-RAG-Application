@@ -11,17 +11,21 @@ import hashlib
 import math
 from threading import RLock
 from time import perf_counter
-from typing import Any
+from typing import Any, Callable
 from uuid import UUID
 
 
 TRACE_SCHEMA_VERSION = "1.0"
 TRACE_SESSION_MAX_OPERATIONS = 256
 TRACE_SAMPLE_LIMIT = 32
+TRACE_TEXT_MAX_UTF8_BYTES = 8192
 TRACE_SESSION_HEADER = "X-Wizard-Diagnostic-Session-ID"
 TRACE_OPERATION_HEADER = "X-Wizard-Diagnostic-Operation-ID"
+TRACE_RELATED_TASK_ROLES = frozenset(
+    {"conversation_persistence", "session_title"}
+)
 
-OPERATION_KINDS = frozenset({"upload", "save", "delete"})
+OPERATION_KINDS = frozenset({"upload", "save", "delete", "chat_query"})
 STAGE_NAMES = frozenset(
     {
         "api.lookup_validation",
@@ -56,6 +60,68 @@ STAGE_NAMES = frozenset(
         "compensation.chunk_restore",
         "compensation.paragraph_map_restore",
         "compensation.document_map_restore",
+        "chat.endpoint_pre_pipeline_total",
+        "chat.api_validation_session",
+        "chat.runtime_setup",
+        "chat.collection_factory",
+        "chat.session_stream_reservation",
+        "chat.collection_ensure",
+        "chat.original_query_lateon",
+        "chat.conversation_hybrid",
+        "chat.conversation_bge",
+        "chat.conversation_collapse",
+        "chat.conversation_relevance_floor",
+        "chat.conversation_adaptive_k",
+        "chat.conversation_hydration",
+        "chat.conversation_mmr",
+        "chat.conversation_finalize",
+        "chat.granite_budgeting",
+        "chat.granite_http",
+        "chat.rewritten_query_lateon",
+        "chat.knowledge_policy_fork_join",
+        "chat.knowledge_hybrid",
+        "chat.knowledge_bge",
+        "chat.knowledge_relevance_floor",
+        "chat.knowledge_adaptive_k",
+        "chat.knowledge_hydration",
+        "chat.knowledge_mmr",
+        "chat.knowledge_finalize",
+        "chat.knowledge_budgeting",
+        "chat.policy_hybrid",
+        "chat.policy_bge",
+        "chat.policy_relevance_floor",
+        "chat.policy_adaptive_k",
+        "chat.policy_hydration",
+        "chat.policy_mmr",
+        "chat.policy_finalize",
+        "chat.policy_budgeting",
+        "chat.qwen_prompt_construction",
+        "chat.qwen_http",
+        "chat.qwen_ttft",
+        "chat.qwen_generation",
+        "chat.qwen_stream_total",
+        "chat.conversation_registry_update",
+        "chat.persistence_enqueue",
+        "chat.persistence_task_execution",
+        "chat.persistence_segmentation",
+        "chat.persistence_embeddings_fork_join",
+        "chat.persistence_lateon",
+        "chat.persistence_gte",
+        "chat.persistence_collection_factory",
+        "chat.persistence_storage_total",
+        "chat.persistence_weaviate_insert",
+        "chat.title_enqueue",
+        "chat.title_task_execution",
+        "chat.title_snapshot",
+        "chat.title_transcript_render",
+        "chat.title_context_build",
+        "chat.title_prompt_build",
+        "chat.title_runtime_setup",
+        "chat.title_generation",
+        "chat.title_qwen_http",
+        "chat.title_qwen_total",
+        "chat.title_validation",
+        "chat.title_registry_update",
     }
 )
 
@@ -90,6 +156,23 @@ def _framed_hash(parts: Iterable[bytes]) -> str:
         digest.update(len(part).to_bytes(8, "big"))
         digest.update(part)
     return digest.hexdigest()
+
+
+def _content_digest(domain: str, parts: Iterable[bytes]) -> str:
+    digest = hashlib.sha256()
+    digest.update(_required_text(domain, "digest domain", maximum=96).encode("ascii"))
+    for part in parts:
+        if not isinstance(part, bytes):
+            raise TypeError("diagnostic digest parts must be bytes")
+        digest.update(len(part).to_bytes(8, "big"))
+        digest.update(part)
+    return digest.hexdigest()
+
+
+def framed_content_digest(domain: str, parts: Iterable[bytes]) -> str:
+    """Return the canonical sanitized digest used by diagnostic evidence."""
+
+    return _content_digest(domain, parts)
 
 
 def _mapping_digest(mapping: Mapping[int, Sequence[str]]) -> str:
@@ -173,11 +256,13 @@ class _Operation:
     finished_at: str | None = None
     outcome: str = "running"
     task_id: str | None = None
+    related_tasks: dict[str, str] = field(default_factory=dict)
     stages: dict[str, _Stage] = field(default_factory=dict)
     counts: dict[str, int] = field(default_factory=dict)
     flags: dict[str, bool] = field(default_factory=dict)
     digests: dict[str, str] = field(default_factory=dict)
     samples: dict[str, _Sample] = field(default_factory=dict)
+    texts: dict[str, str] = field(default_factory=dict)
 
     def payload(self) -> dict[str, object]:
         return {
@@ -187,6 +272,7 @@ class _Operation:
             "collection_type": self.collection_type,
             "wizard_id": self.wizard_id,
             "task_id": self.task_id,
+            "related_tasks": dict(sorted(self.related_tasks.items())),
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "outcome": self.outcome,
@@ -199,6 +285,7 @@ class _Operation:
             "samples": {
                 name: sample.payload() for name, sample in sorted(self.samples.items())
             },
+            "texts": dict(sorted(self.texts.items())),
         }
 
 
@@ -311,6 +398,20 @@ class DiagnosticTraceRegistry:
         with self._lock:
             self._operation(handle).digests[key] = value.lower()
 
+    def set_text(self, handle: TraceHandle, name: str, value: str) -> None:
+        key = _required_text(name, "text name", maximum=96)
+        if not isinstance(value, str) or not value:
+            raise ValueError("diagnostic text must be a non-empty string")
+        encoded = value.encode("utf-8")
+        with self._lock:
+            operation = self._operation(handle)
+            operation.counts[f"{key}_utf8_bytes"] = len(encoded)
+            if len(encoded) > TRACE_TEXT_MAX_UTF8_BYTES:
+                operation.flags[f"{key}_truncated"] = True
+                return
+            operation.texts[key] = value
+            operation.flags[f"{key}_truncated"] = False
+
     def set_sample(
         self,
         handle: TraceHandle,
@@ -361,6 +462,20 @@ class DiagnosticTraceRegistry:
         task = _uuid_text(task_id, "task_id")
         with self._lock:
             self._operation(handle).task_id = task
+
+    def attach_related_task(
+        self, handle: TraceHandle, role: str, task_id: str
+    ) -> None:
+        task_role = _required_text(role, "related task role", maximum=48)
+        if task_role not in TRACE_RELATED_TASK_ROLES:
+            raise ValueError("unknown diagnostic related task role")
+        task = _uuid_text(task_id, "task_id")
+        with self._lock:
+            operation = self._operation(handle)
+            existing = operation.related_tasks.get(task_role)
+            if existing is not None and existing != task:
+                raise ValueError("diagnostic related task role is already attached")
+            operation.related_tasks[task_role] = task
 
     def finish(self, handle: TraceHandle, outcome: str) -> None:
         if outcome not in {"succeeded", "failed"}:
@@ -431,6 +546,9 @@ _REGISTRY: DiagnosticTraceRegistry | None = None
 _ACTIVE_HANDLE: ContextVar[TraceHandle | None] = ContextVar(
     "wizard_diagnostic_operation", default=None
 )
+_TITLE_PROVIDER_ACTIVE: ContextVar[bool] = ContextVar(
+    "wizard_diagnostic_title_provider", default=False
+)
 
 
 def install_registry(registry: DiagnosticTraceRegistry) -> None:
@@ -450,6 +568,51 @@ def uninstall_registry(registry: DiagnosticTraceRegistry) -> None:
 
 def installed_registry() -> DiagnosticTraceRegistry | None:
     return _REGISTRY
+
+
+def trace_operation_active() -> bool:
+    return _REGISTRY is not None and _ACTIVE_HANDLE.get() is not None
+
+
+def active_trace_handle() -> TraceHandle | None:
+    """Return the current immutable handle only while tracing is installed."""
+
+    if _REGISTRY is None:
+        return None
+    return _ACTIVE_HANDLE.get()
+
+
+def title_provider_trace_active() -> bool:
+    return trace_operation_active() and _TITLE_PROVIDER_ACTIVE.get()
+
+
+def trace_utf8_bytes(value: str) -> bytes | None:
+    """Encode trace-only content without allowing an encoding fault to escape."""
+
+    registry = _REGISTRY
+    if registry is None or _ACTIVE_HANDLE.get() is None:
+        return None
+    try:
+        if not isinstance(value, str):
+            raise TypeError("diagnostic text must be a string")
+        return value.encode("utf-8")
+    except Exception:
+        registry.mark_fault()
+        return None
+
+
+def observe_trace_metadata(
+    callback: Callable[..., object], /, *args: object, **kwargs: object
+) -> None:
+    """Run diagnostic-only metadata derivation without affecting production."""
+
+    registry = _REGISTRY
+    if registry is None or _ACTIVE_HANDLE.get() is None:
+        return
+    try:
+        callback(*args, **kwargs)
+    except Exception:
+        registry.mark_fault()
 
 
 def begin_request_operation(
@@ -491,6 +654,20 @@ def activate_operation(handle: TraceHandle | None) -> Iterator[None]:
 
 
 @contextmanager
+def activate_title_provider() -> Iterator[None]:
+    """Identify the existing title completion without changing its arguments."""
+
+    if not trace_operation_active():
+        yield
+        return
+    token: Token[bool] = _TITLE_PROVIDER_ACTIVE.set(True)
+    try:
+        yield
+    finally:
+        _TITLE_PROVIDER_ACTIVE.reset(token)
+
+
+@contextmanager
 def observe_stage(name: str, *, handle: TraceHandle | None = None) -> Iterator[None]:
     active = handle if handle is not None else _ACTIVE_HANDLE.get()
     registry = _REGISTRY
@@ -511,6 +688,23 @@ def observe_stage(name: str, *, handle: TraceHandle | None = None) -> Iterator[N
             )
         except Exception:
             registry.mark_fault()
+
+
+def observe_elapsed(
+    name: str,
+    elapsed_ms: float,
+    *,
+    failed: bool = False,
+    handle: TraceHandle | None = None,
+) -> None:
+    active = handle if handle is not None else _ACTIVE_HANDLE.get()
+    registry = _REGISTRY
+    if active is None or registry is None:
+        return
+    try:
+        registry.observe_stage(active, name, elapsed_ms, failed)
+    except Exception:
+        registry.mark_fault()
 
 
 def _safe_observe(callback: Any, *args: object, **kwargs: object) -> None:
@@ -542,6 +736,25 @@ def set_digest(name: str, value: str) -> None:
         _safe_observe(registry.set_digest, name, value)
 
 
+def set_framed_digest(name: str, domain: str, parts: Iterable[bytes]) -> None:
+    """Hash length-framed content only while a trace operation is active."""
+
+    registry = _REGISTRY
+    handle = _ACTIVE_HANDLE.get()
+    if registry is None or handle is None:
+        return
+    try:
+        registry.set_digest(handle, name, _content_digest(domain, parts))
+    except Exception:
+        registry.mark_fault()
+
+
+def set_text(name: str, value: str) -> None:
+    registry = _REGISTRY
+    if registry is not None:
+        _safe_observe(registry.set_text, name, value)
+
+
 def set_mapping_digest(name: str, mapping: Mapping[int, Sequence[str]]) -> None:
     """Compute a sanitized mapping digest only for an active trace."""
 
@@ -569,6 +782,18 @@ def attach_task(handle: TraceHandle | None, task_id: str) -> None:
         return
     try:
         registry.attach_task(handle, task_id)
+    except Exception:
+        registry.mark_fault()
+
+
+def attach_related_task(
+    handle: TraceHandle | None, role: str, task_id: str
+) -> None:
+    registry = _REGISTRY
+    if registry is None or handle is None:
+        return
+    try:
+        registry.attach_related_task(handle, role, task_id)
     except Exception:
         registry.mark_fault()
 
@@ -727,23 +952,37 @@ __all__ = [
     "TRACE_SAMPLE_LIMIT",
     "TRACE_SCHEMA_VERSION",
     "TRACE_SESSION_HEADER",
+    "TRACE_SESSION_MAX_OPERATIONS",
+    "TRACE_TEXT_MAX_UTF8_BYTES",
     "TraceHandle",
+    "TRACE_RELATED_TASK_ROLES",
     "activate_operation",
+    "activate_title_provider",
+    "active_trace_handle",
     "add_count",
     "attach_task",
+    "attach_related_task",
     "begin_request_operation",
     "finish_operation",
+    "framed_content_digest",
     "fail_operation_on_error",
     "install_registry",
     "installed_registry",
     "mapping_checkpoint",
     "mapping_digest",
     "mapping_membership_digest",
+    "observe_elapsed",
+    "observe_trace_metadata",
     "observe_stage",
     "operation_lifecycle",
     "set_digest",
+    "set_framed_digest",
     "set_flag",
     "set_mapping_digest",
     "set_sample",
+    "set_text",
+    "trace_operation_active",
+    "title_provider_trace_active",
+    "trace_utf8_bytes",
     "uninstall_registry",
 ]

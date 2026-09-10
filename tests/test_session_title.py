@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Sequence
 import threading
+from uuid import uuid4
 
 import pytest
 
@@ -10,6 +11,12 @@ from backend.model_config import SESSION_TITLE_GENERATOR
 from backend.prompts import SESSION_TITLE_PROMPT
 from backend.rag.runtime import RAGRuntime, RerankResult
 from backend.rag.session_title import generate_session_title
+from backend.wizard.diagnostics import (
+    DiagnosticTraceRegistry,
+    activate_operation,
+    install_registry,
+    uninstall_registry,
+)
 
 
 class FakeLLM:
@@ -91,6 +98,44 @@ def test_session_title_uses_ordered_p3_context_configured_model_and_worker() -> 
     assert "Question one and answer one" in prompt
     assert options == {"model": SESSION_TITLE_GENERATOR.model}
     assert provider_thread != main_thread
+
+
+def test_session_title_trace_observes_same_prompt_and_single_completion() -> None:
+    llm = FakeLLM("Useful Retrieval Design")
+    registry = DiagnosticTraceRegistry("usr_title")
+    session_id = str(uuid4())
+    operation_id = str(uuid4())
+    registry.start("usr_title", session_id, "run-title")
+    handle = registry.begin_operation(
+        user_id="usr_title",
+        session_id=session_id,
+        operation_id=operation_id,
+        kind="chat_query",
+        collection_type="conversations",
+        wizard_id=str(uuid4()),
+    )
+    assert handle is not None
+    install_registry(registry)
+    try:
+        with activate_operation(handle):
+            title = asyncio.run(
+                generate_session_title(
+                    ["Question and answer"],
+                    runtime=_runtime(llm),
+                )
+            )
+    finally:
+        uninstall_registry(registry)
+
+    operation = registry.snapshot("usr_title", session_id, operation_id)["operations"][0]
+    assert title == "Useful Retrieval Design"
+    assert len(llm.calls) == 1
+    assert operation["stages"]["chat.title_context_build"]["call_count"] == 1
+    assert operation["stages"]["chat.title_prompt_build"]["call_count"] == 1
+    assert operation["stages"]["chat.title_generation"]["call_count"] == 1
+    assert operation["stages"]["chat.title_validation"]["call_count"] == 1
+    assert operation["texts"]["title"] == title
+    assert "Question and answer" not in str(operation)
 
 
 def test_session_title_prompt_exposes_documented_contract() -> None:

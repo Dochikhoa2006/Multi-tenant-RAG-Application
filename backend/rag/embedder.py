@@ -9,6 +9,15 @@ import math
 from backend.mappings._common import required_uuid, validated_user_id
 from backend.model_config import EMBEDDING_MODEL, LATEON_EMBEDDING_DIMENSION
 from backend.rag.runtime import RAGRuntime, resolve_runtime
+from backend.wizard.diagnostics import (
+    add_count,
+    observe_stage,
+    set_flag,
+    set_framed_digest,
+    set_sample,
+    trace_operation_active,
+    trace_utf8_bytes,
+)
 
 
 def _required_text(value: object, name: str) -> str:
@@ -72,7 +81,8 @@ def encode_documents(
     if not validated:
         return []
     active_runtime = resolve_runtime(runtime)
-    raw = active_runtime.multi_vectors.encode_documents(validated)
+    with observe_stage("chat.persistence_lateon"):
+        raw = active_runtime.multi_vectors.encode_documents(validated)
     if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
         raise TypeError("multi-vector provider must return a sequence of matrices")
     if len(raw) != len(validated):
@@ -81,6 +91,14 @@ def encode_documents(
     dimensions = {len(row) for matrix in matrices for row in matrix}
     if len(dimensions) != 1:
         raise ValueError("document multi-vectors must have consistent dimensions")
+    if trace_operation_active():
+        row_counts = [len(matrix) for matrix in matrices]
+        add_count("persistence_lateon_document_count", len(matrices))
+        add_count("persistence_lateon_total_rows", sum(row_counts))
+        add_count("persistence_lateon_min_rows", min(row_counts))
+        add_count("persistence_lateon_max_rows", max(row_counts))
+        add_count("persistence_lateon_dimension", next(iter(dimensions)))
+        set_flag("persistence_lateon_values_finite", True)
     return matrices
 
 
@@ -109,9 +127,14 @@ def embed_text(
 ) -> list[float]:
     value = _required_text(text, "text")
     active_runtime = resolve_runtime(runtime)
-    return _validated_vector(
-        active_runtime.embeddings.embed(value, model=EMBEDDING_MODEL)
-    )
+    with observe_stage("chat.persistence_gte"):
+        vector = _validated_vector(
+            active_runtime.embeddings.embed(value, model=EMBEDDING_MODEL)
+        )
+    add_count("persistence_gte_vector_count", 1)
+    add_count("persistence_gte_dimension", len(vector))
+    set_flag("persistence_gte_values_finite", True)
+    return vector
 
 
 def embed_chunks(
@@ -179,32 +202,60 @@ async def embed_conversation(
     answer_text = _required_text(answer, "answer")
     active_runtime = resolve_runtime(runtime)
     raw_text = f"Question:\n{question_text}\n\nAnswer:\n{answer_text}"
+    raw_bytes = trace_utf8_bytes(raw_text)
+    if raw_bytes is not None:
+        add_count("persistence_payload_utf8_bytes", len(raw_bytes))
+        set_framed_digest(
+            "persistence_payload_sha256",
+            "chat-conversation-persistence-payload-v1",
+            (raw_bytes,),
+        )
 
-    segments = await asyncio.to_thread(
-        conversation_segments, raw_text, runtime=active_runtime
+    with observe_stage("chat.persistence_segmentation"):
+        segments = await asyncio.to_thread(
+            conversation_segments, raw_text, runtime=active_runtime
+        )
+    add_count("persistence_segment_count", len(segments))
+    set_sample(
+        "persistence_segment_sizes",
+        (f"{index}:{len(segment.encode('utf-8'))}" for index, segment in enumerate(segments)),
+        exact_count=len(segments),
     )
-    segment_vectors, diversity_vector = await asyncio.gather(
-        asyncio.to_thread(
-            encode_documents,
-            segments,
-            runtime=active_runtime,
-        ),
-        asyncio.to_thread(
-            embed_text,
-            raw_text,
-            runtime=active_runtime,
-        ),
+    set_framed_digest(
+        "persistence_segments_sha256",
+        "chat-conversation-persistence-segments-v1",
+        (segment.encode("utf-8") for segment in segments),
     )
+    with observe_stage("chat.persistence_embeddings_fork_join"):
+        segment_vectors, diversity_vector = await asyncio.gather(
+            asyncio.to_thread(
+                encode_documents,
+                segments,
+                runtime=active_runtime,
+            ),
+            asyncio.to_thread(
+                embed_text,
+                raw_text,
+                runtime=active_runtime,
+            ),
+        )
 
     def insert() -> None:
-        collection = active_runtime.conversation_collection_factory(user)
-        collection.insert(
-            conversation,
-            raw_text,
-            segments,
-            segment_vectors,
-            diversity_vector,
-        )
+        with observe_stage("chat.persistence_collection_factory"):
+            collection = active_runtime.conversation_collection_factory(user)
+        with observe_stage("chat.persistence_storage_total"):
+            inserted_id = collection.insert(
+                conversation,
+                raw_text,
+                segments,
+                segment_vectors,
+                diversity_vector,
+            )
+        if trace_operation_active():
+            set_flag(
+                "persistence_returned_conversation_id_matches",
+                inserted_id == conversation,
+            )
 
     await asyncio.to_thread(insert)
 

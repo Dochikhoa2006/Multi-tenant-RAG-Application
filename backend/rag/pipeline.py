@@ -16,6 +16,15 @@ from backend.rag.generator import generate_answer_stream
 from backend.rag.query_rewriter import rewrite_query
 from backend.rag.retrieval import retrieve
 from backend.rag.runtime import RAGRuntime, TimingObserver, resolve_runtime
+from backend.wizard.diagnostics import (
+    activate_operation,
+    active_trace_handle,
+    add_count,
+    attach_related_task,
+    observe_stage,
+    set_flag,
+    set_text,
+)
 
 
 def _required_text(value: object, name: str) -> str:
@@ -119,13 +128,17 @@ async def run_rag_pipeline(
     if queue is None:
         raise RuntimeError("RAG pipeline requires an observable background queue")
 
-    original_vector = await _timed_sync_call(
-        "original_query_embedding",
-        timing_observer,
-        encode_query,
-        query,
-        runtime=active_runtime,
-    )
+    with observe_stage("chat.original_query_lateon"):
+        original_vector = await _timed_sync_call(
+            "original_query_embedding",
+            timing_observer,
+            encode_query,
+            query,
+            runtime=active_runtime,
+        )
+    add_count("original_query_lateon_rows", len(original_vector))
+    add_count("original_query_lateon_dimension", len(original_vector[0]))
+    set_flag("original_query_lateon_values_finite", True)
     conversations = await _sync_call(
         retrieve,
         collections.conversations,
@@ -143,33 +156,38 @@ async def run_rag_pipeline(
         conversations,
         runtime=active_runtime,
     )
-    rewritten_vector = await _timed_sync_call(
-        "rewritten_query_embedding",
-        timing_observer,
-        encode_query,
-        rewritten_query,
-        runtime=active_runtime,
-    )
+    with observe_stage("chat.rewritten_query_lateon"):
+        rewritten_vector = await _timed_sync_call(
+            "rewritten_query_embedding",
+            timing_observer,
+            encode_query,
+            rewritten_query,
+            runtime=active_runtime,
+        )
+    add_count("rewritten_query_lateon_rows", len(rewritten_vector))
+    add_count("rewritten_query_lateon_dimension", len(rewritten_vector[0]))
+    set_flag("rewritten_query_lateon_values_finite", True)
 
-    knowledge_task = _sync_call(
-        retrieve,
-        collections.knowledge_facts,
-        rewritten_query,
-        rewritten_vector,
-        "knowledge_facts",
-        runtime=active_runtime,
-        timing_observer=timing_observer,
-    )
-    policy_task = _sync_call(
-        retrieve,
-        collections.policy,
-        rewritten_query,
-        rewritten_vector,
-        "policy",
-        runtime=active_runtime,
-        timing_observer=timing_observer,
-    )
-    knowledge, policy = await asyncio.gather(knowledge_task, policy_task)
+    with observe_stage("chat.knowledge_policy_fork_join"):
+        knowledge_task = _sync_call(
+            retrieve,
+            collections.knowledge_facts,
+            rewritten_query,
+            rewritten_vector,
+            "knowledge_facts",
+            runtime=active_runtime,
+            timing_observer=timing_observer,
+        )
+        policy_task = _sync_call(
+            retrieve,
+            collections.policy,
+            rewritten_query,
+            rewritten_vector,
+            "policy",
+            runtime=active_runtime,
+            timing_observer=timing_observer,
+        )
+        knowledge, policy = await asyncio.gather(knowledge_task, policy_task)
 
     answer_chunks: list[str] = []
     generation_started: float | None = None
@@ -195,7 +213,30 @@ async def run_rag_pipeline(
     if not answer.strip():
         raise ValueError("answer stream completed without a non-empty answer")
 
+    trace_handle = active_trace_handle()
+
+    async def traced_persistence() -> None:
+        with activate_operation(trace_handle):
+            add_count("persistence_task_started_count", 1)
+            try:
+                with observe_stage("chat.persistence_task_execution"):
+                    await embed_conversation(
+                        user,
+                        conversation,
+                        query,
+                        answer,
+                        runtime=active_runtime,
+                    )
+            except BaseException:
+                set_flag("persistence_task_succeeded", False)
+                raise
+            else:
+                set_flag("persistence_task_succeeded", True)
+                add_count("persistence_task_completed_count", 1)
+
     def work_factory() -> Awaitable[None]:
+        if trace_handle is not None:
+            return traced_persistence()
         return embed_conversation(
             user,
             conversation,
@@ -204,10 +245,15 @@ async def run_rag_pipeline(
             runtime=active_runtime,
         )
 
-    accepted = queue.enqueue(user, "embed_conversation", work_factory)
-    if not inspect.isawaitable(accepted):
-        raise TypeError("background queue enqueue() must return an awaitable")
-    await accepted
+    with observe_stage("chat.persistence_enqueue"):
+        accepted = queue.enqueue(user, "embed_conversation", work_factory)
+        if not inspect.isawaitable(accepted):
+            raise TypeError("background queue enqueue() must return an awaitable")
+        task_id = await accepted
+    add_count("persistence_enqueue_count", 1)
+    set_flag("persistence_enqueue_accepted", True)
+    set_text("persistence_conversation_id", conversation)
+    attach_related_task(trace_handle, "conversation_persistence", task_id)
 
 
 __all__ = ["UserRetrievalCollections", "run_rag_pipeline"]

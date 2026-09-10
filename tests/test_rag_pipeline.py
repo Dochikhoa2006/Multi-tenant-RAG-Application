@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 import threading
 from typing import Any
-from uuid import UUID, uuid5
+from uuid import UUID, uuid4, uuid5
 
 import pytest
 
@@ -21,6 +21,12 @@ from backend.model_config import (
 from backend.rag.pipeline import UserRetrievalCollections, run_rag_pipeline
 from backend.rag.runtime import RAGRuntime, RerankResult
 from backend.weaviate_client.models import HydratedSearchResult, SearchResult
+from backend.wizard.diagnostics import (
+    DiagnosticTraceRegistry,
+    activate_operation,
+    install_registry,
+    uninstall_registry,
+)
 
 
 USER_ID = "usr_pipeline"
@@ -285,7 +291,7 @@ class RecordingQueue:
         if self.failure is not None:
             raise self.failure
         self.jobs.append((user_id, operation, work_factory))
-        return f"job-{len(self.jobs)}"
+        return str(uuid5(UUID(CONVERSATION_ID), f"job-{len(self.jobs)}"))
 
     async def run_next(self) -> None:
         _, _, work_factory = self.jobs.pop(0)
@@ -464,6 +470,59 @@ def test_knowledge_and_policy_retrieval_run_concurrently() -> None:
     harness = _harness(rendezvous=threading.Barrier(2))
 
     assert asyncio.run(_collect(harness)) == ["MMR ", "balances diversity."]
+
+
+def test_pipeline_trace_keeps_two_query_encodes_and_one_concurrent_join() -> None:
+    harness = _harness(rendezvous=threading.Barrier(2))
+    registry = DiagnosticTraceRegistry(USER_ID)
+    session_id = str(uuid4())
+    operation_id = str(uuid4())
+    registry.start(USER_ID, session_id, "run")
+    handle = registry.begin_operation(
+        user_id=USER_ID,
+        session_id=session_id,
+        operation_id=operation_id,
+        kind="chat_query",
+        collection_type="conversations",
+        wizard_id=str(uuid4()),
+    )
+    assert handle is not None
+    install_registry(registry)
+    try:
+        with activate_operation(handle):
+            chunks = asyncio.run(_collect(harness))
+        asyncio.run(harness.queue.run_next())
+    finally:
+        uninstall_registry(registry)
+
+    assert chunks == ["MMR ", "balances diversity."]
+    assert [
+        call[:2]
+        for call in harness.runtime.multi_vectors.calls  # type: ignore[attr-defined]
+        if call[0] == "query"
+    ] == [
+        ("query", ORIGINAL_QUERY),
+        ("query", REWRITTEN_QUERY),
+    ]
+    assert len(harness.knowledge.calls) == 1
+    assert len(harness.policy.calls) == 1
+    operation = registry.snapshot(USER_ID, session_id, operation_id)[
+        "operations"
+    ][0]
+    assert operation["stages"]["chat.rewritten_query_lateon"]["call_count"] == 1
+    assert operation["stages"]["chat.knowledge_policy_fork_join"]["call_count"] == 1
+    assert operation["counts"]["rewritten_query_lateon_rows"] == 1
+    assert operation["counts"]["rewritten_query_lateon_dimension"] == (
+        LATEON_EMBEDDING_DIMENSION
+    )
+    assert operation["related_tasks"] == {
+        "conversation_persistence": str(
+            uuid5(UUID(CONVERSATION_ID), "job-1")
+        )
+    }
+    assert operation["stages"]["chat.persistence_enqueue"]["call_count"] == 1
+    assert operation["stages"]["chat.persistence_task_execution"]["call_count"] == 1
+    assert operation["flags"]["persistence_task_succeeded"] is True
 
 
 def test_partial_generation_failure_never_enqueues_conversation() -> None:

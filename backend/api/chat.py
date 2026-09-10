@@ -38,6 +38,24 @@ from backend.services import (
     SessionDeletionInProgressError,
     SessionSnapshot,
 )
+from backend.wizard.diagnostics import (
+    TRACE_OPERATION_HEADER,
+    TRACE_SESSION_HEADER,
+    activate_operation,
+    attach_related_task,
+    begin_request_operation,
+    fail_operation_on_error,
+    finish_operation,
+    add_count,
+    observe_elapsed,
+    observe_stage,
+    set_flag,
+    set_framed_digest,
+    set_sample,
+    set_text,
+    trace_operation_active,
+    trace_utf8_bytes,
+)
 
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
@@ -245,17 +263,31 @@ async def query(
 ) -> StreamingResponse:
     request_started = perf_counter()
     correlation_id = request_id(request)
+    trace_handle = begin_request_operation(
+        user_id=body.user_id,
+        session_id=request.headers.get(TRACE_SESSION_HEADER),
+        operation_id=request.headers.get(TRACE_OPERATION_HEADER),
+        kind="chat_query",
+        collection_type="conversations",
+        wizard_id=body.session_id,
+    )
     try:
-        if not body.question.strip():
-            raise ValueError("question must not be empty")
-        services.chat_registry.get_session(body.user_id, body.session_id)
-        conversation_id = services.new_uuid()
+        with fail_operation_on_error(trace_handle):
+            with observe_stage(
+                "chat.api_validation_session", handle=trace_handle
+            ):
+                if not body.question.strip():
+                    raise ValueError("question must not be empty")
+                services.chat_registry.get_session(body.user_id, body.session_id)
+                conversation_id = services.new_uuid()
     except KeyError as exc:
         raise not_found("session", correlation_id) from exc
     except (TypeError, ValueError) as exc:
         raise validation_error(str(exc), correlation_id) from exc
     try:
-        runtime = services.require_rag_runtime()
+        with fail_operation_on_error(trace_handle):
+            with observe_stage("chat.runtime_setup", handle=trace_handle):
+                runtime = services.require_rag_runtime()
     except RuntimeError as exc:
         log_internal_error(
             "RAG runtime is unavailable",
@@ -264,7 +296,9 @@ async def query(
         )
         raise service_unavailable(correlation_id) from exc
     try:
-        collections = services.retrieval_collections_factory(body.user_id)
+        with fail_operation_on_error(trace_handle):
+            with observe_stage("chat.collection_factory", handle=trace_handle):
+                collections = services.retrieval_collections_factory(body.user_id)
     except Exception as exc:
         log_internal_error(
             "Could not construct retrieval collections",
@@ -274,11 +308,15 @@ async def query(
         raise service_unavailable(correlation_id) from exc
 
     try:
-        services.chat_registry.begin_chat_stream(
-            body.user_id,
-            body.session_id,
-            conversation_id,
-        )
+        with fail_operation_on_error(trace_handle):
+            with observe_stage(
+                "chat.session_stream_reservation", handle=trace_handle
+            ):
+                services.chat_registry.begin_chat_stream(
+                    body.user_id,
+                    body.session_id,
+                    conversation_id,
+                )
     except SessionDeletionInProgressError as exc:
         raise public_http_error(
             status.HTTP_409_CONFLICT,
@@ -292,7 +330,9 @@ async def query(
         raise validation_error(str(exc), correlation_id) from exc
 
     try:
-        await _ensure_collections(services, body.user_id, correlation_id)
+        with fail_operation_on_error(trace_handle):
+            with observe_stage("chat.collection_ensure", handle=trace_handle):
+                await _ensure_collections(services, body.user_id, correlation_id)
     except asyncio.CancelledError:
         services.chat_registry.end_chat_stream(
             body.user_id,
@@ -313,101 +353,225 @@ async def query(
     async def stream_events():
         answer_parts: list[str] = []
         first_token_at: float | None = None
-        try:
-            async for chunk in run_rag_pipeline(
-                body.user_id,
-                conversation_id,
-                body.question,
-                collections,
-                runtime=runtime,
-                timing_observer=telemetry.observe,
+        trace_outcome = "failed"
+        sse_event_count = 0
+        with activate_operation(trace_handle):
+            for empty_count in (
+                "sse_token_event_count",
+                "sse_telemetry_event_count",
+                "sse_done_event_count",
+                "sse_error_event_count",
             ):
-                now = perf_counter()
-                if first_token_at is None:
-                    first_token_at = now
-                    telemetry.set("ttft", (now - request_started) * 1000.0)
-                answer_parts.append(chunk)
-                yield _sse("token", {"request_id": correlation_id, "text": chunk})
-
-            answer = "".join(answer_parts)
-            if first_token_at is None:
-                raise ValueError("answer stream completed without tokens")
-            services.chat_registry.record_conversation(
-                body.user_id,
-                body.session_id,
-                conversation_id,
-                body.question,
-                answer,
+                add_count(empty_count, 0)
+            observe_elapsed(
+                "chat.endpoint_pre_pipeline_total",
+                (perf_counter() - request_started) * 1000.0,
             )
-
-            async def title_work() -> None:
-                snapshot = services.chat_registry.get_session(
-                    body.user_id,
-                    body.session_id,
-                )
-                conversation_list = [
-                    f"Question:\n{item.question}\n\nAnswer:\n{item.answer}"
-                    for item in snapshot.conversations
-                ]
-                title = await generate_session_title(
-                    conversation_list,
-                    runtime=runtime,
-                )
-                services.chat_registry.update_title(
-                    body.user_id,
-                    body.session_id,
-                    title,
-                )
-
             try:
-                await services.task_queue.enqueue(
+                async for chunk in run_rag_pipeline(
                     body.user_id,
-                    "generate_session_title",
-                    title_work,
+                    conversation_id,
+                    body.question,
+                    collections,
+                    runtime=runtime,
+                    timing_observer=telemetry.observe,
+                ):
+                    now = perf_counter()
+                    if first_token_at is None:
+                        first_token_at = now
+                        telemetry.set("ttft", (now - request_started) * 1000.0)
+                    answer_parts.append(chunk)
+                    sse_event_count += 1
+                    add_count("sse_token_event_count", 1)
+                    if sse_event_count == 1:
+                        add_count("sse_first_token_ordinal", 1)
+                    yield _sse(
+                        "token", {"request_id": correlation_id, "text": chunk}
+                    )
+
+                answer = "".join(answer_parts)
+                if first_token_at is None:
+                    raise ValueError("answer stream completed without tokens")
+                with observe_stage("chat.conversation_registry_update"):
+                    services.chat_registry.record_conversation(
+                        body.user_id,
+                        body.session_id,
+                        conversation_id,
+                        body.question,
+                        answer,
+                    )
+                add_count("conversation_registry_update_count", 1)
+                set_sample(
+                    "conversation_registry_ids",
+                    (conversation_id,),
+                    exact_count=1,
                 )
+
+                async def title_work() -> None:
+                    with activate_operation(trace_handle):
+                        add_count("title_task_started_count", 1)
+                        try:
+                            with observe_stage("chat.title_task_execution"):
+                                with observe_stage("chat.title_snapshot"):
+                                    snapshot = services.chat_registry.get_session(
+                                        body.user_id,
+                                        body.session_id,
+                                    )
+                                add_count(
+                                    "title_snapshot_conversation_count",
+                                    len(snapshot.conversations),
+                                )
+                                if snapshot.conversations:
+                                    set_text(
+                                        "title_snapshot_last_conversation_id",
+                                        snapshot.conversations[-1].conversation_id,
+                                    )
+                                    set_flag(
+                                        "title_snapshot_trigger_matches",
+                                        snapshot.conversations[-1].conversation_id
+                                        == conversation_id,
+                                    )
+                                set_sample(
+                                    "title_snapshot_conversation_ids",
+                                    (
+                                        item.conversation_id
+                                        for item in snapshot.conversations
+                                    ),
+                                    exact_count=len(snapshot.conversations),
+                                )
+                                set_framed_digest(
+                                    "title_snapshot_sha256",
+                                    "chat-title-snapshot-v1",
+                                    (
+                                        part
+                                        for item in snapshot.conversations
+                                        for part in (
+                                            item.conversation_id.encode("ascii"),
+                                            item.question.encode("utf-8"),
+                                            item.answer.encode("utf-8"),
+                                        )
+                                    ),
+                                )
+                                with observe_stage("chat.title_transcript_render"):
+                                    conversation_list = [
+                                        "Question:\n"
+                                        f"{item.question}\n\nAnswer:\n{item.answer}"
+                                        for item in snapshot.conversations
+                                    ]
+                                title = await generate_session_title(
+                                    conversation_list,
+                                    runtime=runtime,
+                                )
+                                with observe_stage("chat.title_registry_update"):
+                                    services.chat_registry.update_title(
+                                        body.user_id,
+                                        body.session_id,
+                                        title,
+                                    )
+                                add_count("title_registry_update_count", 1)
+                        except BaseException:
+                            set_flag("title_task_succeeded", False)
+                            raise
+                        else:
+                            set_flag("title_task_succeeded", True)
+                            add_count("title_task_completed_count", 1)
+
+                try:
+                    with observe_stage("chat.title_enqueue"):
+                        title_task_id = await services.task_queue.enqueue(
+                            body.user_id,
+                            "generate_session_title",
+                            title_work,
+                        )
+                    add_count("title_enqueue_count", 1)
+                    set_flag("title_enqueue_accepted", True)
+                    attach_related_task(
+                        trace_handle,
+                        "session_title",
+                        title_task_id,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    set_flag("title_enqueue_accepted", False)
+                    log_internal_error(
+                        "Could not schedule optional session title generation",
+                        correlation_id,
+                        user_id=body.user_id,
+                        session_id=body.session_id,
+                        conversation_id=conversation_id,
+                    )
+                telemetry.set(
+                    "total_request", (perf_counter() - request_started) * 1000.0
+                )
+                add_count("sse_last_token_ordinal", len(answer_parts))
+                if trace_operation_active():
+                    answer_bytes = trace_utf8_bytes(answer)
+                    if answer_bytes is not None:
+                        add_count("sse_answer_utf8_bytes", len(answer_bytes))
+                    set_framed_digest(
+                        "sse_answer_chunks_sha256",
+                        "chat-qwen-answer-chunks-v1",
+                        (part.encode("utf-8") for part in answer_parts),
+                    )
+                sse_event_count += 1
+                add_count("sse_telemetry_event_count", 1)
+                add_count("sse_telemetry_ordinal", sse_event_count)
+                yield _sse("telemetry", telemetry.payload(correlation_id))
+                sse_event_count += 1
+                add_count("sse_done_event_count", 1)
+                add_count("sse_done_ordinal", sse_event_count)
+                add_count("sse_total_event_count", sse_event_count)
+                set_flag("sse_success_order_valid", True)
+                set_text("sse_terminal_event", "done")
+                yield _sse(
+                    "done",
+                    {
+                        "request_id": correlation_id,
+                        "conversation_id": conversation_id,
+                    },
+                )
+                trace_outcome = "succeeded"
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 log_internal_error(
-                    "Could not schedule optional session title generation",
+                    "Chat request failed",
                     correlation_id,
                     user_id=body.user_id,
                     session_id=body.session_id,
                     conversation_id=conversation_id,
                 )
-            telemetry.set("total_request", (perf_counter() - request_started) * 1000.0)
-            yield _sse("telemetry", telemetry.payload(correlation_id))
-            yield _sse(
-                "done",
-                {
-                    "request_id": correlation_id,
-                    "conversation_id": conversation_id,
-                },
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            log_internal_error(
-                "Chat request failed",
-                correlation_id,
-                user_id=body.user_id,
-                session_id=body.session_id,
-                conversation_id=conversation_id,
-            )
-            yield _sse(
-                "error",
-                public_detail(
-                    "CHAT_PROCESSING_FAILED",
-                    "The response could not be completed.",
-                    correlation_id,
-                ),
-            )
-        finally:
-            services.chat_registry.end_chat_stream(
-                body.user_id,
-                body.session_id,
-                conversation_id,
-            )
+                add_count("sse_last_token_ordinal", len(answer_parts))
+                if trace_operation_active():
+                    answer_bytes = trace_utf8_bytes("".join(answer_parts))
+                    if answer_bytes is not None:
+                        add_count("sse_answer_utf8_bytes", len(answer_bytes))
+                    set_framed_digest(
+                        "sse_answer_chunks_sha256",
+                        "chat-qwen-answer-chunks-v1",
+                        (part.encode("utf-8") for part in answer_parts),
+                    )
+                sse_event_count += 1
+                add_count("sse_error_event_count", 1)
+                add_count("sse_error_ordinal", sse_event_count)
+                add_count("sse_total_event_count", sse_event_count)
+                set_text("sse_terminal_event", "error")
+                yield _sse(
+                    "error",
+                    public_detail(
+                        "CHAT_PROCESSING_FAILED",
+                        "The response could not be completed.",
+                        correlation_id,
+                    ),
+                )
+            finally:
+                services.chat_registry.end_chat_stream(
+                    body.user_id,
+                    body.session_id,
+                    conversation_id,
+                )
+                finish_operation(trace_handle, trace_outcome)
 
     return StreamingResponse(
         stream_events(),

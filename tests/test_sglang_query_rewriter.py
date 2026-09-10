@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import threading
 import time
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -22,6 +23,12 @@ from backend.providers.sglang_query_rewriter import (
     SGLangQueryRewriteError,
 )
 from backend.rag.query_rewrite_contract import ConversationPair, QueryRewritePrompt
+from backend.wizard.diagnostics import (
+    DiagnosticTraceRegistry,
+    activate_operation,
+    install_registry,
+    uninstall_registry,
+)
 
 
 class FakeTokenizer:
@@ -196,6 +203,61 @@ def test_sglang_request_preserves_turns_prefill_and_sampling_contract() -> None:
     assert adapter.current_diagnostics == adapter.last_diagnostics
 
 
+def test_deep_trace_observes_the_same_granite_request_without_raw_context() -> None:
+    pairs = (
+        ConversationPair("one", "Who is Rex?", "Rex is my dog."),
+        ConversationPair("two", "What has fleas?", "Rex has fleas."),
+    )
+    adapter, _, client = _adapter()
+    registry = DiagnosticTraceRegistry("diagnostic_user")
+    session_id = str(uuid4())
+    operation_id = str(uuid4())
+    registry.start("diagnostic_user", session_id, "run")
+    handle = registry.begin_operation(
+        user_id="diagnostic_user",
+        session_id=session_id,
+        operation_id=operation_id,
+        kind="chat_query",
+        collection_type="conversations",
+        wizard_id=str(uuid4()),
+    )
+    assert handle is not None
+    install_registry(registry)
+    try:
+        with activate_operation(handle):
+            rewritten = adapter.complete(
+                _prompt(*pairs), model=QUERY_REWRITER.model
+            )
+    finally:
+        uninstall_registry(registry)
+
+    operation = registry.snapshot(
+        "diagnostic_user", session_id, operation_id
+    )["operations"][0]
+    assert rewritten == "Standalone Rex question"
+    assert len(client.calls) == 1
+    assert operation["stages"]["chat.granite_budgeting"]["call_count"] == 1
+    assert operation["stages"]["chat.granite_http"]["call_count"] == 1
+    assert operation["counts"]["granite_attempt_count"] == 1
+    assert operation["counts"]["granite_final_prompt_tokens"] > 0
+    assert operation["counts"]["granite_final_completion_tokens"] == 7
+    assert operation["flags"]["granite_strict_json"] is True
+    assert operation["flags"]["granite_repair_applied"] is False
+    assert operation["texts"]["granite_rewritten_query"] == rewritten
+    assert operation["samples"]["granite_retained_pair_ids"]["items"] == [
+        "one",
+        "two",
+    ]
+    serialized = str(operation)
+    assert "Who is Rex?" not in serialized
+    assert "Rex is my dog." not in serialized
+    assert set(operation["digests"]) == {
+        "granite_conversation_context_sha256",
+        "granite_request_messages_sha256",
+        "granite_rewritten_query_sha256",
+    }
+
+
 def test_whole_tail_pairs_are_removed_before_request() -> None:
     tokenizer = FakeTokenizer(characters=True)
     client = RecordingClient(tokenizer)
@@ -323,6 +385,57 @@ def test_unrepairable_format_can_succeed_on_the_single_retry() -> None:
 
     assert adapter.complete(_prompt(), model=QUERY_REWRITER.model) == "Recovered query"
     assert len(client.calls) == 2
+
+
+def test_deep_trace_accumulates_existing_granite_format_retry() -> None:
+    tokenizer = FakeTokenizer()
+
+    def response(_: Mapping[str, object]) -> object:
+        continuation = 'query",}' if len(client.calls) == 1 else 'Recovered query"}'
+        return {
+            "model": SGLANG_QUERY_REWRITE.served_model,
+            "choices": [
+                {"message": {"content": continuation}, "finish_reason": "stop"}
+            ],
+            "usage": {
+                "prompt_tokens": tokenizer.last_count,
+                "completion_tokens": 3,
+            },
+        }
+
+    client = RecordingClient(tokenizer, response_factory=response)
+    adapter, _, _ = _adapter(tokenizer=tokenizer, client=client)
+    registry = DiagnosticTraceRegistry("diagnostic_user")
+    session_id = str(uuid4())
+    operation_id = str(uuid4())
+    registry.start("diagnostic_user", session_id, "run")
+    handle = registry.begin_operation(
+        user_id="diagnostic_user",
+        session_id=session_id,
+        operation_id=operation_id,
+        kind="chat_query",
+        collection_type="conversations",
+        wizard_id=str(uuid4()),
+    )
+    assert handle is not None
+    install_registry(registry)
+    try:
+        with activate_operation(handle):
+            assert adapter.complete(_prompt(), model=QUERY_REWRITER.model) == (
+                "Recovered query"
+            )
+    finally:
+        uninstall_registry(registry)
+
+    operation = registry.snapshot(
+        "diagnostic_user", session_id, operation_id
+    )["operations"][0]
+    assert len(client.calls) == 2
+    assert operation["stages"]["chat.granite_http"]["call_count"] == 2
+    assert operation["counts"]["granite_attempt_count"] == 2
+    assert operation["counts"]["granite_format_failure_count"] == 1
+    assert operation["counts"]["granite_format_retry_count"] == 1
+    assert operation["counts"]["granite_usage_response_count"] == 2
 
 
 def test_timeout_is_translated_to_safe_granite_error() -> None:

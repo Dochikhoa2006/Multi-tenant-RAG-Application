@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from types import SimpleNamespace
-from uuid import UUID, uuid5
+from uuid import UUID, uuid4, uuid5
 
 import pytest
 
@@ -23,6 +23,12 @@ from backend.rag.retrieval import _adaptive_k, _mmr, retrieve
 from backend.rag.runtime import RAGRuntime, RerankResult
 from backend.weaviate_client.models import HydratedSearchResult, SearchResult
 from backend.weaviate_client.models import IncompatibleCollectionSchemaError
+from backend.wizard.diagnostics import (
+    DiagnosticTraceRegistry,
+    activate_operation,
+    install_registry,
+    uninstall_registry,
+)
 
 
 def _uuid(index: int) -> str:
@@ -457,6 +463,190 @@ def test_conversation_searches_fifty_segment_hits_once_and_runs_bge_once() -> No
     assert len(collection.hydration_calls[0]) == 17
 
 
+def test_conversation_deep_trace_observes_existing_calls_without_duplicates() -> None:
+    hits = [
+        _conversation_segment(index, index, 0)
+        for index in range(1, 4)
+    ]
+    collection = FakeCollection(hits)
+    reranker = FakeReranker()
+    registry = DiagnosticTraceRegistry("diagnostic_user")
+    trace_session = str(uuid4())
+    operation_id = str(uuid4())
+    chat_session = str(uuid4())
+    registry.start("diagnostic_user", trace_session, "run")
+    handle = registry.begin_operation(
+        user_id="diagnostic_user",
+        session_id=trace_session,
+        operation_id=operation_id,
+        kind="chat_query",
+        collection_type="conversations",
+        wizard_id=chat_session,
+    )
+    assert handle is not None
+    install_registry(registry)
+    try:
+        with activate_operation(handle):
+            results = retrieve(
+                collection,
+                "question",
+                [[0.3, 0.7]],
+                "conversations",
+                runtime=_runtime(reranker),
+            )
+    finally:
+        uninstall_registry(registry)
+
+    operation = registry.snapshot(
+        "diagnostic_user", trace_session, operation_id
+    )["operations"][0]
+    assert len(collection.calls) == 1
+    assert len(reranker.calls) == 1
+    assert len(collection.hydration_calls) == 1
+    assert set(operation["stages"]) == {
+        "chat.conversation_hybrid",
+        "chat.conversation_bge",
+        "chat.conversation_collapse",
+        "chat.conversation_relevance_floor",
+        "chat.conversation_adaptive_k",
+        "chat.conversation_hydration",
+        "chat.conversation_mmr",
+        "chat.conversation_finalize",
+    }
+    assert operation["counts"]["conversation_hybrid_storage_call_count"] == 1
+    assert operation["counts"]["conversation_bge_model_call_count"] == 1
+    assert operation["counts"]["conversation_hydration_storage_call_count"] == 1
+    assert operation["counts"]["conversation_final_count"] == len(results)
+    assert operation["samples"]["conversation_final_ids"]["truncated"] is False
+    assert set(operation["digests"]) == {"conversation_final_context_sha256"}
+
+
+@pytest.mark.parametrize(
+    ("collection_type", "prefix"),
+    [("knowledge_facts", "knowledge"), ("policy", "policy")],
+)
+def test_kp_deep_trace_observes_existing_calls_without_duplicates(
+    collection_type: str,
+    prefix: str,
+) -> None:
+    collection = FakeCollection(
+        [
+            _chunk(1, f"{prefix} one", (1.0, 0.0), 0.9),
+            _chunk(2, f"{prefix} two", (0.0, 1.0), 0.8),
+        ]
+    )
+    reranker = FakeReranker()
+    registry = DiagnosticTraceRegistry("diagnostic_user")
+    trace_session = str(uuid4())
+    operation_id = str(uuid4())
+    registry.start("diagnostic_user", trace_session, "run")
+    handle = registry.begin_operation(
+        user_id="diagnostic_user",
+        session_id=trace_session,
+        operation_id=operation_id,
+        kind="chat_query",
+        collection_type="conversations",
+        wizard_id=str(uuid4()),
+    )
+    assert handle is not None
+    install_registry(registry)
+    try:
+        with activate_operation(handle):
+            results = retrieve(
+                collection,
+                "rewritten question",
+                [[0.3, 0.7]],
+                collection_type,
+                runtime=_runtime(reranker),
+            )
+    finally:
+        uninstall_registry(registry)
+
+    operation = registry.snapshot(
+        "diagnostic_user", trace_session, operation_id
+    )["operations"][0]
+    assert len(collection.calls) == 1
+    assert len(reranker.calls) == 1
+    assert len(collection.hydration_calls) == 1
+    assert {
+        f"chat.{prefix}_hybrid",
+        f"chat.{prefix}_bge",
+        f"chat.{prefix}_relevance_floor",
+        f"chat.{prefix}_adaptive_k",
+        f"chat.{prefix}_hydration",
+        f"chat.{prefix}_mmr",
+        f"chat.{prefix}_finalize",
+        f"chat.{prefix}_budgeting",
+    } <= set(operation["stages"])
+    assert operation["counts"][f"{prefix}_hybrid_storage_call_count"] == 1
+    assert operation["counts"][f"{prefix}_bge_model_call_count"] == 1
+    assert operation["counts"][f"{prefix}_hydration_storage_call_count"] == 1
+    assert operation["counts"][f"{prefix}_final_count"] == len(results)
+    assert operation["samples"][f"{prefix}_final_ids"]["truncated"] is False
+    assert (
+        operation["samples"][f"{prefix}_final_item_fingerprints"]["exact_count"]
+        == len(results)
+    )
+
+
+def _run_traced_retrieval(
+    collection: FakeCollection,
+    reranker: FakeReranker,
+    collection_type: str,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    registry = DiagnosticTraceRegistry("diagnostic_user")
+    trace_session = str(uuid4())
+    operation_id = str(uuid4())
+    registry.start("diagnostic_user", trace_session, "run")
+    handle = registry.begin_operation(
+        user_id="diagnostic_user",
+        session_id=trace_session,
+        operation_id=operation_id,
+        kind="chat_query",
+        collection_type="conversations",
+        wizard_id=str(uuid4()),
+    )
+    assert handle is not None
+    install_registry(registry)
+    try:
+        with activate_operation(handle):
+            results = retrieve(
+                collection,
+                "rewritten question",
+                [[0.3, 0.7]],
+                collection_type,
+                runtime=_runtime(reranker),
+            )
+    finally:
+        uninstall_registry(registry)
+    operation = registry.snapshot(
+        "diagnostic_user", trace_session, operation_id
+    )["operations"][0]
+    return results, operation
+
+
+def test_kp_trace_records_empty_pool_without_extra_model_or_storage_calls() -> None:
+    collection = FakeCollection([])
+    reranker = FakeReranker()
+
+    results, operation = _run_traced_retrieval(
+        collection, reranker, "knowledge_facts"
+    )
+
+    assert results == []
+    assert len(collection.calls) == 1
+    assert collection.hydration_calls == []
+    assert reranker.calls == []
+    assert operation["counts"]["knowledge_bge_model_call_count"] == 0
+    assert operation["counts"]["knowledge_hydration_storage_call_count"] == 0
+    assert operation["counts"]["knowledge_final_count"] == 0
+    assert operation["samples"]["knowledge_final_ids"] == {
+        "exact_count": 0,
+        "items": [],
+        "truncated": False,
+    }
+
+
 def test_conversation_short_page_does_not_retry() -> None:
     hits = [_conversation_segment(index, index, 0) for index in range(1, 18)]
     collection = FakeCollection(hits)
@@ -697,23 +887,26 @@ def test_isolated_unusable_mmr_vector_falls_back_to_bge_order() -> None:
             return hydrated
 
     collection = CorruptVectorCollection(fixtures)
-    results = retrieve(
+    reranker = FakeReranker(
+        [
+            RerankResult(0, 3.0),
+            RerankResult(1, 2.9),
+            RerankResult(2, -0.9),
+        ]
+    )
+    results, operation = _run_traced_retrieval(
         collection,
-        "query",
-        [[1.0]],
+        reranker,
         "knowledge_facts",
-        runtime=_runtime(
-            FakeReranker(
-                [
-                    RerankResult(0, 3.0),
-                    RerankResult(1, 2.9),
-                    RerankResult(2, -0.9),
-                ]
-            )
-        ),
     )
 
     assert [item["object_id"] for item in results] == [_uuid(1), _uuid(2)]
+    assert len(collection.calls) == 1
+    assert len(collection.hydration_calls) == 1
+    assert len(reranker.calls) == 1
+    assert operation["flags"]["knowledge_mmr_usable"] is False
+    assert operation["flags"]["knowledge_mmr_fallback"] is True
+    assert operation["flags"]["knowledge_hydration_values_finite"] is False
 
 
 def test_corrupt_hydrated_candidate_is_removed_without_extra_fetch() -> None:
