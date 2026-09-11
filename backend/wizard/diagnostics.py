@@ -19,6 +19,7 @@ TRACE_SCHEMA_VERSION = "1.0"
 TRACE_SESSION_MAX_OPERATIONS = 256
 TRACE_SAMPLE_LIMIT = 32
 TRACE_TEXT_MAX_UTF8_BYTES = 8192
+TRACE_CAPTURE_MODES = frozenset({"deep", "evaluation"})
 TRACE_SESSION_HEADER = "X-Wizard-Diagnostic-Session-ID"
 TRACE_OPERATION_HEADER = "X-Wizard-Diagnostic-Operation-ID"
 TRACE_RELATED_TASK_ROLES = frozenset(
@@ -294,6 +295,7 @@ class _Session:
     session_id: str
     run_id: str
     user_id: str
+    capture_mode: str
     started_at: str = field(default_factory=_utc_timestamp)
     operations: dict[str, _Operation] = field(default_factory=dict)
     overflowed: bool = False
@@ -303,10 +305,15 @@ class _Session:
 class DiagnosticTraceRegistry:
     """Own at most one bounded diagnostic trace session."""
 
-    def __init__(self, configured_user_id: str) -> None:
+    def __init__(
+        self, configured_user_id: str, *, capture_mode: str = "deep"
+    ) -> None:
         self.configured_user_id = _required_text(
             configured_user_id, "configured_user_id"
         )
+        if capture_mode not in TRACE_CAPTURE_MODES:
+            raise ValueError("diagnostic capture mode is invalid")
+        self.capture_mode = capture_mode
         self._session: _Session | None = None
         self._lock = RLock()
 
@@ -319,7 +326,7 @@ class DiagnosticTraceRegistry:
         with self._lock:
             if self._session is not None:
                 raise RuntimeError("a Wizard diagnostic session is already active")
-            self._session = _Session(session, run, user)
+            self._session = _Session(session, run, user, self.capture_mode)
             return self._session_payload(self._session, operation_id=None)
 
     def delete(self, user_id: str, session_id: str) -> None:
@@ -339,6 +346,8 @@ class DiagnosticTraceRegistry:
         wizard_id: str,
     ) -> TraceHandle | None:
         if user_id != self.configured_user_id or kind not in OPERATION_KINDS:
+            return None
+        if self.capture_mode == "evaluation" and kind != "chat_query":
             return None
         try:
             session_key = _uuid_text(session_id, "session_id")
@@ -374,6 +383,16 @@ class DiagnosticTraceRegistry:
         with self._lock:
             operation = self._operation(handle)
             operation.stages.setdefault(name, _Stage()).observe(elapsed_ms, failed)
+
+    def captures_deep_trace(self, handle: TraceHandle) -> bool:
+        with self._lock:
+            self._operation(handle)
+            return self.capture_mode == "deep"
+
+    def captures_evaluation_evidence(self, handle: TraceHandle) -> bool:
+        with self._lock:
+            self._operation(handle)
+            return self.capture_mode == "evaluation"
 
     def add_count(self, handle: TraceHandle, name: str, value: int) -> None:
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -495,6 +514,11 @@ class DiagnosticTraceRegistry:
     ) -> dict[str, object]:
         with self._lock:
             session = self._required_session(user_id, session_id)
+            if operation_id is not None and session.capture_mode == "evaluation":
+                operation_key = _uuid_text(operation_id, "operation_id")
+                operation = session.operations.get(operation_key)
+                if operation is None or operation.finished_at is None:
+                    raise KeyError("diagnostic operation")
             return self._session_payload(session, operation_id)
 
     def _required_session(self, user_id: str, session_id: str) -> _Session:
@@ -527,12 +551,17 @@ class DiagnosticTraceRegistry:
                 raise KeyError("diagnostic operation")
             selected = [operations[operation_key].payload()]
         else:
-            selected = [item.payload() for item in operations.values()]
+            selected = [
+                item.payload()
+                for item in operations.values()
+                if session.capture_mode != "evaluation" or item.finished_at is not None
+            ]
         return {
             "schema_version": TRACE_SCHEMA_VERSION,
             "session_id": session.session_id,
             "run_id": session.run_id,
             "user_id": session.user_id,
+            "capture_mode": session.capture_mode,
             "started_at": session.started_at,
             "operation_count": len(session.operations),
             "overflowed": session.overflowed,
@@ -571,13 +600,33 @@ def installed_registry() -> DiagnosticTraceRegistry | None:
 
 
 def trace_operation_active() -> bool:
-    return _REGISTRY is not None and _ACTIVE_HANDLE.get() is not None
+    registry = _REGISTRY
+    handle = _ACTIVE_HANDLE.get()
+    if registry is None or handle is None:
+        return False
+    try:
+        return registry.captures_deep_trace(handle)
+    except Exception:
+        registry.mark_fault()
+        return False
+
+
+def evaluation_evidence_active() -> bool:
+    registry = _REGISTRY
+    handle = _ACTIVE_HANDLE.get()
+    if registry is None or handle is None:
+        return False
+    try:
+        return registry.captures_evaluation_evidence(handle)
+    except Exception:
+        registry.mark_fault()
+        return False
 
 
 def active_trace_handle() -> TraceHandle | None:
-    """Return the current immutable handle only while tracing is installed."""
+    """Return the current immutable handle only for full deep tracing."""
 
-    if _REGISTRY is None:
+    if not trace_operation_active():
         return None
     return _ACTIVE_HANDLE.get()
 
@@ -590,9 +639,12 @@ def trace_utf8_bytes(value: str) -> bytes | None:
     """Encode trace-only content without allowing an encoding fault to escape."""
 
     registry = _REGISTRY
-    if registry is None or _ACTIVE_HANDLE.get() is None:
+    handle = _ACTIVE_HANDLE.get()
+    if registry is None or handle is None:
         return None
     try:
+        if not registry.captures_deep_trace(handle):
+            return None
         if not isinstance(value, str):
             raise TypeError("diagnostic text must be a string")
         return value.encode("utf-8")
@@ -607,9 +659,12 @@ def observe_trace_metadata(
     """Run diagnostic-only metadata derivation without affecting production."""
 
     registry = _REGISTRY
-    if registry is None or _ACTIVE_HANDLE.get() is None:
+    handle = _ACTIVE_HANDLE.get()
+    if registry is None or handle is None:
         return
     try:
+        if not registry.captures_deep_trace(handle):
+            return
         callback(*args, **kwargs)
     except Exception:
         registry.mark_fault()
@@ -674,6 +729,14 @@ def observe_stage(name: str, *, handle: TraceHandle | None = None) -> Iterator[N
     if active is None or registry is None:
         yield
         return
+    try:
+        if not registry.captures_deep_trace(active):
+            yield
+            return
+    except Exception:
+        registry.mark_fault()
+        yield
+        return
     started = perf_counter()
     failed = False
     try:
@@ -702,6 +765,8 @@ def observe_elapsed(
     if active is None or registry is None:
         return
     try:
+        if not registry.captures_deep_trace(active):
+            return
         registry.observe_stage(active, name, elapsed_ms, failed)
     except Exception:
         registry.mark_fault()
@@ -713,6 +778,8 @@ def _safe_observe(callback: Any, *args: object, **kwargs: object) -> None:
     if registry is None or handle is None:
         return
     try:
+        if not registry.captures_deep_trace(handle):
+            return
         callback(handle, *args, **kwargs)
     except Exception:
         registry.mark_fault()
@@ -744,6 +811,8 @@ def set_framed_digest(name: str, domain: str, parts: Iterable[bytes]) -> None:
     if registry is None or handle is None:
         return
     try:
+        if not registry.captures_deep_trace(handle):
+            return
         registry.set_digest(handle, name, _content_digest(domain, parts))
     except Exception:
         registry.mark_fault()
@@ -753,6 +822,96 @@ def set_text(name: str, value: str) -> None:
     registry = _REGISTRY
     if registry is not None:
         _safe_observe(registry.set_text, name, value)
+
+
+def capture_evaluation_rewrite(value: str) -> None:
+    """Capture the already-produced Granite rewrite for evaluation mode only."""
+
+    registry = _REGISTRY
+    handle = _ACTIVE_HANDLE.get()
+    if registry is None or handle is None:
+        return
+    try:
+        if not registry.captures_evaluation_evidence(handle):
+            return
+        encoded = value.encode("utf-8")
+        registry.set_digest(
+            handle,
+            "granite_rewritten_query_sha256",
+            _content_digest(
+                "chat-granite-rewritten-query-v1",
+                (encoded,),
+            ),
+        )
+        registry.set_text(handle, "granite_rewritten_query", value)
+    except Exception:
+        registry.mark_fault()
+
+
+def capture_evaluation_contexts(
+    knowledge: Sequence[Mapping[str, Any]],
+    policy: Sequence[Mapping[str, Any]],
+) -> None:
+    """Capture exact final Qwen context identity without retaining raw text."""
+
+    registry = _REGISTRY
+    handle = _ACTIVE_HANDLE.get()
+    if registry is None or handle is None:
+        return
+    try:
+        if not registry.captures_evaluation_evidence(handle):
+            return
+        for prefix, items in (("knowledge", knowledge), ("policy", policy)):
+            count = len(items)
+            identifiers: list[str] = []
+            fingerprints: list[str] = []
+            digest_parts: list[bytes] = []
+            rendered_bytes = max(0, count - 1) * 2
+            for item in items:
+                object_id = _uuid_text(str(item["object_id"]), "context object ID")
+                raw_text = item["raw_text"]
+                if not isinstance(raw_text, str) or not raw_text.strip():
+                    raise ValueError("evaluation context text is invalid")
+                identifier = object_id.encode("utf-8")
+                content = raw_text.encode("utf-8")
+                identifiers.append(object_id)
+                fingerprints.append(
+                    f"{object_id}:{_content_digest('chat-kp-item-v1', (identifier, content))}"
+                )
+                digest_parts.extend((identifier, content))
+                rendered_bytes += len(content)
+            registry.add_count(handle, f"qwen_{prefix}_used_count", count)
+            registry.add_count(
+                handle, f"qwen_{prefix}_context_utf8_bytes", rendered_bytes
+            )
+            registry.set_sample(
+                handle,
+                f"qwen_{prefix}_used_ids",
+                identifiers,
+                exact_count=count,
+            )
+            registry.set_sample(
+                handle,
+                f"qwen_{prefix}_used_item_fingerprints",
+                fingerprints,
+                exact_count=count,
+            )
+            registry.set_flag(
+                handle,
+                f"qwen_{prefix}_used_proof_truncated",
+                count > TRACE_SAMPLE_LIMIT,
+            )
+            registry.set_digest(
+                handle,
+                f"qwen_{prefix}_context_sha256",
+                _content_digest(
+                    f"chat-qwen-{prefix}-context-v1",
+                    digest_parts,
+                ),
+            )
+        registry.set_flag(handle, "evaluation_evidence_captured", True)
+    except Exception:
+        registry.mark_fault()
 
 
 def set_mapping_digest(name: str, mapping: Mapping[int, Sequence[str]]) -> None:
@@ -781,6 +940,8 @@ def attach_task(handle: TraceHandle | None, task_id: str) -> None:
     if registry is None or handle is None:
         return
     try:
+        if not registry.captures_deep_trace(handle):
+            return
         registry.attach_task(handle, task_id)
     except Exception:
         registry.mark_fault()
@@ -793,6 +954,8 @@ def attach_related_task(
     if registry is None or handle is None:
         return
     try:
+        if not registry.captures_deep_trace(handle):
+            return
         registry.attach_related_task(handle, role, task_id)
     except Exception:
         registry.mark_fault()
@@ -963,6 +1126,9 @@ __all__ = [
     "attach_task",
     "attach_related_task",
     "begin_request_operation",
+    "capture_evaluation_contexts",
+    "capture_evaluation_rewrite",
+    "evaluation_evidence_active",
     "finish_operation",
     "framed_content_digest",
     "fail_operation_on_error",

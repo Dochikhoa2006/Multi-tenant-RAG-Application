@@ -26,6 +26,7 @@ from backend.rag.query_rewrite_contract import ConversationPair, QueryRewritePro
 from backend.wizard.diagnostics import (
     DiagnosticTraceRegistry,
     activate_operation,
+    finish_operation,
     install_registry,
     uninstall_registry,
 )
@@ -256,6 +257,43 @@ def test_deep_trace_observes_the_same_granite_request_without_raw_context() -> N
         "granite_request_messages_sha256",
         "granite_rewritten_query_sha256",
     }
+
+
+def test_evaluation_profile_captures_only_the_official_rewrite() -> None:
+    adapter, _, client = _adapter()
+    registry = DiagnosticTraceRegistry(
+        "diagnostic_user", capture_mode="evaluation"
+    )
+    session_id = str(uuid4())
+    operation_id = str(uuid4())
+    registry.start("diagnostic_user", session_id, "ask-run")
+    handle = registry.begin_operation(
+        user_id="diagnostic_user",
+        session_id=session_id,
+        operation_id=operation_id,
+        kind="chat_query",
+        collection_type="conversations",
+        wizard_id=str(uuid4()),
+    )
+    assert handle is not None
+    install_registry(registry)
+    try:
+        with activate_operation(handle):
+            rewritten = adapter.complete(_prompt(), model=QUERY_REWRITER.model)
+        finish_operation(handle, "succeeded")
+    finally:
+        uninstall_registry(registry)
+
+    operation = registry.snapshot(
+        "diagnostic_user", session_id, operation_id
+    )["operations"][0]
+    assert rewritten == "Standalone Rex question"
+    assert len(client.calls) == 1
+    assert operation["stages"] == {}
+    assert operation["texts"] == {
+        "granite_rewritten_query": "Standalone Rex question"
+    }
+    assert set(operation["digests"]) == {"granite_rewritten_query_sha256"}
 
 
 def test_whole_tail_pairs_are_removed_before_request() -> None:

@@ -270,6 +270,56 @@ assert RAG_DIAGNOSTIC_USER_ID == 'wizard_diagnostic'
         assert invalid.returncode != 0
 
 
+def test_evaluation_evidence_configuration_is_default_off_and_user_scoped() -> None:
+    default = _run_python(
+        """
+from backend.config import RAG_EVALUATION_EVIDENCE_ENABLED, RAG_EVALUATION_USER_ID
+assert RAG_EVALUATION_EVIDENCE_ENABLED is False
+assert RAG_EVALUATION_USER_ID == ''
+""",
+        overrides={
+            "RAG_EVALUATION_EVIDENCE_ENABLED": "false",
+            "RAG_EVALUATION_USER_ID": "",
+        },
+    )
+    assert default.returncode == 0, default.stderr
+    valid = _run_python(
+        """
+from backend.config import RAG_EVALUATION_EVIDENCE_ENABLED, RAG_EVALUATION_USER_ID
+assert RAG_EVALUATION_EVIDENCE_ENABLED is True
+assert RAG_EVALUATION_USER_ID == 'evaluation_user'
+""",
+        overrides={
+            "RAG_EVALUATION_EVIDENCE_ENABLED": "true",
+            "RAG_EVALUATION_USER_ID": "evaluation_user",
+        },
+    )
+    assert valid.returncode == 0, valid.stderr
+    for user_id in ("", " padded ", "invalid/user"):
+        invalid = _run_python(
+            "import backend.config",
+            overrides={
+                "RAG_EVALUATION_EVIDENCE_ENABLED": "true",
+                "RAG_EVALUATION_USER_ID": user_id,
+            },
+        )
+        assert invalid.returncode != 0
+
+
+def test_deep_diagnostics_and_evaluation_evidence_are_mutually_exclusive() -> None:
+    result = _run_python(
+        "import backend.config",
+        overrides={
+            "WIZARD_DIAGNOSTICS_ENABLED": "true",
+            "RAG_DIAGNOSTIC_USER_ID": "wizard_diagnostic",
+            "RAG_EVALUATION_EVIDENCE_ENABLED": "true",
+            "RAG_EVALUATION_USER_ID": "evaluation_user",
+        },
+    )
+    assert result.returncode != 0
+    assert "cannot be enabled together" in result.stderr
+
+
 @pytest.mark.parametrize(
     "overrides",
     [

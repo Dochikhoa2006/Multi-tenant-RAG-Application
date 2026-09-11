@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import hashlib
 import json
 import math
+from pathlib import Path
 from time import perf_counter, sleep
 from typing import Any
 from uuid import UUID, uuid4
@@ -33,6 +34,16 @@ from deployment.e2e_diagnostic import (
     RequestRecorder,
     SelectedQuery,
     utc_timestamp,
+)
+from deployment.evaluation_bridge import (
+    EvaluationBridgeError,
+    EvaluationLaunch,
+    build_evaluation_record,
+    cancel_local_evaluation,
+    finish_local_evaluation,
+    parse_request_evidence,
+    resolve_exact_contexts,
+    start_local_evaluation,
 )
 from deployment.wizard_diagnostic import CorpusGeneration, CorpusState
 from deployment.wizard_diagnostic_api import CorpusStorage, TRACE_PATH
@@ -72,6 +83,7 @@ class ValidatedStream:
     answer_chunks_sha256: str
     telemetry_schema_version: str
     timings_ms: Mapping[str, object]
+    telemetry: Mapping[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -130,6 +142,7 @@ class QueryAttemptResult:
     deep_trace: Mapping[str, object] | None
     duration_ms: float
     started_at: str
+    evaluation: Mapping[str, object] | None = None
 
 
 _CHAT_TRACE_STAGES = (
@@ -1187,6 +1200,7 @@ def validate_e2e_stream(
         ),
         telemetry_schema_version=TELEMETRY_SCHEMA_VERSION,
         timings_ms=timings,
+        telemetry=dict(telemetry),
     )
 
 
@@ -1472,6 +1486,7 @@ def _record_attempt(recorder: RequestRecorder, result: QueryAttemptResult) -> No
         trace_polling=result.trace_polling,
         post_generation=result.post_generation,
         registry_verification=result.registry_verification,
+        evaluation=result.evaluation,
     )
 
 
@@ -1558,6 +1573,13 @@ def format_query_terminal(result: QueryAttemptResult) -> str:
             ),
             "Answer:",
             result.answer,
+            "Evaluation: "
+            + (
+                "skipped"
+                if not isinstance(result.evaluation, Mapping)
+                else f"{result.evaluation.get('status', 'failed')} "
+                f"evaluation_ms={result.evaluation.get('evaluation_ms', 'unavailable')}"
+            ),
         )
     )
 
@@ -1569,6 +1591,9 @@ def _execute_query(
     session_id: str,
     query: SelectedQuery,
     trace: _DeepTraceSession,
+    config: Mapping[str, str],
+    evaluation_directory: Path,
+    allowed_document_ids: Mapping[str, frozenset[str]],
     *,
     started_at: str,
     started_clock: float,
@@ -1584,6 +1609,11 @@ def _execute_query(
     trace_polling: Mapping[str, object] | None = None
     post_generation: Mapping[str, object] | None = None
     registry_verification: Mapping[str, object] | None = None
+    evaluation: Mapping[str, object] | None = {
+        "status": "skipped",
+        "error_code": "RAG_NOT_SUCCEEDED",
+    }
+    evaluation_launch: EvaluationLaunch | None = None
     code: str | None = None
     failure_scope: str | None = None
     failure_stage: str | None = None
@@ -1660,6 +1690,46 @@ def _execute_query(
                 stream=result,
                 http_status=response_status or 0,
             )
+            try:
+                evidence = parse_request_evidence(
+                    operation,
+                    user_id=user_id,
+                    trace_session_id=trace.session_id,
+                    operation_id=operation_id,
+                    chat_session_id=session_id,
+                    request_id=result.request_id,
+                )
+                contexts = resolve_exact_contexts(
+                    config,
+                    user_id=user_id,
+                    evidence=evidence,
+                    allowed_document_ids=allowed_document_ids,
+                )
+                record = build_evaluation_record(
+                    source="e2e",
+                    request_id=result.request_id,
+                    conversation_id=result.conversation_id,
+                    original_query=query.question,
+                    response=result.answer,
+                    telemetry=result.telemetry,
+                    evidence=evidence,
+                    contexts=contexts,
+                    captured_at=utc_timestamp(),
+                )
+                evaluation_launch = start_local_evaluation(
+                    record,
+                    evaluation_directory,
+                    f"{query.source_index:06d}-{result.request_id}",
+                )
+                evaluation = {
+                    "status": "running",
+                    "error_code": None,
+                }
+            except Exception:
+                evaluation = {
+                    "status": "failed",
+                    "error_code": "EVALUATION_EVIDENCE_INVALID",
+                }
             flags = _mapping(operation.get("flags"), "deep trace flags")
             if flags.get("title_enqueue_accepted") is False:
                 raise PostGenerationContractError("Title enqueue was not accepted")
@@ -1716,6 +1786,10 @@ def _execute_query(
                 result.answer,
                 title,
             )
+        except KeyboardInterrupt:
+            if evaluation_launch is not None:
+                cancel_local_evaluation(evaluation_launch)
+            raise
         except PostGenerationContractError:
             code = "POST_GENERATION_FAILED"
             failure_scope = "individual"
@@ -1724,10 +1798,25 @@ def _execute_query(
             code = "DEEP_TRACE_INVALID"
             failure_scope = "systemic"
             failure_stage = "trace"
+            evaluation = {
+                "status": "failed",
+                "error_code": "EVALUATION_EVIDENCE_INVALID",
+            }
         except (httpx.HTTPError, TypeError, ValueError, RuntimeError):
             code = "POST_GENERATION_INVALID"
             failure_scope = "individual"
             failure_stage = "post_generation"
+        finally:
+            if evaluation_launch is not None:
+                try:
+                    evaluation = finish_local_evaluation(
+                        evaluation_launch
+                    ).artifact()
+                except Exception:
+                    evaluation = {
+                        "status": "failed",
+                        "error_code": "EVALUATION_PROCESS_FAILED",
+                    }
     elif response_status == 200:
         try:
             payload, operation, trace_polling = trace.wait_operation(operation_id)
@@ -1794,6 +1883,7 @@ def _execute_query(
         post_generation=post_generation,
         registry_verification=registry_verification,
         deep_trace=deep_trace,
+        evaluation=evaluation,
         duration_ms=(perf_counter() - started_clock) * 1000.0,
         started_at=started_at,
     )
@@ -1837,6 +1927,7 @@ def _session_failure_result(
         post_generation=None,
         registry_verification=None,
         deep_trace=None,
+        evaluation={"status": "skipped", "error_code": "RAG_NOT_SUCCEEDED"},
         duration_ms=(perf_counter() - started_clock) * 1000.0,
         started_at=started_at,
     )
@@ -1863,6 +1954,15 @@ def run_e2e_phase_2d(
         progress["physical_corpus_status"] = "failed"
         raise
     progress["physical_corpus_status"] = "succeeded"
+    allowed_document_ids: dict[str, frozenset[str]] = {
+        collection: frozenset(
+            document.wizard_id
+            for document in active.documents
+            if document.collection == collection
+        )
+        for collection in ("knowledge", "policy")
+    }
+    evaluation_directory = recorder.path.parent / "evaluation"
     timeout = httpx.Timeout(connect=30, read=900, write=120, pool=30)
     shared_session_id: str | None = None
     with httpx.Client(headers=dict(runtime_headers), timeout=timeout) as client:
@@ -1960,6 +2060,9 @@ def run_e2e_phase_2d(
                         session_id,
                         query,
                         trace,
+                        config,
+                        evaluation_directory,
+                        allowed_document_ids,
                         started_at=started_at,
                         started_clock=started_clock,
                     )
@@ -1987,6 +2090,10 @@ def run_e2e_phase_2d(
                         post_generation=None,
                         registry_verification=None,
                         deep_trace=None,
+                        evaluation={
+                            "status": "skipped",
+                            "error_code": "RAG_NOT_SUCCEEDED",
+                        },
                         duration_ms=(perf_counter() - started_clock) * 1000.0,
                         started_at=started_at,
                     )

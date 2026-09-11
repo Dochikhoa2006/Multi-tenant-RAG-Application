@@ -15,7 +15,12 @@ import tiktoken
 
 from backend.dev_ui import install_dev_ui
 from backend.main import create_app
-from backend.config import RAG_DIAGNOSTIC_USER_ID, WIZARD_DIAGNOSTICS_ENABLED
+from backend.config import (
+    RAG_DIAGNOSTIC_USER_ID,
+    RAG_EVALUATION_EVIDENCE_ENABLED,
+    RAG_EVALUATION_USER_ID,
+    WIZARD_DIAGNOSTICS_ENABLED,
+)
 from backend.model_config import TEXT_PROCESSING
 from backend.processing.chunker import _get_tokenizer as _get_chunk_tokenizer
 from backend.processing.paragraph_splitter import (
@@ -292,7 +297,7 @@ def create_runtime_app(
         startup_hook=startup,
         shutdown_hook=shutdown,
     )
-    if WIZARD_DIAGNOSTICS_ENABLED:
+    if WIZARD_DIAGNOSTICS_ENABLED or RAG_EVALUATION_EVIDENCE_ENABLED:
         from backend.api.wizard_diagnostics import build_wizard_diagnostic_router
         from backend.wizard.diagnostics import (
             DiagnosticTraceRegistry,
@@ -300,7 +305,14 @@ def create_runtime_app(
         )
 
         wizard_diagnostic_registry = DiagnosticTraceRegistry(
-            RAG_DIAGNOSTIC_USER_ID
+            (
+                RAG_DIAGNOSTIC_USER_ID
+                if WIZARD_DIAGNOSTICS_ENABLED
+                else RAG_EVALUATION_USER_ID
+            ),
+            capture_mode=(
+                "deep" if WIZARD_DIAGNOSTICS_ENABLED else "evaluation"
+            ),
         )
         install_registry(wizard_diagnostic_registry)
         application.state.wizard_diagnostic_registry = wizard_diagnostic_registry

@@ -30,6 +30,7 @@ from backend.rag.query_rewrite_contract import QueryRewritePrompt
 from backend.wizard.diagnostics import (
     TRACE_SAMPLE_LIMIT,
     add_count,
+    capture_evaluation_rewrite,
     observe_elapsed,
     observe_stage,
     set_flag,
@@ -390,6 +391,7 @@ class SGLangGraniteQueryRewriter:
         self._thread_diagnostics.value = diagnostics
         # Retain the legacy process-wide inspection attribute for sequential callers.
         self.last_diagnostics = diagnostics
+        capture_evaluation_rewrite(result)
         return result
 
     def complete(

@@ -13,6 +13,7 @@ from backend.rag.runtime import RAGRuntime, RerankResult
 from backend.wizard.diagnostics import (
     DiagnosticTraceRegistry,
     activate_operation,
+    finish_operation,
     install_registry,
     uninstall_registry,
 )
@@ -326,6 +327,58 @@ def test_generator_trace_proves_exact_final_context_without_extra_llm_calls() ->
     serialized = json.dumps(operation, sort_keys=True)
     assert knowledge_text not in serialized
     assert policy_text not in serialized
+
+
+def test_evaluation_profile_captures_only_final_context_identity() -> None:
+    knowledge_id = str(uuid4())
+    policy_id = str(uuid4())
+    llm = FakeLLM(["answer"])
+    registry = DiagnosticTraceRegistry(
+        "diagnostic_user", capture_mode="evaluation"
+    )
+    session_id = str(uuid4())
+    operation_id = str(uuid4())
+    registry.start("diagnostic_user", session_id, "ask-run")
+    handle = registry.begin_operation(
+        user_id="diagnostic_user",
+        session_id=session_id,
+        operation_id=operation_id,
+        kind="chat_query",
+        collection_type="conversations",
+        wizard_id=str(uuid4()),
+    )
+    assert handle is not None
+    install_registry(registry)
+    try:
+        with activate_operation(handle):
+            chunks = asyncio.run(
+                _collect(
+                    llm,
+                    knowledge=[
+                        {"object_id": knowledge_id, "raw_text": "exact knowledge"}
+                    ],
+                    policy=[
+                        {"object_id": policy_id, "raw_text": "exact policy"}
+                    ],
+                )
+            )
+        finish_operation(handle, "succeeded")
+    finally:
+        uninstall_registry(registry)
+
+    operation = registry.snapshot(
+        "diagnostic_user", session_id, operation_id
+    )["operations"][0]
+    assert chunks == ["answer"]
+    assert len(llm.calls) == 1
+    assert operation["stages"] == {}
+    assert operation["samples"]["qwen_knowledge_used_ids"]["items"] == [
+        knowledge_id
+    ]
+    assert operation["samples"]["qwen_policy_used_ids"]["items"] == [policy_id]
+    serialized = json.dumps(operation)
+    assert "exact knowledge" not in serialized
+    assert "exact policy" not in serialized
 
 
 def test_generator_trace_fault_cannot_change_an_accepted_context_contract() -> None:

@@ -616,7 +616,7 @@ def test_e2e_run_and_request_artifacts_have_stable_contract(tmp_path: Path) -> N
     assert first.run_id != second.run_id
     assert first.requests_path.read_bytes() == b""
     summary = json.loads(first.summary_path.read_text(encoding="utf-8"))
-    assert E2E_SCHEMA_VERSION == "1.3"
+    assert E2E_SCHEMA_VERSION == "1.4"
     assert E2E_PHASE == "2D"
     assert summary["schema_version"] == E2E_SCHEMA_VERSION
     assert summary["phase"] == E2E_PHASE
@@ -646,6 +646,12 @@ def test_e2e_run_and_request_artifacts_have_stable_contract(tmp_path: Path) -> N
         trace_polling={"poll_count": 2, "wait_ms": 0.5},
         post_generation={"conversation_persistence": {"status": "succeeded"}},
         registry_verification={"title": "Useful Retrieval Session"},
+        evaluation={
+            "status": "succeeded",
+            "error_code": None,
+            "evaluation_ms": 12.5,
+            "record_sha256": "a" * 64,
+        },
     )
     update_e2e_summary(
         first,
@@ -672,6 +678,7 @@ def test_e2e_run_and_request_artifacts_have_stable_contract(tmp_path: Path) -> N
     assert rows[0]["registry_verification"]["title"] == (
         "Useful Retrieval Session"
     )
+    assert rows[0]["evaluation"]["status"] == "succeeded"
     finished = json.loads(first.summary_path.read_text())
     assert finished["requests"] == {
         "selected": 1,
@@ -687,6 +694,12 @@ def test_e2e_run_and_request_artifacts_have_stable_contract(tmp_path: Path) -> N
     assert finished["deep_trace"] == {
         "status": "succeeded",
         "session_deleted": True,
+    }
+    assert finished["evaluation"] == {
+        "succeeded": 1,
+        "partial": 0,
+        "failed": 0,
+        "skipped": 0,
     }
     assert finished["finished_at"].endswith("Z")
     assert not first.summary_path.with_suffix(".json.tmp").exists()

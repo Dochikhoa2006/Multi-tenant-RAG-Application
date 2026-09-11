@@ -43,6 +43,21 @@ if WIZARD_DIAGNOSTICS_ENABLED == "true" and not RAG_DIAGNOSTIC_USER_ID:
     raise ValueError(
         "RAG_DIAGNOSTIC_USER_ID is required when Wizard diagnostics are enabled"
     )
+RAG_EVALUATION_EVIDENCE_ENABLED = os.getenv(
+    "RAG_EVALUATION_EVIDENCE_ENABLED", "false"
+).strip().lower()
+if RAG_EVALUATION_EVIDENCE_ENABLED not in {"true", "false"}:
+    raise ValueError("RAG_EVALUATION_EVIDENCE_ENABLED must be true or false")
+RAG_EVALUATION_USER_ID = os.getenv("RAG_EVALUATION_USER_ID", "")
+if RAG_EVALUATION_EVIDENCE_ENABLED == "true" and not RAG_EVALUATION_USER_ID:
+    raise ValueError(
+        "RAG_EVALUATION_USER_ID is required when evaluation evidence is enabled"
+    )
+if (
+    WIZARD_DIAGNOSTICS_ENABLED == "true"
+    and RAG_EVALUATION_EVIDENCE_ENABLED == "true"
+):
+    raise ValueError("deep diagnostics and evaluation evidence are mutually exclusive")
 
 RUNTIME_MODEL_ROOT = Path("/opt/runtime-models")
 GRANITE_MODEL_ROOT = Path("/opt/granite-models")
@@ -105,9 +120,12 @@ runtime_environment = {
     "UPLOAD_MAX_TOTAL_BYTES": os.getenv("UPLOAD_MAX_TOTAL_BYTES", "26214400"),
     "UPLOAD_READ_CHUNK_BYTES": os.getenv("UPLOAD_READ_CHUNK_BYTES", "65536"),
     "WIZARD_DIAGNOSTICS_ENABLED": WIZARD_DIAGNOSTICS_ENABLED,
+    "RAG_EVALUATION_EVIDENCE_ENABLED": RAG_EVALUATION_EVIDENCE_ENABLED,
 }
 if WIZARD_DIAGNOSTICS_ENABLED == "true":
     runtime_environment["RAG_DIAGNOSTIC_USER_ID"] = RAG_DIAGNOSTIC_USER_ID
+if RAG_EVALUATION_EVIDENCE_ENABLED == "true":
+    runtime_environment["RAG_EVALUATION_USER_ID"] = RAG_EVALUATION_USER_ID
 
 image = (
     modal.Image.debian_slim(python_version="3.12")

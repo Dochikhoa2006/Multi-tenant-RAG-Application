@@ -298,6 +298,38 @@ def test_runtime_mounts_diagnostic_routes_only_when_explicitly_enabled(
         uninstall_registry(diagnostic.state.wizard_diagnostic_registry)
 
 
+def test_runtime_mounts_metadata_only_evidence_for_configured_user(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.wizard.diagnostics import uninstall_registry
+
+    monkeypatch.setattr(runtime_app_module, "WIZARD_DIAGNOSTICS_ENABLED", False)
+    monkeypatch.setattr(runtime_app_module, "RAG_EVALUATION_EVIDENCE_ENABLED", True)
+    monkeypatch.setattr(runtime_app_module, "RAG_EVALUATION_USER_ID", "evaluation_user")
+    application, _, _ = _application([])
+    try:
+        registry = application.state.wizard_diagnostic_registry
+        assert registry.configured_user_id == "evaluation_user"
+        assert registry.capture_mode == "evaluation"
+        paths: list[str] = []
+
+        def visit(routes: object) -> None:
+            for route in routes:  # type: ignore[union-attr]
+                path = getattr(route, "path", None)
+                if isinstance(path, str):
+                    paths.append(path)
+                nested = getattr(
+                    getattr(route, "original_router", None), "routes", None
+                )
+                if nested is not None:
+                    visit(nested)
+
+        visit(application.routes)
+        assert paths.count("/api/_diagnostics/wizard/trace") == 3
+    finally:
+        uninstall_registry(application.state.wizard_diagnostic_registry)
+
+
 def test_default_model_discovery_uses_expected_urls_and_bearer_tokens() -> None:
     events: list[str] = []
     app, created, _ = _application(events)

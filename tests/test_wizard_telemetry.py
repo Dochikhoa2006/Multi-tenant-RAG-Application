@@ -95,10 +95,13 @@ def test_providerless_app_stays_generic_and_runtime_owns_conditional_mount() -> 
     runtime_source = (root / "backend/runtime_app.py").read_text(encoding="utf-8")
 
     assert "wizard_diagnostic" not in main_source
-    assert "if WIZARD_DIAGNOSTICS_ENABLED:" in runtime_source
+    assert (
+        "if WIZARD_DIAGNOSTICS_ENABLED or RAG_EVALUATION_EVIDENCE_ENABLED:"
+        in runtime_source
+    )
     assert "build_wizard_diagnostic_router" in runtime_source
     assert runtime_source.index("application = create_app(") < runtime_source.index(
-        "if WIZARD_DIAGNOSTICS_ENABLED:"
+        "if WIZARD_DIAGNOSTICS_ENABLED or RAG_EVALUATION_EVIDENCE_ENABLED:"
     )
 
 

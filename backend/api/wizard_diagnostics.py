@@ -78,6 +78,13 @@ def build_wizard_diagnostic_router(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="collection_type and wizard_id must be supplied together",
             )
+        if registry.capture_mode == "evaluation" and (
+            wizard_id is not None or probe_chunk_ids
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="Evaluation evidence does not expose mapping checkpoints",
+            )
         if wizard_id is not None and collection_type is not None:
             try:
                 payload["mapping_checkpoint"] = mapping_checkpoint(

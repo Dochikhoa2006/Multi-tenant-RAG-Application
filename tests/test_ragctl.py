@@ -124,6 +124,8 @@ def test_command_runner_verifies_modal_target_and_propagates_environment(
     captured_environment: dict[str, str] = {}
     monkeypatch.setenv("WIZARD_DIAGNOSTICS_ENABLED", "true")
     monkeypatch.setenv("RAG_DIAGNOSTIC_USER_ID", "ambient_user")
+    monkeypatch.setenv("RAG_EVALUATION_EVIDENCE_ENABLED", "true")
+    monkeypatch.setenv("RAG_EVALUATION_USER_ID", "ambient_evaluation_user")
 
     monkeypatch.setattr(
         ragctl,
@@ -152,6 +154,8 @@ def test_command_runner_verifies_modal_target_and_propagates_environment(
     assert captured_environment["UPLOAD_READ_CHUNK_BYTES"] == "500"
     assert "WIZARD_DIAGNOSTICS_ENABLED" not in captured_environment
     assert "RAG_DIAGNOSTIC_USER_ID" not in captured_environment
+    assert "RAG_EVALUATION_EVIDENCE_ENABLED" not in captured_environment
+    assert "RAG_EVALUATION_USER_ID" not in captured_environment
 
 
 def test_non_modal_command_does_not_run_modal_target_probe(
@@ -356,7 +360,9 @@ def test_only_runtime_deployment_receives_default_off_diagnostic_override(
 
     assert all("overrides" not in options for options in runner.options[:2])
     assert runner.options[2]["overrides"] == {
-        "WIZARD_DIAGNOSTICS_ENABLED": "false"
+        "WIZARD_DIAGNOSTICS_ENABLED": "false",
+        "RAG_EVALUATION_EVIDENCE_ENABLED": "true",
+        "RAG_EVALUATION_USER_ID": ragctl.DEFAULT_USER_ID,
     }
     assert ragctl.gpu_request(config, "MODAL_SGLANG_GPU") == "H100"
     assert ragctl.gpu_request(config, "QWEN_MODAL_SGLANG_GPU") == "H100"
@@ -381,6 +387,7 @@ def test_diagnostic_runtime_override_is_scoped_to_modal_runtime_deploy(
             "overrides": {
                 "WIZARD_DIAGNOSTICS_ENABLED": "true",
                 "RAG_DIAGNOSTIC_USER_ID": "wizard_diagnostic",
+                "RAG_EVALUATION_EVIDENCE_ENABLED": "false",
             }
         }
     ]
@@ -824,6 +831,112 @@ def test_sse_parser_and_result_validation_accept_contract_order() -> None:
 
     assert answer.startswith("Atlas guide")
     assert timings["ttft"] == 1.5
+
+
+def test_ask_evaluation_failure_is_informational_and_query_is_sent_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    request_id = "70000000-0000-4000-8000-000000000001"
+    session_id = "70000000-0000-4000-8000-000000000002"
+    conversation_id = "70000000-0000-4000-8000-000000000003"
+    timings = {name: 0.0 for name in ragctl.CHAT_TIMING_KEYS}
+
+    class Response:
+        def __init__(
+            self,
+            status_code: int,
+            payload: object = None,
+            *,
+            headers: dict[str, str] | None = None,
+            lines: list[str] | None = None,
+        ) -> None:
+            self.status_code = status_code
+            self._payload = payload
+            self.headers = headers or {}
+            self._lines = lines or []
+
+        def json(self) -> object:
+            return self._payload
+
+        def iter_lines(self) -> object:
+            return iter(self._lines)
+
+        def __enter__(self) -> "Response":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    class Client:
+        query_posts = 0
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> "Client":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def get(self, url: str, **_kwargs: object) -> Response:
+            assert url.endswith("/health")
+            return Response(200)
+
+        def post(self, url: str, **_kwargs: object) -> Response:
+            if url.endswith("/api/chat/sessions"):
+                return Response(201, {"session_id": session_id})
+            assert url.endswith("/api/_diagnostics/wizard/trace")
+            return Response(404)
+
+        def stream(self, _method: str, url: str, **_kwargs: object) -> Response:
+            assert url.endswith("/api/chat/query")
+            type(self).query_posts += 1
+            return Response(
+                200,
+                headers={"X-Request-ID": request_id},
+                lines=[
+                    "event: token",
+                    "data: " + json.dumps({"request_id": request_id, "text": "answer"}),
+                    "",
+                    "event: telemetry",
+                    "data: "
+                    + json.dumps(
+                        {
+                            "request_id": request_id,
+                            "schema_version": "1.0",
+                            "timings_ms": timings,
+                        }
+                    ),
+                    "",
+                    "event: done",
+                    "data: "
+                    + json.dumps(
+                        {
+                            "request_id": request_id,
+                            "conversation_id": conversation_id,
+                        }
+                    ),
+                    "",
+                ],
+            )
+
+    monkeypatch.setattr(ragctl.httpx, "Client", Client)
+    monkeypatch.setattr(ragctl, "read_runtime_url", lambda _config: "https://runtime")
+    monkeypatch.setattr(ragctl, "ASK_DIAGNOSTICS_PATH", tmp_path / "ask")
+
+    ragctl.ask(_config(), "question")
+
+    assert Client.query_posts == 1
+    output = capsys.readouterr().out
+    assert "Answer: answer" in output
+    assert "SSE verified: 1 token event(s) -> telemetry -> done" in output
+    assert "Evaluation: status=failed" in output
+    statuses = list((tmp_path / "ask").glob("*/status.json"))
+    assert len(statuses) == 1
+    assert json.loads(statuses[0].read_text())["status"] == "failed"
 
 
 def test_launcher_uses_the_public_telemetry_key_owner() -> None:

@@ -114,11 +114,20 @@ TEXT_FILE_ENCODING = _required_string("TEXT_FILE_ENCODING", "utf-8-sig")
 TEXT_FILE_JOIN_SEPARATOR = _raw_string("TEXT_FILE_JOIN_SEPARATOR", "\n\n")
 WIZARD_DIAGNOSTICS_ENABLED = _boolean("WIZARD_DIAGNOSTICS_ENABLED", False)
 RAG_DIAGNOSTIC_USER_ID = _raw_string("RAG_DIAGNOSTIC_USER_ID", "")
+RAG_EVALUATION_EVIDENCE_ENABLED = _boolean(
+    "RAG_EVALUATION_EVIDENCE_ENABLED", False
+)
+RAG_EVALUATION_USER_ID = _raw_string("RAG_EVALUATION_USER_ID", "")
 
 try:
     _USER_ID_PATTERN = re.compile(USER_ID_PATTERN)
 except re.error as exc:
     raise ValueError("USER_ID_PATTERN must be a valid regular expression") from exc
+
+if WIZARD_DIAGNOSTICS_ENABLED and RAG_EVALUATION_EVIDENCE_ENABLED:
+    raise ValueError(
+        "Wizard diagnostics and evaluation evidence cannot be enabled together"
+    )
 
 if WIZARD_DIAGNOSTICS_ENABLED:
     if not RAG_DIAGNOSTIC_USER_ID:
@@ -132,6 +141,20 @@ if WIZARD_DIAGNOSTICS_ENABLED:
     if _USER_ID_PATTERN.fullmatch(RAG_DIAGNOSTIC_USER_ID) is None:
         raise ValueError(
             "RAG_DIAGNOSTIC_USER_ID does not match configured USER_ID_PATTERN"
+        )
+
+if RAG_EVALUATION_EVIDENCE_ENABLED:
+    if not RAG_EVALUATION_USER_ID:
+        raise ValueError(
+            "RAG_EVALUATION_USER_ID is required when evaluation evidence is enabled"
+        )
+    if RAG_EVALUATION_USER_ID != RAG_EVALUATION_USER_ID.strip():
+        raise ValueError(
+            "RAG_EVALUATION_USER_ID must not contain leading or trailing whitespace"
+        )
+    if _USER_ID_PATTERN.fullmatch(RAG_EVALUATION_USER_ID) is None:
+        raise ValueError(
+            "RAG_EVALUATION_USER_ID does not match configured USER_ID_PATTERN"
         )
 
 

@@ -1,0 +1,159 @@
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from rag_evaluation.metrics import (
+    EXPECTED_RAGAS_VERSION,
+    METRIC_PLANS,
+    EvaluationSettings,
+    EvaluationSetupError,
+    RagasMetricBackend,
+    assert_collections_api_compatible,
+    metric_skip_code,
+)
+from rag_evaluation.models import EvaluationRecord
+
+
+class RecordingMetric:
+    def __init__(self, value: float = 0.75) -> None:
+        self.value = value
+        self.calls: list[dict[str, object]] = []
+
+    async def ascore(self, **kwargs):
+        self.calls.append(kwargs)
+        return SimpleNamespace(value=self.value)
+
+
+class DummyClient:
+    async def close(self) -> None:
+        return None
+
+
+def _backend() -> tuple[RagasMetricBackend, dict[str, RecordingMetric]]:
+    metrics = {plan.name: RecordingMetric() for plan in METRIC_PLANS}
+    return (
+        RagasMetricBackend(
+            client=DummyClient(),
+            metrics=metrics,
+            embeddings=object(),
+            ragas_version=EXPECTED_RAGAS_VERSION,
+            judge_metadata={"provider": "ollama", "model": "qwen3.5:4b"},
+            embedding_metadata={"provider": "huggingface_local", "dimension": 384},
+        ),
+        metrics,
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://api.openai.com",
+        "http://192.168.1.2:11434",
+        "http://user:password@127.0.0.1:11434",
+        "http://127.0.0.1:11434/custom",
+    ],
+)
+def test_settings_reject_nonlocal_or_credentialed_endpoints(url, tmp_path) -> None:
+    with pytest.raises(EvaluationSetupError):
+        EvaluationSettings(
+            ollama_url=url,
+            embedding_model_path=tmp_path,
+        ).validate()
+
+
+def test_settings_normalize_loopback_openai_url(tmp_path) -> None:
+    settings = EvaluationSettings(
+        ollama_url="http://localhost:11434/v1/",
+        embedding_model_path=tmp_path,
+    )
+    settings.validate()
+    assert settings.ollama_origin == "http://localhost:11434"
+    assert settings.openai_base_url == "http://localhost:11434/v1"
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "qwen3-4b-awq",
+        "QWEN3-4B-AWQ:latest",
+        "merged-granite-4.1-3b-query-rewrite",
+    ],
+)
+def test_settings_reject_production_inference_model_identifiers(
+    tmp_path, model
+) -> None:
+    with pytest.raises(EvaluationSetupError, match="production inference model"):
+        EvaluationSettings(
+            judge_model=model,
+            embedding_model_path=tmp_path,
+        ).validate()
+
+
+def test_locked_collections_api_is_compatible() -> None:
+    assert assert_collections_api_compatible() == "0.4.3"
+
+
+def test_reference_and_opt_in_metric_selection(record) -> None:
+    plans = {plan.name: plan for plan in METRIC_PLANS}
+    assert metric_skip_code(
+        plans["faithfulness"], record, include_noise_sensitivity=False
+    ) is None
+    assert (
+        metric_skip_code(
+            plans["context_recall"], record, include_noise_sensitivity=False
+        )
+        == "REFERENCE_NOT_PROVIDED"
+    )
+    assert (
+        metric_skip_code(
+            plans["noise_sensitivity"], record, include_noise_sensitivity=False
+        )
+        == "NOT_REQUESTED"
+    )
+
+
+def test_metric_backend_routes_original_and_rewritten_queries(record_mapping) -> None:
+    record_mapping["reference"] = "Expected answer."
+    record = EvaluationRecord.from_mapping(record_mapping)
+    backend, metrics = _backend()
+
+    for plan in METRIC_PLANS:
+        assert asyncio.run(backend.score(plan, record)) == 0.75
+
+    assert metrics["faithfulness"].calls[0]["user_input"] == record.original_query
+    assert metrics["response_relevancy"].calls[0]["user_input"] == record.original_query
+    assert metrics["context_utilization"].calls[0]["user_input"] == record.rewritten_query
+    assert metrics["context_recall"].calls[0]["user_input"] == record.rewritten_query
+    assert (
+        metrics["context_precision_with_reference"].calls[0]["user_input"]
+        == record.rewritten_query
+    )
+    assert metrics["noise_sensitivity"].calls[0]["user_input"] == record.original_query
+    assert metrics["factual_correctness"].calls[0] == {
+        "response": record.response,
+        "reference": record.reference,
+    }
+    for name in (
+        "faithfulness",
+        "context_utilization",
+        "context_recall",
+        "context_precision_with_reference",
+        "noise_sensitivity",
+    ):
+        assert metrics[name].calls[0]["retrieved_contexts"] == list(
+            record.retrieved_contexts
+        )
+
+
+def test_tracking_and_huggingface_network_are_forced_off(monkeypatch) -> None:
+    import os
+    import rag_evaluation.metrics as metrics_module
+
+    assert os.environ["RAGAS_DO_NOT_TRACK"] == "true"
+    assert os.environ["HF_HUB_OFFLINE"] == "1"
+    assert os.environ["TRANSFORMERS_OFFLINE"] == "1"
+    assert Path(metrics_module.__file__).is_file()

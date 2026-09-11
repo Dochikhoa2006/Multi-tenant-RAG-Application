@@ -19,6 +19,7 @@ import tempfile
 import time
 from typing import Any
 from urllib.parse import urlparse
+from uuid import uuid4
 import warnings
 
 import httpx
@@ -33,6 +34,7 @@ WIZARD_DIAGNOSTICS_PATH = PROJECT_ROOT / ".local" / "diagnostics" / "wizard"
 WIZARD_CORPUS_STATE_PATH = WIZARD_DIAGNOSTICS_PATH / "corpus-state.json"
 WIZARD_CORPUS_LOCK_PATH = WIZARD_DIAGNOSTICS_PATH / "corpus-state.lock"
 E2E_DIAGNOSTICS_PATH = PROJECT_ROOT / ".local" / "diagnostics" / "e2e"
+ASK_DIAGNOSTICS_PATH = PROJECT_ROOT / ".local" / "diagnostics" / "ask"
 COMPOSE_FILE = PROJECT_ROOT / "deployment" / "compose.weaviate-secure.yaml"
 CERT_DIR = PROJECT_ROOT / ".local" / "tailscale-certs"
 CERT_PATH = CERT_DIR / "weaviate.pem"
@@ -100,7 +102,12 @@ REQUIRED_ENV_KEYS = (
     *MODAL_TARGET_KEYS,
 )
 RUNTIME_DIAGNOSTIC_ENV_KEYS = frozenset(
-    {"WIZARD_DIAGNOSTICS_ENABLED", "RAG_DIAGNOSTIC_USER_ID"}
+    {
+        "WIZARD_DIAGNOSTICS_ENABLED",
+        "RAG_DIAGNOSTIC_USER_ID",
+        "RAG_EVALUATION_EVIDENCE_ENABLED",
+        "RAG_EVALUATION_USER_ID",
+    }
 )
 
 
@@ -841,11 +848,19 @@ def deploy_runtime(
     *,
     wizard_diagnostic_user_id: str | None = None,
 ) -> str:
-    overrides = {"WIZARD_DIAGNOSTICS_ENABLED": "false"}
+    evaluation_user_id = (
+        config.get("RAG_USER_ID", DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
+    )
+    overrides = {
+        "WIZARD_DIAGNOSTICS_ENABLED": "false",
+        "RAG_EVALUATION_EVIDENCE_ENABLED": "true",
+        "RAG_EVALUATION_USER_ID": evaluation_user_id,
+    }
     if wizard_diagnostic_user_id is not None:
         overrides = {
             "WIZARD_DIAGNOSTICS_ENABLED": "true",
             "RAG_DIAGNOSTIC_USER_ID": wizard_diagnostic_user_id,
+            "RAG_EVALUATION_EVIDENCE_ENABLED": "false",
         }
     runner.run(
         [MODAL, "deploy", PROJECT_ROOT / "deployment" / "modal_runtime.py"],
@@ -1657,6 +1672,19 @@ def ask(
     *,
     verify_atlas_grounding: bool = False,
 ) -> None:
+    from deployment.e2e_diagnostic import utc_timestamp
+    from deployment.e2e_diagnostic_api import _DeepTraceSession
+    from deployment.evaluation_bridge import (
+        EvaluationBridgeError,
+        EvaluationObservation,
+        build_evaluation_record,
+        finish_local_evaluation,
+        parse_request_evidence,
+        resolve_exact_contexts,
+        start_local_evaluation,
+        write_private_json,
+    )
+
     runtime_url = read_runtime_url(config)
     question_text = (question if question is not None else input("Question: ")).strip()
     if not question_text:
@@ -1664,6 +1692,12 @@ def ask(
     user_id = config.get("RAG_USER_ID", DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
     headers = _runtime_headers(config)
     timeout = httpx.Timeout(connect=30, read=900, write=120, pool=30)
+    run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid4().hex[:12]
+    trace_operation_id = str(uuid4())
+    trace_error_code: str | None = None
+    trace_operation: Mapping[str, Any] | None = None
+    trace: _DeepTraceSession | None = None
+    response_request_id: str | None = None
     with httpx.Client(headers=headers, timeout=timeout) as client:
         health = client.get(f"{runtime_url}/health")
         if health.status_code != 200:
@@ -1678,59 +1712,190 @@ def ask(
         except (KeyError, TypeError, ValueError) as exc:
             raise RagCtlError("Session creation returned malformed JSON") from exc
 
+        trace_candidate = _DeepTraceSession(client, runtime_url, user_id, run_id)
+        try:
+            trace_candidate.start()
+        except Exception:
+            trace_error_code = "EVALUATION_EVIDENCE_START_FAILED"
+            trace_candidate.started = True
+            try:
+                trace_candidate.delete()
+            except Exception:
+                pass
+            trace = None
+        else:
+            trace = trace_candidate
+
         print(f"Session: {session_id}")
         print("Answer: ", end="", flush=True)
         events: list[str] = []
         answer_parts: list[str] = []
         telemetry: Mapping[str, object] | None = None
         done_payload: Mapping[str, object] | None = None
-        with client.stream(
-            "POST",
-            f"{runtime_url}/api/chat/query",
-            headers={"Accept": "text/event-stream"},
-            json={
-                "user_id": user_id,
-                "session_id": session_id,
-                "question": question_text,
-            },
-        ) as response:
-            if response.status_code != 200:
-                raise RagCtlError("Chat request did not return an SSE stream")
-            for event_name, payload in iter_sse(response.iter_lines()):
-                events.append(event_name)
-                if event_name == "error":
-                    raise RagCtlError(f"RAG stream failed: {payload}")
-                if event_name == "token":
-                    if not isinstance(payload, Mapping) or not isinstance(
-                        payload.get("text"), str
-                    ) or not payload["text"]:
-                        raise RagCtlError("RAG stream returned an invalid token event")
-                    answer_parts.append(payload["text"])
-                    print(payload["text"], end="", flush=True)
-                elif event_name == "telemetry":
-                    if telemetry is not None or not isinstance(payload, Mapping):
-                        raise RagCtlError("RAG stream returned invalid telemetry")
-                    telemetry = payload
-                elif event_name == "done":
-                    if done_payload is not None or not isinstance(payload, Mapping):
-                        raise RagCtlError("RAG stream returned an invalid done event")
-                    done_payload = payload
-                else:
-                    raise RagCtlError(f"RAG stream returned unexpected event {event_name!r}")
-        print()
-
-    _, timings = validate_chat_result(
-        events,
-        answer_parts,
-        telemetry,
-        done_payload,
-        verify_atlas_grounding=verify_atlas_grounding,
-    )
+        try:
+            query_headers = {"Accept": "text/event-stream"}
+            if trace is not None:
+                query_headers.update(
+                    {
+                        "X-Wizard-Diagnostic-Session-ID": trace.session_id,
+                        "X-Wizard-Diagnostic-Operation-ID": trace_operation_id,
+                    }
+                )
+            with client.stream(
+                "POST",
+                f"{runtime_url}/api/chat/query",
+                headers=query_headers,
+                json={
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "question": question_text,
+                },
+            ) as response:
+                response_request_id = response.headers.get("X-Request-ID")
+                if response.status_code != 200:
+                    raise RagCtlError("Chat request did not return an SSE stream")
+                for event_name, payload in iter_sse(response.iter_lines()):
+                    events.append(event_name)
+                    if event_name == "error":
+                        raise RagCtlError(f"RAG stream failed: {payload}")
+                    if event_name == "token":
+                        if not isinstance(payload, Mapping) or not isinstance(
+                            payload.get("text"), str
+                        ) or not payload["text"]:
+                            raise RagCtlError("RAG stream returned an invalid token event")
+                        answer_parts.append(payload["text"])
+                        print(payload["text"], end="", flush=True)
+                    elif event_name == "telemetry":
+                        if telemetry is not None or not isinstance(payload, Mapping):
+                            raise RagCtlError("RAG stream returned invalid telemetry")
+                        telemetry = payload
+                    elif event_name == "done":
+                        if done_payload is not None or not isinstance(payload, Mapping):
+                            raise RagCtlError("RAG stream returned an invalid done event")
+                        done_payload = payload
+                    else:
+                        raise RagCtlError(
+                            f"RAG stream returned unexpected event {event_name!r}"
+                        )
+            print()
+            answer, timings = validate_chat_result(
+                events,
+                answer_parts,
+                telemetry,
+                done_payload,
+                verify_atlas_grounding=verify_atlas_grounding,
+            )
+            if trace is not None:
+                try:
+                    _, trace_operation, _ = trace.wait_operation(trace_operation_id)
+                except Exception:
+                    trace_error_code = "EVALUATION_EVIDENCE_INVALID"
+                finally:
+                    try:
+                        trace.delete()
+                    except Exception:
+                        trace_error_code = "EVALUATION_EVIDENCE_DELETE_FAILED"
+        except BaseException:
+            if trace is not None and trace.started:
+                try:
+                    trace.delete()
+                except Exception:
+                    pass
+            raise
 
     summary = {name: timings[name] for name in CHAT_TIMING_KEYS}
     print("Telemetry (ms): " + json.dumps(summary, sort_keys=True))
     print("Done: " + json.dumps(dict(done_payload), sort_keys=True))
     print(f"SSE verified: {events.count('token')} token event(s) -> telemetry -> done")
+
+    evaluation: EvaluationObservation
+    try:
+        if trace_error_code is not None or trace_operation is None:
+            raise EvaluationBridgeError(
+                trace_error_code or "evaluation evidence is unavailable"
+            )
+        if not isinstance(telemetry, Mapping) or not isinstance(done_payload, Mapping):
+            raise EvaluationBridgeError("public response evidence is unavailable")
+        request_id = done_payload.get("request_id")
+        conversation_id = done_payload.get("conversation_id")
+        if request_id != response_request_id or telemetry.get("request_id") != request_id:
+            raise EvaluationBridgeError("public request correlation is invalid")
+        evidence = parse_request_evidence(
+            trace_operation,
+            user_id=user_id,
+            trace_session_id=trace.session_id,
+            operation_id=trace_operation_id,
+            chat_session_id=session_id,
+            request_id=str(request_id),
+        )
+        contexts = resolve_exact_contexts(
+            config,
+            user_id=user_id,
+            evidence=evidence,
+        )
+        record = build_evaluation_record(
+            source="rag_ask",
+            request_id=str(request_id),
+            conversation_id=str(conversation_id),
+            original_query=question_text,
+            response=answer,
+            telemetry=telemetry,
+            evidence=evidence,
+            contexts=contexts,
+            captured_at=utc_timestamp(),
+        )
+        launch = start_local_evaluation(
+            record,
+            ASK_DIAGNOSTICS_PATH / run_id,
+            "evaluation",
+            exact_names=True,
+        )
+        try:
+            evaluation = finish_local_evaluation(launch)
+        except KeyboardInterrupt:
+            from deployment.evaluation_bridge import cancel_local_evaluation
+
+            cancel_local_evaluation(launch)
+            raise
+        except Exception:
+            evaluation = EvaluationObservation(
+                "failed",
+                "EVALUATION_PROCESS_FAILED",
+                0.0,
+                None,
+                None,
+                None,
+            )
+    except Exception:
+        evaluation = EvaluationObservation(
+            "failed",
+            trace_error_code or "EVALUATION_EVIDENCE_INVALID",
+            0.0,
+            None,
+            None,
+            None,
+        )
+    status_path = ASK_DIAGNOSTICS_PATH / run_id / "status.json"
+    evaluation_artifact = evaluation.artifact()
+    status_artifact_path: str | None = str(status_path)
+    try:
+        write_private_json(status_path, evaluation_artifact)
+    except Exception:
+        status_artifact_path = None
+        evaluation_artifact = {
+            **evaluation_artifact,
+            "status": "failed",
+            "error_code": "EVALUATION_STATUS_WRITE_FAILED",
+        }
+    print(
+        "Evaluation: "
+        f"status={evaluation_artifact['status']} "
+        f"evaluation_ms={evaluation_artifact['evaluation_ms']} "
+        f"record={evaluation_artifact.get('record_path')} "
+        f"result={evaluation_artifact.get('result_path')} "
+        f"status_artifact={status_artifact_path}",
+        flush=True,
+    )
 
 
 def status(config: Mapping[str, str], runner: CommandRunner) -> None:

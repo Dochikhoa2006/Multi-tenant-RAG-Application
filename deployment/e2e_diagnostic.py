@@ -22,7 +22,7 @@ from deployment.wizard_diagnostic import (
 )
 
 
-E2E_SCHEMA_VERSION = "1.3"
+E2E_SCHEMA_VERSION = "1.4"
 E2E_PHASE = "2D"
 
 
@@ -299,6 +299,10 @@ class RequestRecorder:
         self.query_posts = 0
         self.individual_failed = 0
         self.systemic_failed = 0
+        self.evaluation_succeeded = 0
+        self.evaluation_partial = 0
+        self.evaluation_failed = 0
+        self.evaluation_skipped = 0
 
     @property
     def totals(self) -> dict[str, int]:
@@ -309,6 +313,15 @@ class RequestRecorder:
             "query_posts": self.query_posts,
             "individual_failed": self.individual_failed,
             "systemic_failed": self.systemic_failed,
+        }
+
+    @property
+    def evaluation_totals(self) -> dict[str, int]:
+        return {
+            "succeeded": self.evaluation_succeeded,
+            "partial": self.evaluation_partial,
+            "failed": self.evaluation_failed,
+            "skipped": self.evaluation_skipped,
         }
 
     def record(
@@ -338,6 +351,7 @@ class RequestRecorder:
         trace_polling: Mapping[str, object] | None = None,
         post_generation: Mapping[str, object] | None = None,
         registry_verification: Mapping[str, object] | None = None,
+        evaluation: Mapping[str, object] | None = None,
     ) -> None:
         if status not in {"succeeded", "failed"}:
             raise E2EDiagnosticError("Request status must be succeeded or failed")
@@ -384,6 +398,12 @@ class RequestRecorder:
             or duration_ms < 0
         ):
             raise E2EDiagnosticError("Request counts or duration are invalid")
+        evaluation_status = "skipped"
+        if evaluation is not None:
+            candidate = evaluation.get("status")
+            if candidate not in {"succeeded", "partial", "failed", "skipped"}:
+                raise E2EDiagnosticError("Evaluation status is invalid")
+            evaluation_status = str(candidate)
         self.attempted += 1
         if query_http_attempted:
             self.query_posts += 1
@@ -395,6 +415,14 @@ class RequestRecorder:
                 self.individual_failed += 1
             else:
                 self.systemic_failed += 1
+        if evaluation_status == "succeeded":
+            self.evaluation_succeeded += 1
+        elif evaluation_status == "partial":
+            self.evaluation_partial += 1
+        elif evaluation_status == "failed":
+            self.evaluation_failed += 1
+        else:
+            self.evaluation_skipped += 1
         payload = {
             "schema_version": E2E_SCHEMA_VERSION,
             "sequence": self.attempted,
@@ -439,6 +467,7 @@ class RequestRecorder:
             ),
             "diagnostic_operation_id": diagnostic_operation_id,
             "deep_trace": None if deep_trace is None else dict(deep_trace),
+            "evaluation": None if evaluation is None else dict(evaluation),
         }
         try:
             with self.path.open("a", encoding="utf-8") as target:
@@ -489,6 +518,7 @@ def update_e2e_summary(
                     "status": trace_status,
                     "session_deleted": trace_deleted,
                 },
+                "evaluation": recorder.evaluation_totals,
                 "lifecycle": {
                     "pre_down": pre_down_status,
                     "up": up_status,

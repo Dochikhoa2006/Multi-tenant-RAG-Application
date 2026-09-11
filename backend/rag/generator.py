@@ -19,6 +19,7 @@ from backend.rag.runtime import RAGRuntime, TimingObserver, Tokenizer, resolve_r
 from backend.wizard.diagnostics import (
     TRACE_SAMPLE_LIMIT,
     add_count,
+    capture_evaluation_contexts,
     framed_content_digest,
     observe_elapsed,
     observe_trace_metadata,
@@ -226,6 +227,7 @@ def _build_budgeted_prompt(
             observe_trace_metadata(
                 _trace_final_prompt_context, knowledge, policy, prompt
             )
+            capture_evaluation_contexts(knowledge, policy)
             return prompt
         _drop_total_budget_tail(knowledge, policy, tokenizer)
 
