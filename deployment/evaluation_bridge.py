@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
+import stat
 import subprocess
+from threading import Event, Lock
 from time import perf_counter
 from typing import Any
 from uuid import UUID, uuid4
@@ -25,6 +29,11 @@ EVALUATOR = PROJECT_ROOT / "evaluation" / ".venv" / "bin" / "rag-evaluate"
 EVALUATION_RECORD_SCHEMA_VERSION = "1.0"
 EVALUATION_RESULT_SCHEMA_VERSION = "1.0"
 EVALUATION_TIMEOUT_SECONDS = 1800.0
+LOCAL_EVALUATION_CONCURRENCY = 1
+LOCAL_EVALUATION_LOCK_PATH = (
+    PROJECT_ROOT / ".local" / "diagnostics" / "evaluation" / "execution.lock"
+)
+_LOCK_POLL_SECONDS = 0.05
 _PROPERTIES = ("user_id", "document_id", "paragraph_id", "chunk_id", "raw_text")
 
 
@@ -67,12 +76,14 @@ class EvaluationObservation:
     record_path: str | None
     result_path: str | None
     record_sha256: str | None
+    queue_wait_ms: float = 0.0
 
     def artifact(self) -> dict[str, object]:
         return {
             "status": self.status,
             "error_code": self.error_code,
             "evaluation_ms": round(self.duration_ms, 3),
+            "queue_wait_ms": round(self.queue_wait_ms, 3),
             "record_path": self.record_path,
             "result_path": self.result_path,
             "record_sha256": self.record_sha256,
@@ -90,6 +101,27 @@ class EvaluationLaunch:
     request_id: str
     conversation_id: str
     error_code: str | None = None
+
+
+@dataclass
+class _EvaluationJobState:
+    lock: Lock = field(default_factory=Lock)
+    launch: EvaluationLaunch | None = None
+
+
+@dataclass(frozen=True)
+class EvaluationJob:
+    future: Future[EvaluationObservation]
+    cancel_event: Event
+    state: _EvaluationJobState
+
+
+_LOCAL_EVALUATION_EXECUTOR = ThreadPoolExecutor(
+    max_workers=LOCAL_EVALUATION_CONCURRENCY,
+    thread_name_prefix="rag-local-evaluation",
+)
+_LOCAL_JOB_LOCK = Lock()
+_LOCAL_JOB_PENDING = False
 
 
 def _canonical_uuid(value: object, name: str) -> str:
@@ -439,6 +471,7 @@ def start_local_evaluation(
     stem: str,
     *,
     exact_names: bool = False,
+    execution_lock_fd: int | None = None,
 ) -> EvaluationLaunch:
     started = perf_counter()
     record_path = directory / (
@@ -453,7 +486,9 @@ def start_local_evaluation(
     try:
         record_sha256 = write_private_json(record_path, record)
         if not EVALUATOR.is_file() or not os.access(EVALUATOR, os.X_OK):
-            raise EvaluationBridgeError("dedicated evaluator environment is unavailable")
+            raise EvaluationBridgeError(
+                "dedicated evaluator environment is unavailable"
+            )
         environment = os.environ.copy()
         environment.update(
             {
@@ -470,6 +505,9 @@ def start_local_evaluation(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            pass_fds=(
+                () if execution_lock_fd is None else (execution_lock_fd,)
+            ),
         )
         return EvaluationLaunch(
             started,
@@ -585,18 +623,305 @@ def cancel_local_evaluation(launch: EvaluationLaunch) -> None:
             pass
 
 
+def _acquire_evaluation_lock(
+    path: Path,
+    cancel_event: Event,
+    submitted_at: float,
+) -> tuple[int | None, float]:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.parent.is_symlink() or path.is_symlink():
+        raise EvaluationBridgeError("local evaluation lock path is unsafe")
+    os.chmod(path.parent, 0o700)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise EvaluationBridgeError("local evaluation lock is not a regular file")
+        os.fchmod(descriptor, 0o600)
+        while True:
+            if cancel_event.is_set():
+                os.close(descriptor)
+                return None, (perf_counter() - submitted_at) * 1000.0
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return descriptor, (perf_counter() - submitted_at) * 1000.0
+            except BlockingIOError:
+                cancel_event.wait(_LOCK_POLL_SECONDS)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _release_evaluation_lock(descriptor: int | None) -> None:
+    if descriptor is None:
+        return
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _terminal_job(
+    status: str,
+    error_code: str,
+    *,
+    duration_ms: float = 0.0,
+    queue_wait_ms: float = 0.0,
+) -> EvaluationJob:
+    future: Future[EvaluationObservation] = Future()
+    future.set_result(
+        EvaluationObservation(
+            status,
+            error_code,
+            duration_ms,
+            None,
+            None,
+            None,
+            queue_wait_ms,
+        )
+    )
+    return EvaluationJob(future, Event(), _EvaluationJobState())
+
+
+def _run_evaluation_job(
+    *,
+    submitted_at: float,
+    cancel_event: Event,
+    state: _EvaluationJobState,
+    execution_lock_path: Path,
+    config: Mapping[str, str],
+    user_id: str,
+    evidence: RequestEvidence,
+    allowed_document_ids: Mapping[str, frozenset[str]] | None,
+    source: str,
+    request_id: str,
+    conversation_id: str,
+    original_query: str,
+    response: str,
+    telemetry: Mapping[str, object],
+    captured_at: str,
+    directory: Path,
+    stem: str,
+    exact_names: bool,
+) -> EvaluationObservation:
+    descriptor: int | None = None
+    queue_wait_ms = 0.0
+    launch: EvaluationLaunch | None = None
+    try:
+        descriptor, queue_wait_ms = _acquire_evaluation_lock(
+            execution_lock_path,
+            cancel_event,
+            submitted_at,
+        )
+        if descriptor is None or cancel_event.is_set():
+            return EvaluationObservation(
+                "failed",
+                "EVALUATION_CANCELLED",
+                (perf_counter() - submitted_at) * 1000.0,
+                None,
+                None,
+                None,
+                queue_wait_ms,
+            )
+        contexts = resolve_exact_contexts(
+            config,
+            user_id=user_id,
+            evidence=evidence,
+            allowed_document_ids=allowed_document_ids,
+        )
+        if cancel_event.is_set():
+            return EvaluationObservation(
+                "failed",
+                "EVALUATION_CANCELLED",
+                (perf_counter() - submitted_at) * 1000.0,
+                None,
+                None,
+                None,
+                queue_wait_ms,
+            )
+        record = build_evaluation_record(
+            source=source,
+            request_id=request_id,
+            conversation_id=conversation_id,
+            original_query=original_query,
+            response=response,
+            telemetry=telemetry,
+            evidence=evidence,
+            contexts=contexts,
+            captured_at=captured_at,
+        )
+        if cancel_event.is_set():
+            return EvaluationObservation(
+                "failed",
+                "EVALUATION_CANCELLED",
+                (perf_counter() - submitted_at) * 1000.0,
+                None,
+                None,
+                None,
+                queue_wait_ms,
+            )
+        launch = start_local_evaluation(
+            record,
+            directory,
+            stem,
+            exact_names=exact_names,
+            execution_lock_fd=descriptor,
+        )
+        with state.lock:
+            state.launch = launch
+        if cancel_event.is_set():
+            cancel_local_evaluation(launch)
+        observation = finish_local_evaluation(launch)
+        if cancel_event.is_set():
+            return EvaluationObservation(
+                "failed",
+                "EVALUATION_CANCELLED",
+                (perf_counter() - submitted_at) * 1000.0,
+                observation.record_path,
+                None,
+                observation.record_sha256,
+                queue_wait_ms,
+            )
+        return EvaluationObservation(
+            observation.status,
+            observation.error_code,
+            (perf_counter() - submitted_at) * 1000.0,
+            observation.record_path,
+            observation.result_path,
+            observation.record_sha256,
+            queue_wait_ms,
+        )
+    except Exception:
+        return EvaluationObservation(
+            "failed",
+            "EVALUATION_EVIDENCE_INVALID",
+            (perf_counter() - submitted_at) * 1000.0,
+            (
+                None
+                if launch is None or launch.record_path is None
+                else str(launch.record_path)
+            ),
+            None,
+            None if launch is None else launch.record_sha256,
+            queue_wait_ms,
+        )
+    finally:
+        with state.lock:
+            state.launch = None
+        _release_evaluation_lock(descriptor)
+        global _LOCAL_JOB_PENDING
+        with _LOCAL_JOB_LOCK:
+            _LOCAL_JOB_PENDING = False
+
+
+def submit_local_evaluation(
+    *,
+    config: Mapping[str, str],
+    user_id: str,
+    evidence: RequestEvidence,
+    allowed_document_ids: Mapping[str, frozenset[str]] | None,
+    source: str,
+    request_id: str,
+    conversation_id: str,
+    original_query: str,
+    response: str,
+    telemetry: Mapping[str, object],
+    captured_at: str,
+    directory: Path,
+    stem: str,
+    exact_names: bool = False,
+    execution_lock_path: Path = LOCAL_EVALUATION_LOCK_PATH,
+) -> EvaluationJob:
+    """Submit one bounded local evidence-hydration and evaluator job."""
+
+    try:
+        telemetry_copy = json.loads(
+            json.dumps(telemetry, ensure_ascii=False, allow_nan=False)
+        )
+        if not isinstance(telemetry_copy, Mapping):
+            raise TypeError("telemetry must be a mapping")
+        config_copy = dict(config)
+        allowed_copy = (
+            None
+            if allowed_document_ids is None
+            else {
+                collection: frozenset(document_ids)
+                for collection, document_ids in allowed_document_ids.items()
+            }
+        )
+    except (TypeError, ValueError):
+        return _terminal_job("failed", "EVALUATION_EVIDENCE_INVALID")
+
+    global _LOCAL_JOB_PENDING
+    with _LOCAL_JOB_LOCK:
+        if _LOCAL_JOB_PENDING:
+            return _terminal_job("failed", "EVALUATION_LOCAL_JOB_BUSY")
+        _LOCAL_JOB_PENDING = True
+    submitted_at = perf_counter()
+    cancel_event = Event()
+    state = _EvaluationJobState()
+    try:
+        future = _LOCAL_EVALUATION_EXECUTOR.submit(
+            _run_evaluation_job,
+            submitted_at=submitted_at,
+            cancel_event=cancel_event,
+            state=state,
+            execution_lock_path=execution_lock_path,
+            config=config_copy,
+            user_id=user_id,
+            evidence=evidence,
+            allowed_document_ids=allowed_copy,
+            source=source,
+            request_id=request_id,
+            conversation_id=conversation_id,
+            original_query=original_query,
+            response=response,
+            telemetry=telemetry_copy,
+            captured_at=captured_at,
+            directory=directory,
+            stem=stem,
+            exact_names=exact_names,
+        )
+    except Exception:
+        with _LOCAL_JOB_LOCK:
+            _LOCAL_JOB_PENDING = False
+        return _terminal_job("failed", "EVALUATION_START_FAILED")
+    return EvaluationJob(future, cancel_event, state)
+
+
+def finish_evaluation_job(job: EvaluationJob) -> EvaluationObservation:
+    return job.future.result()
+
+
+def cancel_evaluation_job(job: EvaluationJob) -> None:
+    job.cancel_event.set()
+    with job.state.lock:
+        launch = job.state.launch
+    if launch is not None:
+        cancel_local_evaluation(launch)
+
+
 __all__ = [
     "ContextIdentity",
     "EvaluationBridgeError",
+    "EvaluationJob",
     "EvaluationLaunch",
     "EvaluationObservation",
+    "LOCAL_EVALUATION_CONCURRENCY",
+    "LOCAL_EVALUATION_LOCK_PATH",
     "RequestEvidence",
     "ResolvedContexts",
     "build_evaluation_record",
+    "cancel_evaluation_job",
     "cancel_local_evaluation",
     "finish_local_evaluation",
+    "finish_evaluation_job",
     "parse_request_evidence",
     "resolve_exact_contexts",
     "start_local_evaluation",
+    "submit_local_evaluation",
     "write_private_json",
 ]

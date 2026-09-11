@@ -1677,11 +1677,10 @@ def ask(
     from deployment.evaluation_bridge import (
         EvaluationBridgeError,
         EvaluationObservation,
-        build_evaluation_record,
-        finish_local_evaluation,
+        cancel_evaluation_job,
+        finish_evaluation_job,
         parse_request_evidence,
-        resolve_exact_contexts,
-        start_local_evaluation,
+        submit_local_evaluation,
         write_private_json,
     )
 
@@ -1828,34 +1827,25 @@ def ask(
             chat_session_id=session_id,
             request_id=str(request_id),
         )
-        contexts = resolve_exact_contexts(
-            config,
+        evaluation_job = submit_local_evaluation(
+            config=config,
             user_id=user_id,
             evidence=evidence,
-        )
-        record = build_evaluation_record(
             source="rag_ask",
             request_id=str(request_id),
             conversation_id=str(conversation_id),
             original_query=question_text,
             response=answer,
             telemetry=telemetry,
-            evidence=evidence,
-            contexts=contexts,
             captured_at=utc_timestamp(),
-        )
-        launch = start_local_evaluation(
-            record,
-            ASK_DIAGNOSTICS_PATH / run_id,
-            "evaluation",
+            directory=ASK_DIAGNOSTICS_PATH / run_id,
+            stem="evaluation",
             exact_names=True,
         )
         try:
-            evaluation = finish_local_evaluation(launch)
+            evaluation = finish_evaluation_job(evaluation_job)
         except KeyboardInterrupt:
-            from deployment.evaluation_bridge import cancel_local_evaluation
-
-            cancel_local_evaluation(launch)
+            cancel_evaluation_job(evaluation_job)
             raise
         except Exception:
             evaluation = EvaluationObservation(

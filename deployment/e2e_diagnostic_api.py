@@ -36,14 +36,11 @@ from deployment.e2e_diagnostic import (
     utc_timestamp,
 )
 from deployment.evaluation_bridge import (
-    EvaluationBridgeError,
-    EvaluationLaunch,
-    build_evaluation_record,
-    cancel_local_evaluation,
-    finish_local_evaluation,
+    EvaluationJob,
+    cancel_evaluation_job,
+    finish_evaluation_job,
     parse_request_evidence,
-    resolve_exact_contexts,
-    start_local_evaluation,
+    submit_local_evaluation,
 )
 from deployment.wizard_diagnostic import CorpusGeneration, CorpusState
 from deployment.wizard_diagnostic_api import CorpusStorage, TRACE_PATH
@@ -1613,7 +1610,7 @@ def _execute_query(
         "status": "skipped",
         "error_code": "RAG_NOT_SUCCEEDED",
     }
-    evaluation_launch: EvaluationLaunch | None = None
+    evaluation_job: EvaluationJob | None = None
     code: str | None = None
     failure_scope: str | None = None
     failure_stage: str | None = None
@@ -1699,27 +1696,20 @@ def _execute_query(
                     chat_session_id=session_id,
                     request_id=result.request_id,
                 )
-                contexts = resolve_exact_contexts(
-                    config,
+                evaluation_job = submit_local_evaluation(
+                    config=config,
                     user_id=user_id,
                     evidence=evidence,
                     allowed_document_ids=allowed_document_ids,
-                )
-                record = build_evaluation_record(
                     source="e2e",
                     request_id=result.request_id,
                     conversation_id=result.conversation_id,
                     original_query=query.question,
                     response=result.answer,
                     telemetry=result.telemetry,
-                    evidence=evidence,
-                    contexts=contexts,
                     captured_at=utc_timestamp(),
-                )
-                evaluation_launch = start_local_evaluation(
-                    record,
-                    evaluation_directory,
-                    f"{query.source_index:06d}-{result.request_id}",
+                    directory=evaluation_directory,
+                    stem=f"{query.source_index:06d}-{result.request_id}",
                 )
                 evaluation = {
                     "status": "running",
@@ -1787,8 +1777,8 @@ def _execute_query(
                 title,
             )
         except KeyboardInterrupt:
-            if evaluation_launch is not None:
-                cancel_local_evaluation(evaluation_launch)
+            if evaluation_job is not None:
+                cancel_evaluation_job(evaluation_job)
             raise
         except PostGenerationContractError:
             code = "POST_GENERATION_FAILED"
@@ -1806,17 +1796,6 @@ def _execute_query(
             code = "POST_GENERATION_INVALID"
             failure_scope = "individual"
             failure_stage = "post_generation"
-        finally:
-            if evaluation_launch is not None:
-                try:
-                    evaluation = finish_local_evaluation(
-                        evaluation_launch
-                    ).artifact()
-                except Exception:
-                    evaluation = {
-                        "status": "failed",
-                        "error_code": "EVALUATION_PROCESS_FAILED",
-                    }
     elif response_status == 200:
         try:
             payload, operation, trace_polling = trace.wait_operation(operation_id)
@@ -1856,6 +1835,18 @@ def _execute_query(
             failure_scope = "individual"
             failure_stage = "query"
     status = "succeeded" if code is None and result is not None else "failed"
+    duration_ms = (perf_counter() - started_clock) * 1000.0
+    if evaluation_job is not None:
+        try:
+            evaluation = finish_evaluation_job(evaluation_job).artifact()
+        except KeyboardInterrupt:
+            cancel_evaluation_job(evaluation_job)
+            raise
+        except Exception:
+            evaluation = {
+                "status": "failed",
+                "error_code": "EVALUATION_PROCESS_FAILED",
+            }
     return QueryAttemptResult(
         query=query,
         status=status,
@@ -1884,7 +1875,7 @@ def _execute_query(
         registry_verification=registry_verification,
         deep_trace=deep_trace,
         evaluation=evaluation,
-        duration_ms=(perf_counter() - started_clock) * 1000.0,
+        duration_ms=duration_ms,
         started_at=started_at,
     )
 

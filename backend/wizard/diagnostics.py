@@ -17,6 +17,7 @@ from uuid import UUID
 
 TRACE_SCHEMA_VERSION = "1.0"
 TRACE_SESSION_MAX_OPERATIONS = 256
+EVALUATION_SESSION_CAPACITY = 256
 TRACE_SAMPLE_LIMIT = 32
 TRACE_TEXT_MAX_UTF8_BYTES = 8192
 TRACE_CAPTURE_MODES = frozenset({"deep", "evaluation"})
@@ -303,7 +304,7 @@ class _Session:
 
 
 class DiagnosticTraceRegistry:
-    """Own at most one bounded diagnostic trace session."""
+    """Own one deep session or bounded request-scoped evaluation sessions."""
 
     def __init__(
         self, configured_user_id: str, *, capture_mode: str = "deep"
@@ -315,6 +316,7 @@ class DiagnosticTraceRegistry:
             raise ValueError("diagnostic capture mode is invalid")
         self.capture_mode = capture_mode
         self._session: _Session | None = None
+        self._evaluation_sessions: dict[str, _Session] = {}
         self._lock = RLock()
 
     def start(self, user_id: str, session_id: str, run_id: str) -> dict[str, object]:
@@ -324,6 +326,18 @@ class DiagnosticTraceRegistry:
         if user != self.configured_user_id:
             raise KeyError("diagnostic session")
         with self._lock:
+            if self.capture_mode == "evaluation":
+                if session in self._evaluation_sessions:
+                    raise RuntimeError(
+                        "an evaluation evidence session is already active"
+                    )
+                if len(self._evaluation_sessions) >= EVALUATION_SESSION_CAPACITY:
+                    raise RuntimeError(
+                        "evaluation evidence session capacity is exhausted"
+                    )
+                evaluation_session = _Session(session, run, user, self.capture_mode)
+                self._evaluation_sessions[session] = evaluation_session
+                return self._session_payload(evaluation_session, operation_id=None)
             if self._session is not None:
                 raise RuntimeError("a Wizard diagnostic session is already active")
             self._session = _Session(session, run, user, self.capture_mode)
@@ -332,6 +346,9 @@ class DiagnosticTraceRegistry:
     def delete(self, user_id: str, session_id: str) -> None:
         with self._lock:
             session = self._required_session(user_id, session_id)
+            if self.capture_mode == "evaluation":
+                self._evaluation_sessions.pop(session.session_id, None)
+                return
             if self._session is session:
                 self._session = None
 
@@ -351,19 +368,34 @@ class DiagnosticTraceRegistry:
             return None
         try:
             session_key = _uuid_text(session_id, "session_id")
+        except (TypeError, ValueError):
+            return None
+        try:
             operation_key = _uuid_text(operation_id, "operation_id")
             wizard_key = _uuid_text(wizard_id, "wizard_id")
         except (TypeError, ValueError):
-            self.mark_fault()
+            if self.capture_mode == "evaluation":
+                self.mark_fault(TraceHandle(session_key, ""))
+            else:
+                self.mark_fault()
             return None
         with self._lock:
-            session = self._session
+            session = (
+                self._evaluation_sessions.get(session_key)
+                if self.capture_mode == "evaluation"
+                else self._session
+            )
             if session is None or session.session_id != session_key:
                 return None
             if operation_key in session.operations:
                 session.trace_faulted = True
                 return None
-            if len(session.operations) >= TRACE_SESSION_MAX_OPERATIONS:
+            operation_limit = (
+                1
+                if self.capture_mode == "evaluation"
+                else TRACE_SESSION_MAX_OPERATIONS
+            )
+            if len(session.operations) >= operation_limit:
                 session.overflowed = True
                 return None
             session.operations[operation_key] = _Operation(
@@ -504,8 +536,20 @@ class DiagnosticTraceRegistry:
             operation.outcome = outcome
             operation.finished_at = _utc_timestamp()
 
-    def mark_fault(self) -> None:
+    def mark_fault(self, handle: TraceHandle | None = None) -> None:
         with self._lock:
+            if self.capture_mode == "evaluation":
+                active = handle
+                if active is None:
+                    try:
+                        active = _ACTIVE_HANDLE.get()
+                    except NameError:
+                        active = None
+                if active is not None:
+                    session = self._evaluation_sessions.get(active.session_id)
+                    if session is not None:
+                        session.trace_faulted = True
+                return
             if self._session is not None:
                 self._session.trace_faulted = True
 
@@ -524,7 +568,11 @@ class DiagnosticTraceRegistry:
     def _required_session(self, user_id: str, session_id: str) -> _Session:
         user = _required_text(user_id, "user_id")
         session_key = _uuid_text(session_id, "session_id")
-        session = self._session
+        session = (
+            self._evaluation_sessions.get(session_key)
+            if self.capture_mode == "evaluation"
+            else self._session
+        )
         if (
             session is None
             or user != self.configured_user_id
@@ -535,7 +583,11 @@ class DiagnosticTraceRegistry:
         return session
 
     def _operation(self, handle: TraceHandle) -> _Operation:
-        session = self._session
+        session = (
+            self._evaluation_sessions.get(handle.session_id)
+            if self.capture_mode == "evaluation"
+            else self._session
+        )
         if session is None or session.session_id != handle.session_id:
             raise KeyError("diagnostic session")
         return session.operations[handle.operation_id]
@@ -1111,6 +1163,7 @@ def mapping_membership_digest(mapping: Mapping[int, Sequence[str]]) -> str:
 
 __all__ = [
     "DiagnosticTraceRegistry",
+    "EVALUATION_SESSION_CAPACITY",
     "TRACE_OPERATION_HEADER",
     "TRACE_SAMPLE_LIMIT",
     "TRACE_SCHEMA_VERSION",

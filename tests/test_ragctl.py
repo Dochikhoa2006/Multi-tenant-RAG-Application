@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
 import stat
 import subprocess
+from threading import Barrier, Lock, Semaphore
+import time
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
@@ -937,6 +941,181 @@ def test_ask_evaluation_failure_is_informational_and_query_is_sent_once(
     statuses = list((tmp_path / "ask").glob("*/status.json"))
     assert len(statuses) == 1
     assert json.loads(statuses[0].read_text())["status"] == "failed"
+
+
+def test_concurrent_asks_overlap_inference_and_each_attempts_bounded_evaluation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from deployment import e2e_diagnostic_api, evaluation_bridge
+
+    request_count = 4
+    stream_barrier = Barrier(request_count)
+    state_lock = Lock()
+    client_sequence = 0
+    active_streams = 0
+    maximum_active_streams = 0
+    evaluation_submissions = 0
+    active_evaluations = 0
+    maximum_active_evaluations = 0
+    evaluation_slot = Semaphore(1)
+    timings = {name: 0.0 for name in ragctl.CHAT_TIMING_KEYS}
+
+    class Response:
+        def __init__(
+            self,
+            status_code: int,
+            payload: object = None,
+            *,
+            headers: dict[str, str] | None = None,
+            lines: list[str] | None = None,
+            overlap: bool = False,
+        ) -> None:
+            self.status_code = status_code
+            self._payload = payload
+            self.headers = headers or {}
+            self._lines = lines or []
+            self._overlap = overlap
+
+        def json(self) -> object:
+            return self._payload
+
+        def iter_lines(self) -> object:
+            nonlocal active_streams, maximum_active_streams
+            if self._overlap:
+                with state_lock:
+                    active_streams += 1
+                    maximum_active_streams = max(
+                        maximum_active_streams, active_streams
+                    )
+                stream_barrier.wait(timeout=5)
+                time.sleep(0.02)
+                with state_lock:
+                    active_streams -= 1
+            return iter(self._lines)
+
+        def __enter__(self) -> "Response":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    class Client:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            nonlocal client_sequence
+            with state_lock:
+                client_sequence += 1
+                self.sequence = client_sequence
+            self.session_id = str(uuid4())
+            self.request_id = str(uuid4())
+            self.conversation_id = str(uuid4())
+
+        def __enter__(self) -> "Client":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def get(self, url: str, **_kwargs: object) -> Response:
+            assert url.endswith("/health")
+            return Response(200)
+
+        def post(self, url: str, **_kwargs: object) -> Response:
+            assert url.endswith("/api/chat/sessions")
+            return Response(201, {"session_id": self.session_id})
+
+        def stream(self, _method: str, url: str, **_kwargs: object) -> Response:
+            assert url.endswith("/api/chat/query")
+            return Response(
+                200,
+                headers={"X-Request-ID": self.request_id},
+                overlap=True,
+                lines=[
+                    "event: token",
+                    "data: "
+                    + json.dumps({"request_id": self.request_id, "text": "answer"}),
+                    "",
+                    "event: telemetry",
+                    "data: "
+                    + json.dumps(
+                        {
+                            "request_id": self.request_id,
+                            "schema_version": "1.0",
+                            "timings_ms": timings,
+                        }
+                    ),
+                    "",
+                    "event: done",
+                    "data: "
+                    + json.dumps(
+                        {
+                            "request_id": self.request_id,
+                            "conversation_id": self.conversation_id,
+                        }
+                    ),
+                    "",
+                ],
+            )
+
+    class Trace:
+        def __init__(
+            self, _client: object, _url: str, _user: str, _run: str
+        ) -> None:
+            self.session_id = str(uuid4())
+            self.started = False
+
+        def start(self) -> None:
+            self.started = True
+
+        def wait_operation(self, _operation_id: str) -> tuple[object, object, object]:
+            return {}, {}, {}
+
+        def delete(self) -> None:
+            self.started = False
+
+    def submit(**_kwargs: object) -> object:
+        nonlocal evaluation_submissions
+        with state_lock:
+            evaluation_submissions += 1
+        return object()
+
+    def finish(_job: object) -> evaluation_bridge.EvaluationObservation:
+        nonlocal active_evaluations, maximum_active_evaluations
+        with evaluation_slot:
+            with state_lock:
+                active_evaluations += 1
+                maximum_active_evaluations = max(
+                    maximum_active_evaluations, active_evaluations
+                )
+            time.sleep(0.02)
+            with state_lock:
+                active_evaluations -= 1
+        return evaluation_bridge.EvaluationObservation(
+            "succeeded", None, 20.0, None, None, "a" * 64, 0.0
+        )
+
+    monkeypatch.setattr(ragctl.httpx, "Client", Client)
+    monkeypatch.setattr(ragctl, "read_runtime_url", lambda _config: "https://runtime")
+    monkeypatch.setattr(ragctl, "ASK_DIAGNOSTICS_PATH", tmp_path / "ask")
+    monkeypatch.setattr(e2e_diagnostic_api, "_DeepTraceSession", Trace)
+    monkeypatch.setattr(
+        evaluation_bridge, "parse_request_evidence", lambda *_args, **_kwargs: object()
+    )
+    monkeypatch.setattr(evaluation_bridge, "submit_local_evaluation", submit)
+    monkeypatch.setattr(evaluation_bridge, "finish_evaluation_job", finish)
+
+    with ThreadPoolExecutor(max_workers=request_count) as executor:
+        futures = [
+            executor.submit(ragctl.ask, _config(), f"question-{index}")
+            for index in range(request_count)
+        ]
+        for future in futures:
+            future.result(timeout=10)
+
+    assert maximum_active_streams == request_count
+    assert evaluation_submissions == request_count
+    assert maximum_active_evaluations == 1
+    assert len(list((tmp_path / "ask").glob("*/status.json"))) == request_count
 
 
 def test_launcher_uses_the_public_telemetry_key_owner() -> None:
