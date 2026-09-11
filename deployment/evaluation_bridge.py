@@ -12,8 +12,10 @@ import json
 import math
 import os
 from pathlib import Path
+import signal
 import stat
 import subprocess
+import sys
 from threading import Event, Lock
 from time import perf_counter
 from typing import Any
@@ -34,7 +36,30 @@ LOCAL_EVALUATION_LOCK_PATH = (
     PROJECT_ROOT / ".local" / "diagnostics" / "evaluation" / "execution.lock"
 )
 _LOCK_POLL_SECONDS = 0.05
+_PROCESS_STOP_GRACE_SECONDS = 5.0
+_WORKER_MAX_OUTPUT_BYTES = 1_048_576
 _PROPERTIES = ("user_id", "document_id", "paragraph_id", "chunk_id", "raw_text")
+_HYDRATION_CONFIG_KEYS = (
+    "WEAVIATE_URL",
+    "WEAVIATE_API_KEY",
+    "WEAVIATE_GRPC_PORT",
+    "WEAVIATE_GRPC_SECURE",
+)
+_CHILD_BASE_ENV_KEYS = (
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "PATH",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "TMPDIR",
+)
+_EVALUATOR_ENV_KEYS = (
+    "RAG_EVAL_EMBEDDING_MODEL_PATH",
+    "RAG_EVAL_JUDGE_MODEL",
+    "RAG_EVAL_OLLAMA_URL",
+    "RAG_EVAL_TIMEOUT_SECONDS",
+)
 
 
 class EvaluationBridgeError(RuntimeError):
@@ -77,6 +102,7 @@ class EvaluationObservation:
     result_path: str | None
     record_sha256: str | None
     queue_wait_ms: float = 0.0
+    execution_ms: float = 0.0
 
     def artifact(self) -> dict[str, object]:
         return {
@@ -84,6 +110,7 @@ class EvaluationObservation:
             "error_code": self.error_code,
             "evaluation_ms": round(self.duration_ms, 3),
             "queue_wait_ms": round(self.queue_wait_ms, 3),
+            "execution_ms": round(self.execution_ms, 3),
             "record_path": self.record_path,
             "result_path": self.result_path,
             "record_sha256": self.record_sha256,
@@ -107,6 +134,7 @@ class EvaluationLaunch:
 class _EvaluationJobState:
     lock: Lock = field(default_factory=Lock)
     launch: EvaluationLaunch | None = None
+    worker: subprocess.Popen[bytes] | None = None
 
 
 @dataclass(frozen=True)
@@ -465,6 +493,36 @@ def write_private_json(path: Path, value: Mapping[str, object]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _sanitized_child_environment(*, evaluator: bool) -> dict[str, str]:
+    """Return the small environment required by local evaluation children."""
+
+    environment = {
+        name: value
+        for name in _CHILD_BASE_ENV_KEYS
+        if (value := os.environ.get(name)) is not None
+    }
+    if evaluator:
+        environment.update(
+            {
+                name: value
+                for name in _EVALUATOR_ENV_KEYS
+                if (value := os.environ.get(name)) is not None
+            }
+        )
+    environment.update(
+        {
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONUTF8": "1",
+            "RAGAS_DO_NOT_TRACK": "true",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "HF_HUB_DISABLE_TELEMETRY": "1",
+            "TOKENIZERS_PARALLELISM": "false",
+        }
+    )
+    return environment
+
+
 def start_local_evaluation(
     record: Mapping[str, object],
     directory: Path,
@@ -489,15 +547,7 @@ def start_local_evaluation(
             raise EvaluationBridgeError(
                 "dedicated evaluator environment is unavailable"
             )
-        environment = os.environ.copy()
-        environment.update(
-            {
-                "RAGAS_DO_NOT_TRACK": "true",
-                "HF_HUB_OFFLINE": "1",
-                "TRANSFORMERS_OFFLINE": "1",
-                "HF_HUB_DISABLE_TELEMETRY": "1",
-            }
-        )
+        environment = _sanitized_child_environment(evaluator=True)
         process = subprocess.Popen(
             [str(EVALUATOR), "run", str(record_path), "--output", str(result_path)],
             cwd=PROJECT_ROOT,
@@ -681,9 +731,262 @@ def _terminal_job(
             None,
             None,
             queue_wait_ms,
+            0.0,
         )
     )
     return EvaluationJob(future, Event(), _EvaluationJobState())
+
+
+def _evidence_mapping(evidence: RequestEvidence) -> dict[str, object]:
+    def identity(value: ContextIdentity) -> dict[str, object]:
+        return {
+            "collection": value.collection,
+            "ids": list(value.ids),
+            "fingerprints": list(value.fingerprints),
+            "digest": value.digest,
+            "rendered_utf8_bytes": value.rendered_utf8_bytes,
+        }
+
+    return {
+        "user_id": evidence.user_id,
+        "trace_session_id": evidence.trace_session_id,
+        "operation_id": evidence.operation_id,
+        "chat_session_id": evidence.chat_session_id,
+        "request_id": evidence.request_id,
+        "rewritten_query": evidence.rewritten_query,
+        "knowledge": identity(evidence.knowledge),
+        "policy": identity(evidence.policy),
+    }
+
+
+def _evidence_from_mapping(value: object) -> RequestEvidence:
+    item = _mapping(value, "worker evidence")
+
+    def identity(name: str) -> ContextIdentity:
+        raw = _mapping(item.get(name), f"worker {name} evidence")
+        ids = raw.get("ids")
+        fingerprints = raw.get("fingerprints")
+        if not isinstance(ids, list) or not isinstance(fingerprints, list):
+            raise EvaluationBridgeError("worker context identity is malformed")
+        return ContextIdentity(
+            str(raw.get("collection", "")),
+            tuple(str(entry) for entry in ids),
+            tuple(str(entry) for entry in fingerprints),
+            _sha256(raw.get("digest"), "worker context digest"),
+            int(raw.get("rendered_utf8_bytes", -1)),
+        )
+
+    return RequestEvidence(
+        user_id=str(item.get("user_id", "")),
+        trace_session_id=_canonical_uuid(
+            item.get("trace_session_id"), "worker trace session ID"
+        ),
+        operation_id=_canonical_uuid(
+            item.get("operation_id"), "worker operation ID"
+        ),
+        chat_session_id=_canonical_uuid(
+            item.get("chat_session_id"), "worker chat session ID"
+        ),
+        request_id=_canonical_uuid(item.get("request_id"), "worker request ID"),
+        rewritten_query=str(item.get("rewritten_query", "")),
+        knowledge=identity("knowledge"),
+        policy=identity("policy"),
+    )
+
+
+def run_admitted_evaluation_payload(
+    payload: Mapping[str, object],
+    *,
+    execution_lock_fd: int,
+    timeout_seconds: float,
+) -> dict[str, object]:
+    """Run one admitted local job inside its supervised worker process."""
+
+    started = perf_counter()
+    launch: EvaluationLaunch | None = None
+    try:
+        config_value = _mapping(payload.get("config"), "worker configuration")
+        config = {str(name): str(value) for name, value in config_value.items()}
+        evidence = _evidence_from_mapping(payload.get("evidence"))
+        allowed_value = payload.get("allowed_document_ids")
+        allowed = None
+        if allowed_value is not None:
+            allowed_mapping = _mapping(allowed_value, "allowed document IDs")
+            allowed = {
+                str(collection): frozenset(str(item) for item in identifiers)
+                for collection, identifiers in allowed_mapping.items()
+                if isinstance(identifiers, list)
+            }
+            if len(allowed) != len(allowed_mapping):
+                raise EvaluationBridgeError("allowed document IDs are malformed")
+        contexts = resolve_exact_contexts(
+            config,
+            user_id=str(payload.get("user_id", "")),
+            evidence=evidence,
+            allowed_document_ids=allowed,
+        )
+        record = build_evaluation_record(
+            source=str(payload.get("source", "")),
+            request_id=str(payload.get("request_id", "")),
+            conversation_id=str(payload.get("conversation_id", "")),
+            original_query=str(payload.get("original_query", "")),
+            response=str(payload.get("response", "")),
+            telemetry=_mapping(payload.get("telemetry"), "worker telemetry"),
+            evidence=evidence,
+            contexts=contexts,
+            captured_at=str(payload.get("captured_at", "")),
+        )
+        remaining = timeout_seconds - (perf_counter() - started)
+        if remaining <= 0:
+            raise TimeoutError
+        launch = start_local_evaluation(
+            record,
+            Path(str(payload.get("directory", ""))),
+            str(payload.get("stem", "")),
+            exact_names=payload.get("exact_names") is True,
+            execution_lock_fd=execution_lock_fd,
+        )
+        observation = finish_local_evaluation(launch, timeout_seconds=remaining)
+        return {
+            "status": observation.status,
+            "error_code": observation.error_code,
+            "record_path": observation.record_path,
+            "result_path": observation.result_path,
+            "record_sha256": observation.record_sha256,
+        }
+    except TimeoutError:
+        if launch is not None:
+            cancel_local_evaluation(launch)
+        return {
+            "status": "failed",
+            "error_code": "EVALUATION_TIMEOUT",
+            "record_path": None,
+            "result_path": None,
+            "record_sha256": None,
+        }
+    except Exception:
+        if launch is not None:
+            cancel_local_evaluation(launch)
+        return {
+            "status": "failed",
+            "error_code": "EVALUATION_EVIDENCE_INVALID",
+            "record_path": (
+                None
+                if launch is None or launch.record_path is None
+                else str(launch.record_path)
+            ),
+            "result_path": None,
+            "record_sha256": None if launch is None else launch.record_sha256,
+        }
+
+
+def _stop_worker(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        process.wait()
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=_PROCESS_STOP_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=_PROCESS_STOP_GRACE_SECONDS)
+
+
+def _worker_payload(
+    *,
+    config: Mapping[str, str],
+    user_id: str,
+    evidence: RequestEvidence,
+    allowed_document_ids: Mapping[str, frozenset[str]] | None,
+    source: str,
+    request_id: str,
+    conversation_id: str,
+    original_query: str,
+    response: str,
+    telemetry: Mapping[str, object],
+    captured_at: str,
+    directory: Path,
+    stem: str,
+    exact_names: bool,
+) -> bytes:
+    hydration_config = {
+        name: config[name]
+        for name in _HYDRATION_CONFIG_KEYS
+        if name in config
+    }
+    payload = {
+        "config": hydration_config,
+        "user_id": user_id,
+        "evidence": _evidence_mapping(evidence),
+        "allowed_document_ids": (
+            None
+            if allowed_document_ids is None
+            else {
+                collection: sorted(document_ids)
+                for collection, document_ids in allowed_document_ids.items()
+            }
+        ),
+        "source": source,
+        "request_id": request_id,
+        "conversation_id": conversation_id,
+        "original_query": original_query,
+        "response": response,
+        "telemetry": dict(telemetry),
+        "captured_at": captured_at,
+        "directory": str(directory),
+        "stem": stem,
+        "exact_names": exact_names,
+    }
+    return _canonical_bytes(payload)
+
+
+def _run_supervised_worker(
+    payload: bytes,
+    *,
+    descriptor: int,
+    timeout_seconds: float,
+    state: _EvaluationJobState,
+) -> Mapping[str, object]:
+    worker = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "deployment.evaluation_bridge_worker",
+            "--lock-fd",
+            str(descriptor),
+            "--timeout-seconds",
+            str(timeout_seconds),
+        ],
+        cwd=PROJECT_ROOT,
+        env=_sanitized_child_environment(evaluator=True),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        pass_fds=(descriptor,),
+        start_new_session=True,
+    )
+    with state.lock:
+        state.worker = worker
+    try:
+        output, _ = worker.communicate(input=payload, timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        _stop_worker(worker)
+        raise TimeoutError from None
+    if worker.returncode != 0 or len(output) > _WORKER_MAX_OUTPUT_BYTES:
+        raise EvaluationBridgeError("evaluation worker failed")
+    try:
+        result = json.loads(output.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise EvaluationBridgeError("evaluation worker result is malformed") from exc
+    if not isinstance(result, Mapping):
+        raise EvaluationBridgeError("evaluation worker result is malformed")
+    return result
 
 
 def _run_evaluation_job(
@@ -709,7 +1012,7 @@ def _run_evaluation_job(
 ) -> EvaluationObservation:
     descriptor: int | None = None
     queue_wait_ms = 0.0
-    launch: EvaluationLaunch | None = None
+    admitted_at: float | None = None
     try:
         descriptor, queue_wait_ms = _acquire_evaluation_lock(
             execution_lock_path,
@@ -725,92 +1028,124 @@ def _run_evaluation_job(
                 None,
                 None,
                 queue_wait_ms,
+                0.0,
             )
-        contexts = resolve_exact_contexts(
-            config,
+        admitted_at = perf_counter()
+        payload = _worker_payload(
+            config=config,
             user_id=user_id,
             evidence=evidence,
             allowed_document_ids=allowed_document_ids,
-        )
-        if cancel_event.is_set():
-            return EvaluationObservation(
-                "failed",
-                "EVALUATION_CANCELLED",
-                (perf_counter() - submitted_at) * 1000.0,
-                None,
-                None,
-                None,
-                queue_wait_ms,
-            )
-        record = build_evaluation_record(
             source=source,
             request_id=request_id,
             conversation_id=conversation_id,
             original_query=original_query,
             response=response,
             telemetry=telemetry,
-            evidence=evidence,
-            contexts=contexts,
             captured_at=captured_at,
-        )
-        if cancel_event.is_set():
-            return EvaluationObservation(
-                "failed",
-                "EVALUATION_CANCELLED",
-                (perf_counter() - submitted_at) * 1000.0,
-                None,
-                None,
-                None,
-                queue_wait_ms,
-            )
-        launch = start_local_evaluation(
-            record,
-            directory,
-            stem,
+            directory=directory,
+            stem=stem,
             exact_names=exact_names,
-            execution_lock_fd=descriptor,
         )
-        with state.lock:
-            state.launch = launch
-        if cancel_event.is_set():
-            cancel_local_evaluation(launch)
-        observation = finish_local_evaluation(launch)
         if cancel_event.is_set():
             return EvaluationObservation(
                 "failed",
                 "EVALUATION_CANCELLED",
                 (perf_counter() - submitted_at) * 1000.0,
-                observation.record_path,
                 None,
-                observation.record_sha256,
+                None,
+                None,
                 queue_wait_ms,
+                (perf_counter() - admitted_at) * 1000.0,
             )
+        remaining_seconds = EVALUATION_TIMEOUT_SECONDS - (
+            perf_counter() - admitted_at
+        )
+        if remaining_seconds <= 0:
+            return EvaluationObservation(
+                "failed",
+                "EVALUATION_TIMEOUT",
+                (perf_counter() - submitted_at) * 1000.0,
+                None,
+                None,
+                None,
+                queue_wait_ms,
+                (perf_counter() - admitted_at) * 1000.0,
+            )
+        try:
+            result = _run_supervised_worker(
+                payload,
+                descriptor=descriptor,
+                timeout_seconds=remaining_seconds,
+                state=state,
+            )
+        except TimeoutError:
+            execution_ms = (perf_counter() - admitted_at) * 1000.0
+            return EvaluationObservation(
+                "failed",
+                "EVALUATION_TIMEOUT",
+                (perf_counter() - submitted_at) * 1000.0,
+                None,
+                None,
+                None,
+                queue_wait_ms,
+                execution_ms,
+            )
+        if cancel_event.is_set():
+            execution_ms = (perf_counter() - admitted_at) * 1000.0
+            return EvaluationObservation(
+                "failed",
+                "EVALUATION_CANCELLED",
+                (perf_counter() - submitted_at) * 1000.0,
+                None,
+                None,
+                None,
+                queue_wait_ms,
+                execution_ms,
+            )
+        status = result.get("status")
+        error_code = result.get("error_code")
+        if status not in {"succeeded", "partial", "failed"} or (
+            error_code is not None and not isinstance(error_code, str)
+        ):
+            raise EvaluationBridgeError("evaluation worker result is invalid")
+        execution_ms = (perf_counter() - admitted_at) * 1000.0
         return EvaluationObservation(
-            observation.status,
-            observation.error_code,
+            str(status),
+            error_code,
             (perf_counter() - submitted_at) * 1000.0,
-            observation.record_path,
-            observation.result_path,
-            observation.record_sha256,
+            result.get("record_path")
+            if isinstance(result.get("record_path"), str)
+            else None,
+            result.get("result_path")
+            if isinstance(result.get("result_path"), str)
+            else None,
+            result.get("record_sha256")
+            if isinstance(result.get("record_sha256"), str)
+            else None,
             queue_wait_ms,
+            execution_ms,
         )
     except Exception:
+        execution_ms = (
+            0.0
+            if admitted_at is None
+            else (perf_counter() - admitted_at) * 1000.0
+        )
         return EvaluationObservation(
             "failed",
-            "EVALUATION_EVIDENCE_INVALID",
+            "EVALUATION_PROCESS_FAILED",
             (perf_counter() - submitted_at) * 1000.0,
-            (
-                None
-                if launch is None or launch.record_path is None
-                else str(launch.record_path)
-            ),
             None,
-            None if launch is None else launch.record_sha256,
+            None,
+            None,
             queue_wait_ms,
+            execution_ms,
         )
     finally:
         with state.lock:
             state.launch = None
+            state.worker = None
         _release_evaluation_lock(descriptor)
         global _LOCAL_JOB_PENDING
         with _LOCAL_JOB_LOCK:
@@ -900,8 +1235,14 @@ def cancel_evaluation_job(job: EvaluationJob) -> None:
     job.cancel_event.set()
     with job.state.lock:
         launch = job.state.launch
+        worker = job.state.worker
     if launch is not None:
         cancel_local_evaluation(launch)
+    if worker is not None:
+        try:
+            _stop_worker(worker)
+        except (OSError, subprocess.SubprocessError):
+            pass
 
 
 __all__ = [

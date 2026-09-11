@@ -637,6 +637,21 @@ def test_local_job_waits_cross_process_before_hydration_and_passes_lock_fd(
             "succeeded", None, 1.0, None, None, "a" * 64
         ),
     )
+    def supervised(
+        _payload: bytes, *, descriptor: int, timeout_seconds: float, state: object
+    ) -> dict[str, object]:
+        assert timeout_seconds > 0
+        hydrated.set()
+        inherited_descriptors.append(descriptor)
+        return {
+            "status": "succeeded",
+            "error_code": None,
+            "record_path": None,
+            "result_path": None,
+            "record_sha256": "a" * 64,
+        }
+
+    monkeypatch.setattr(bridge, "_run_supervised_worker", supervised)
 
     job = _submit_test_job(tmp_path, evidence, lock_path)
     time.sleep(0.05)
@@ -740,6 +755,20 @@ def test_waiting_local_job_recovers_lock_after_owner_process_exits(
             "succeeded", None, 1.0, None, None, "a" * 64
         ),
     )
+    monkeypatch.setattr(
+        bridge,
+        "_run_supervised_worker",
+        lambda *_args, **_kwargs: (
+            hydrated.set()
+            or {
+                "status": "succeeded",
+                "error_code": None,
+                "record_path": None,
+                "result_path": None,
+                "record_sha256": "a" * 64,
+            }
+        ),
+    )
 
     job = _submit_test_job(tmp_path, evidence, lock_path)
     time.sleep(0.05)
@@ -803,6 +832,21 @@ def test_failed_hydration_releases_local_slot_for_next_job(
             "succeeded", None, 1.0, None, None, "a" * 64
         ),
     )
+    def supervised_failure_then_success(*_args: object, **_kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {
+            "status": "failed" if calls == 1 else "succeeded",
+            "error_code": "EVALUATION_EVIDENCE_INVALID" if calls == 1 else None,
+            "record_path": None,
+            "result_path": None,
+            "record_sha256": None if calls == 1 else "a" * 64,
+        }
+
+    calls = 0
+    monkeypatch.setattr(
+        bridge, "_run_supervised_worker", supervised_failure_then_success
+    )
     lock_path = tmp_path / "execution.lock"
 
     first = bridge.finish_evaluation_job(
@@ -843,6 +887,18 @@ def test_cancellation_during_hydration_does_not_spawn_evaluator(
         "start_local_evaluation",
         lambda *_args, **_kwargs: evaluator_started.set(),
     )
+    def supervised_cancel(*_args: object, **_kwargs: object) -> dict[str, object]:
+        hydration_started.set()
+        assert hydration_release.wait(timeout=5)
+        return {
+            "status": "succeeded",
+            "error_code": None,
+            "record_path": None,
+            "result_path": None,
+            "record_sha256": "a" * 64,
+        }
+
+    monkeypatch.setattr(bridge, "_run_supervised_worker", supervised_cancel)
     job = _submit_test_job(tmp_path, evidence, tmp_path / "execution.lock")
     assert hydration_started.wait(timeout=5)
     bridge.cancel_evaluation_job(job)
@@ -1048,6 +1104,7 @@ def test_e2e_duration_freezes_before_delayed_evaluation_join(
         "error_code": None,
         "evaluation_ms": 123.0,
         "queue_wait_ms": 17.0,
+        "execution_ms": 0.0,
         "record_path": None,
         "result_path": None,
         "record_sha256": "a" * 64,

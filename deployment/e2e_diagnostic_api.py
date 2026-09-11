@@ -1575,6 +1575,8 @@ def format_query_terminal(result: QueryAttemptResult) -> str:
                 "skipped"
                 if not isinstance(result.evaluation, Mapping)
                 else f"{result.evaluation.get('status', 'failed')} "
+                f"queue_wait_ms={result.evaluation.get('queue_wait_ms', 'unavailable')} "
+                f"execution_ms={result.evaluation.get('execution_ms', 'unavailable')} "
                 f"evaluation_ms={result.evaluation.get('evaluation_ms', 'unavailable')}"
             ),
         )
@@ -1609,6 +1611,9 @@ def _execute_query(
     evaluation: Mapping[str, object] | None = {
         "status": "skipped",
         "error_code": "RAG_NOT_SUCCEEDED",
+        "queue_wait_ms": 0.0,
+        "execution_ms": 0.0,
+        "evaluation_ms": 0.0,
     }
     evaluation_job: EvaluationJob | None = None
     code: str | None = None
@@ -1719,6 +1724,9 @@ def _execute_query(
                 evaluation = {
                     "status": "failed",
                     "error_code": "EVALUATION_EVIDENCE_INVALID",
+                    "queue_wait_ms": 0.0,
+                    "execution_ms": 0.0,
+                    "evaluation_ms": 0.0,
                 }
             flags = _mapping(operation.get("flags"), "deep trace flags")
             if flags.get("title_enqueue_accepted") is False:
@@ -1791,6 +1799,9 @@ def _execute_query(
             evaluation = {
                 "status": "failed",
                 "error_code": "EVALUATION_EVIDENCE_INVALID",
+                "queue_wait_ms": 0.0,
+                "execution_ms": 0.0,
+                "evaluation_ms": 0.0,
             }
         except (httpx.HTTPError, TypeError, ValueError, RuntimeError):
             code = "POST_GENERATION_INVALID"
@@ -1846,6 +1857,9 @@ def _execute_query(
             evaluation = {
                 "status": "failed",
                 "error_code": "EVALUATION_PROCESS_FAILED",
+                "queue_wait_ms": 0.0,
+                "execution_ms": 0.0,
+                "evaluation_ms": 0.0,
             }
     return QueryAttemptResult(
         query=query,
@@ -1918,7 +1932,13 @@ def _session_failure_result(
         post_generation=None,
         registry_verification=None,
         deep_trace=None,
-        evaluation={"status": "skipped", "error_code": "RAG_NOT_SUCCEEDED"},
+        evaluation={
+            "status": "skipped",
+            "error_code": "RAG_NOT_SUCCEEDED",
+            "queue_wait_ms": 0.0,
+            "execution_ms": 0.0,
+            "evaluation_ms": 0.0,
+        },
         duration_ms=(perf_counter() - started_clock) * 1000.0,
         started_at=started_at,
     )
@@ -2084,6 +2104,9 @@ def run_e2e_phase_2d(
                         evaluation={
                             "status": "skipped",
                             "error_code": "RAG_NOT_SUCCEEDED",
+                            "queue_wait_ms": 0.0,
+                            "execution_ms": 0.0,
+                            "evaluation_ms": 0.0,
                         },
                         duration_ms=(perf_counter() - started_clock) * 1000.0,
                         started_at=started_at,

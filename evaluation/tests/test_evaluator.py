@@ -5,7 +5,7 @@ from dataclasses import replace
 import math
 
 from rag_evaluation.evaluator import evaluate_record
-from rag_evaluation.metrics import EXPECTED_RAGAS_VERSION
+from rag_evaluation.metrics import EXPECTED_RAGAS_VERSION, RagasMetricBackend
 from rag_evaluation.models import EvaluationRecord
 
 
@@ -144,3 +144,23 @@ def test_result_contains_no_raw_record_content(record) -> None:
     assert record.knowledge_contexts[0] not in payload
     assert record.policy_contexts[0] not in payload
 
+
+def test_ragas_import_or_ollama_setup_failure_is_independent(
+    record, monkeypatch
+) -> None:
+    for failure in (
+        ModuleNotFoundError("ragas is unavailable"),
+        ConnectionError("local Ollama is unavailable"),
+        TimeoutError("local judge timed out"),
+    ):
+        async def fail_create(*_args, _failure=failure, **_kwargs):
+            raise _failure
+
+        monkeypatch.setattr(RagasMetricBackend, "create", fail_create)
+        result = asyncio.run(evaluate_record(record))
+        assert result.status == "failed"
+        assert all(
+            metric.status in {"failed", "skipped"} for metric in result.metrics
+        )
+        assert result.setup_error_code == "EVALUATOR_SETUP_FAILED"
+        assert str(failure) not in result.to_json()

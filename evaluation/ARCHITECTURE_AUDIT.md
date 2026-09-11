@@ -163,24 +163,28 @@ The bridge admits hydration and evaluator work through an exclusive `flock` at
 `.local/diagnostics/evaluation/execution.lock`. All ask and E2E processes in
 the checkout share it. Acquisition happens before a Weaviate connection is
 opened, contexts are hydrated, records are written, or `rag-evaluate` is
-spawned. The descriptor is inherited by the evaluator child, so an unexpected
-launcher exit cannot free the slot while that child remains alive. Other
-descriptors close normally and credentials are not child arguments.
+spawned. A supervised local worker retains the descriptor and owns the admitted
+lifecycle. Required Weaviate configuration travels through private process
+input, never command arguments or an artifact. The evaluator child receives an
+allowlisted environment that excludes Modal, Weaviate, SGLang, cloud-provider,
+proxy, and Python-path credentials or overrides.
 
-Waiting is cancellable and does not consume the 1,800-second evaluator timeout,
-which begins after admission. Each CLI process permits at most one pending
-evaluation job; E2E remains sequential. Interruption cancels a waiting job or
-terminates and reaps its active evaluator without touching remote persistence
-or title work.
+Waiting is cancellable and does not consume the 1,800-second admitted execution
+deadline. That deadline begins when the lock is acquired and includes hydration,
+record construction, evaluator execution, result validation, and cleanup. A
+timeout or interruption terminates and reaps the supervised process group before
+the slot is released. Each CLI process permits at most one pending evaluation
+job; E2E remains sequential.
 
 For E2E, the job is submitted after successful SSE and deep-evidence validation
 but before existing remote persistence/title polling. The remote checks and
 local job can overlap. The request row's `duration_ms` freezes at its original
 Phase 2D boundary—after remote tasks and postconditions, before evaluator join.
-`evaluation_ms` runs from job submission to terminal completion, and
-`queue_wait_ms` identifies admission delay. These possibly overlapping
-intervals are never added, subtracted, or folded into public telemetry or RAG
-latency aggregates.
+`queue_wait_ms` runs from submission to admission, `execution_ms` runs from
+admission through terminal cleanup, and `evaluation_ms` runs from submission to
+terminal completion. They are frozen when the job finishes, not when its caller
+later joins it. These possibly overlapping intervals are never folded into
+public telemetry, E2E `duration_ms`, or RAG latency aggregates.
 
 ## Artifacts and failure independence
 
@@ -233,6 +237,10 @@ callers, and the isolated `evaluation/` project.
   read access to Weaviate. Their failure is observational only.
 - E2E retains its current selection bound. Trace rotation and unrelated batch
   statistics are outside this correction.
+- Live OFF/ON requests are independent stochastic generations. Answer digests
+  are observations, while byte equality is proved only by controlled offline
+  tests that replay the same provider stream. An OFF deployment does not expose
+  rewrite or context evidence, so the live gate makes no such comparison.
 
 ## Proof that Ragas remains outside Modal
 

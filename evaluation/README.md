@@ -118,19 +118,41 @@ After `done`, the launcher retrieves and deletes its server evidence before it
 waits for local execution. Hydration, record construction, and Ragas execution
 share a cross-process file lock at
 `.local/diagnostics/evaluation/execution.lock`; the initial local concurrency is
-one. This serializes only post-response evaluation, never inference.
+one. A supervised worker gives the admitted lifecycle a 1,800-second deadline
+covering hydration through cleanup. The evaluator receives only an allowlisted
+environment and does not inherit Modal, Weaviate, SGLang, cloud-provider, proxy,
+or Python-path credentials. This serializes only post-response evaluation,
+never inference.
 
 E2E submits local evaluation before polling existing remote persistence/title
 tasks, so those activities may overlap. Its historical `duration_ms` stops at
 the original post-generation diagnostic boundary before evaluator join.
-`evaluation_ms` is independent and includes local admission through terminal
-completion; `queue_wait_ms` reports admission delay separately.
+`queue_wait_ms` measures admission delay, `execution_ms` measures admitted work,
+and `evaluation_ms` measures submission through terminal completion. All three
+remain outside production telemetry and the historical E2E `duration_ms`.
 
 A missing evaluator environment, Ollama failure, invalid score, evidence
 mismatch, timeout, or local artifact failure cannot change the generated answer
 or remote persistence/title tasks. E2E records likewise keep inference and
 evaluation statuses independent. See `ARCHITECTURE_AUDIT.md` for the exact
 evidence and concurrency contracts.
+
+## Deployment-safety gate
+
+`protected_contracts.json` pins the approved production sources and public
+contracts. Its validation is mandatory before any authorized live evidence is
+accepted:
+
+```sh
+.venv/bin/python evaluation/non_regression_gate.py preflight
+```
+
+The live verifier consumes only artifacts collected during separately
+authorized real runs. It requires successful ordinary ask and E2E evaluation,
+all mandatory reference-free Ragas metrics, successful post-generation work,
+and both OFF/ON and evaluator-contention latency gates. Independent live Qwen
+answers are stochastic and are not required to have equal bytes. See
+`NON_REGRESSION_REPORT.md` for the current gate status.
 
 ## Tests
 

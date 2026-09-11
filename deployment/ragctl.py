@@ -1880,6 +1880,8 @@ def ask(
     print(
         "Evaluation: "
         f"status={evaluation_artifact['status']} "
+        f"queue_wait_ms={evaluation_artifact['queue_wait_ms']} "
+        f"execution_ms={evaluation_artifact['execution_ms']} "
         f"evaluation_ms={evaluation_artifact['evaluation_ms']} "
         f"record={evaluation_artifact.get('record_path')} "
         f"result={evaluation_artifact.get('result_path')} "

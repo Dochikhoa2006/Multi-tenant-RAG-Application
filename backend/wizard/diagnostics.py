@@ -369,6 +369,12 @@ class DiagnosticTraceRegistry:
         try:
             session_key = _uuid_text(session_id, "session_id")
         except (TypeError, ValueError):
+            # Deep diagnostics historically fail closed for malformed
+            # correlation supplied by their configured user.  Evaluation
+            # sessions are independent: without a valid session UUID there is
+            # no safe owner to fault.
+            if self.capture_mode == "deep":
+                self.mark_fault()
             return None
         try:
             operation_key = _uuid_text(operation_id, "operation_id")

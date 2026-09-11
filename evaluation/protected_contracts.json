@@ -1,0 +1,117 @@
+{
+  "schema_version": "1.0",
+  "behavioral_baseline_commit": "fba3c3481d5dc438b6081ab85afcbaa99dbc2987",
+  "approved_integration_commit": "d37c82710a8bd166af4c68f5f57d1068a7cdc880",
+  "approved_evidence_hook_files": {
+    "backend/api/wizard_diagnostics.py": "three authenticated hidden trace endpoints only",
+    "backend/config.py": "default-off diagnostic and evaluation-evidence configuration",
+    "backend/providers/sglang_query_rewriter.py": "copy the already accepted Granite rewrite into bounded evidence",
+    "backend/rag/generator.py": "copy exact post-budget Knowledge/Policy identity into bounded evidence",
+    "backend/runtime_app.py": "conditionally mount the hidden router on the integrated runtime only",
+    "backend/wizard/diagnostics.py": "bounded in-memory deep and evaluation evidence registry",
+    "deployment/e2e_diagnostic.py": "local E2E artifact contract",
+    "deployment/e2e_diagnostic_api.py": "local post-response evidence and evaluation orchestration",
+    "deployment/evaluation_bridge.py": "read-only local hydration and isolated evaluator control",
+    "deployment/modal_runtime.py": "explicit runtime-only evidence enablement",
+    "deployment/ragctl.py": "ordinary ask and diagnostic local orchestration"
+  },
+  "behavioral_baseline_files": {
+    "backend/api/wizard_diagnostics.py": "4db1ec576c6df4d721010a34f4d63c510a393fd39bb56e5ce3f24bcf11053290",
+    "backend/config.py": "00e7a1e45fd6dd603b24968dde6fe60f2477948b3f242c4977837d04f3bc0ab2",
+    "backend/providers/sglang_query_rewriter.py": "2812434376c6ae50d6147f28a97573b5421c1c4138692012939b99c1b7ac02b0",
+    "backend/rag/generator.py": "d34006d4ccc6914dc0ff799ce77e041271fa0f827139ee961ee73fa2a201974d",
+    "backend/runtime_app.py": "5abbcbfcb6986deddf79562ac706dd5430ea17e072276e2a5fc5ad92c0b0a966",
+    "backend/wizard/diagnostics.py": "9f161d1ac48d1ca446de7656eb79a8a6071f6c8adfe3ad65e77172c37e9874ee",
+    "deployment/e2e_diagnostic.py": "9d7c737ded5aba04561805c7a0c233e43f2c4a2c28c895f62eeaee642aa75d97",
+    "deployment/e2e_diagnostic_api.py": "bb6d3fbcf9af3f5e484266244e93998bbeebc4b57d3bfbbf82b6dd4372dbc9c0",
+    "deployment/modal_runtime.py": "cf98ccc6808b5619e2171c61ce863be0a61dba50f3aecd8e0648767e962f4846",
+    "deployment/ragctl.py": "979286038e58d84acd19b4411f5aa7e832a5a03edf1c73ecf8035f8d1f16786f"
+  },
+  "files": {
+    "backend/api/wizard_diagnostics.py": "062d447e1b4df74ee02c29bcf708c6845791007f589166d395a4a3e2e8729221",
+    "backend/api/chat.py": "daac2821e9e4f43a85d346df6e43aea960d4826cca535e470388386e4ef6a3d4",
+    "backend/api/models.py": "23a22c5668fbd6abf0c6f5527b118c8abecaa3f2f56c3a78660175c1685e326a",
+    "backend/api/telemetry.py": "89d29fa1d32a1fc005a978450457460d2333d4c276f2cad93d5614c5b883bdf3",
+    "backend/config.py": "412b8222244b193fd319e153387a17db6b32c24923803c9dfc72122b74ac29f9",
+    "backend/model_config.py": "51afea3ec0a04bc7c39d2fab45536c2ece6c448ac28ee5a8a4e1a52e1e9b15f1",
+    "backend/providers/sglang_query_rewriter.py": "9c261291dcf40b1d58774a475dfc9f3a9e0a1b0485b40132b525deea67926d54",
+    "backend/providers/sglang_qwen_llm.py": "2939407d50117ee6bbe0be767a6750a1478c06823800f712b8742c00c191e596",
+    "backend/rag/embedder.py": "cf42a087db451c48b66162551beb06a8ae6d6c2585b9d811a9cb96a04b246c02",
+    "backend/rag/generator.py": "b287582532cbb3904a22fc498ff743ff92a8918e34aa7751ffc8691b22d24d7c",
+    "backend/rag/pipeline.py": "e10fd98fb16add7a62d61f01bd90d026ef6444b2bc4d1eaf7f583807dda58056",
+    "backend/rag/query_rewriter.py": "2d6828332e6a772fe033d1bf1421e1d5540b10a661f3ac7649a9b549dd96a760",
+    "backend/rag/retrieval.py": "d35205c5534fe32a850ab00e22ebb3262d9153b4ac1ca3b3c3d9a0b653f0d8b6",
+    "backend/rag/session_title.py": "998f660fe323601efe1f6ea0a8a3ed31e4465e149d3295807d7179afa374177d",
+    "backend/requirements.txt": "dc99e3f8f06d4b76f59039ff3af44c4ecbb30c38ac4c63d30dc9ae940e243546",
+    "backend/runtime_app.py": "a54690d002b786faf886865f2222f3d70df21a0ad5c899040ba1adb662d505d7",
+    "backend/task_queue.py": "dc8ca93135e1f7110e8de707ecd172efbd98f778129ae23c0df9bccdd7c38377",
+    "backend/wizard/diagnostics.py": "1f99d7b02343ef1deb4c32972daa49fe925e30ae2e9200a933fc14bab387fb49",
+    "backend/weaviate_client/_base.py": "a6c5383e8c37878307e0278a8812ac71f326adc11a6f1682d46511018246deeb",
+    "backend/weaviate_client/_chunk_collection.py": "9530c3ffe9ea8d66529b2d28c1277b63c2a18be88561b88ca796878d04e8107b",
+    "backend/weaviate_client/conversation.py": "6814f59117ccda58804baa59fe981d85e52f95fb836041f3c8497fd7c1e4f9b9",
+    "backend/weaviate_client/knowledge.py": "d4be0a179f38092169ad5118461be8ab8537c2a2ccce51308cc28c65c54aae71",
+    "backend/weaviate_client/policy.py": "c2e92ff342f7177326c14d4139714a55e8a46fd5717a81d57ed212c63b136e16",
+    "deployment/compose.weaviate-secure.yaml": "ccf42512ed9bd6cb7e237da67b33e1f5166fa7661154739a43384f48ef4402f7",
+    "deployment/e2e_diagnostic.py": "e4157b0a30e815c9a0fea24139bde6344caa681c09edd7ca6488f72319136d14",
+    "deployment/e2e_diagnostic_api.py": "ab93a0240d14c0c6a67d1b7fbf684f14a0453186a3b09a12bfa3e895749af4e2",
+    "deployment/evaluation_bridge.py": "39a6234ffc3710d47995115a29031a9e45c1f2257de48bfd856a15a2acbef1bc",
+    "deployment/evaluation_bridge_worker.py": "e91a703ca9b4cc8c9ce23351d57891935b46aae31c21dab042277a2a58e1ba3c",
+    "deployment/modal_runtime.py": "c72c56380840855391f9667f7c548873df08e132fff51a6d2653efe182637a4e",
+    "deployment/ragctl.py": "3cb158cc0c22c5f12b1da261e15995f4b1df2ec2f86c079aeecf805b583c38f5"
+  },
+  "contracts": {
+    "telemetry_schema_version": "1.0",
+    "timing_keys": [
+      "original_query_embedding",
+      "conversation_hybrid_search",
+      "conversation_mmr_rerank",
+      "query_rewrite",
+      "rewritten_query_embedding",
+      "knowledge_hybrid_search",
+      "knowledge_cross_encoder_rerank",
+      "policy_hybrid_search",
+      "policy_cross_encoder_rerank",
+      "prompt_construction",
+      "ttft",
+      "generation",
+      "total_request"
+    ],
+    "candidate_ceilings": {
+      "conversation": 50,
+      "knowledge": 50,
+      "policy": 40
+    },
+    "context_budgets": {
+      "knowledge": 2500,
+      "policy": 750,
+      "total": 3500
+    },
+    "qwen": {
+      "temperature": 0.7,
+      "top_p": 0.8,
+      "top_k": 20,
+      "min_p": 0.0,
+      "presence_penalty": 1.5,
+      "thinking": false
+    },
+    "granite": {
+      "temperature": 0,
+      "stream": false,
+      "continue_final_message": true,
+      "n": 1
+    },
+    "sse_success_order": "token* -> telemetry -> done",
+    "query_request_fields": ["question", "session_id", "user_id"],
+    "task_resource_fields": [
+      "created_at",
+      "error",
+      "error_code",
+      "finished_at",
+      "operation",
+      "started_at",
+      "status",
+      "task_id",
+      "user_id"
+    ]
+  }
+}

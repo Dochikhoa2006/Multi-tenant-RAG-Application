@@ -1,0 +1,706 @@
+"""Offline contract preflight and opt-in live-evidence acceptance checks."""
+
+from __future__ import annotations
+
+import argparse
+from collections.abc import Mapping, Sequence
+from datetime import datetime
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import random
+import statistics
+import sys
+from typing import Any
+from uuid import UUID
+
+
+ROOT = Path(__file__).resolve().parents[1]
+MANIFEST_PATH = ROOT / "evaluation" / "protected_contracts.json"
+LATENCY_METRICS = ("ttft", "generation", "total_request")
+MANDATORY_METRICS = frozenset(
+    {"faithfulness", "response_relevancy", "context_utilization"}
+)
+DEFAULT_FIXTURES = ROOT / "diagnostics" / "fixtures" / "wizard"
+DEFAULT_QUERIES = ROOT / "diagnostics" / "queries.py"
+BEHAVIORAL_BASELINE_COMMIT = "fba3c3481d5dc438b6081ab85afcbaa99dbc2987"
+APPROVED_INTEGRATION_COMMIT = "d37c82710a8bd166af4c68f5f57d1068a7cdc880"
+APPROVED_EVIDENCE_HOOK_FILES = frozenset(
+    {
+        "backend/api/wizard_diagnostics.py",
+        "backend/config.py",
+        "backend/providers/sglang_query_rewriter.py",
+        "backend/rag/generator.py",
+        "backend/runtime_app.py",
+        "backend/wizard/diagnostics.py",
+        "deployment/e2e_diagnostic.py",
+        "deployment/e2e_diagnostic_api.py",
+        "deployment/evaluation_bridge.py",
+        "deployment/modal_runtime.py",
+        "deployment/ragctl.py",
+    }
+)
+EVALUATION_RECORD_FIELDS = frozenset(
+    {
+        "schema_version",
+        "source",
+        "request_id",
+        "conversation_id",
+        "original_query",
+        "rewritten_query",
+        "response",
+        "knowledge_contexts",
+        "knowledge_context_ids",
+        "policy_contexts",
+        "policy_context_ids",
+        "retrieved_contexts",
+        "context_roles",
+        "telemetry",
+        "reference",
+        "reference_context_ids",
+        "captured_at",
+    }
+)
+
+
+class GateError(RuntimeError):
+    """A safe non-regression-gate failure."""
+
+
+def _load_object(path: Path, name: str) -> Mapping[str, Any]:
+    if not path.is_file() or path.is_symlink():
+        raise GateError(f"{name} must be one regular file")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise GateError(f"{name} is invalid JSON") from exc
+    if not isinstance(value, Mapping):
+        raise GateError(f"{name} must contain one JSON object")
+    return value
+
+
+def _digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def validate_protected_contracts(
+    manifest_path: Path = MANIFEST_PATH,
+) -> dict[str, object]:
+    """Fail before live work when protected source or literals drift."""
+
+    manifest = _load_object(manifest_path, "protected-contract manifest")
+    if manifest.get("schema_version") != "1.0":
+        raise GateError("protected-contract manifest schema is unsupported")
+    if (
+        manifest.get("behavioral_baseline_commit") != BEHAVIORAL_BASELINE_COMMIT
+        or manifest.get("approved_integration_commit") != APPROVED_INTEGRATION_COMMIT
+    ):
+        raise GateError("protected commit identity drifted")
+    files = manifest.get("files")
+    contracts = manifest.get("contracts")
+    hooks = manifest.get("approved_evidence_hook_files")
+    baseline_files = manifest.get("behavioral_baseline_files")
+    if (
+        not isinstance(files, Mapping)
+        or not isinstance(contracts, Mapping)
+        or not isinstance(hooks, Mapping)
+        or frozenset(hooks) != APPROVED_EVIDENCE_HOOK_FILES
+        or not all(isinstance(value, str) and value for value in hooks.values())
+        or not isinstance(baseline_files, Mapping)
+    ):
+        raise GateError("protected-contract manifest is incomplete")
+    for relative, expected in baseline_files.items():
+        if (
+            not isinstance(relative, str)
+            or not isinstance(expected, str)
+            or len(expected) != 64
+            or any(character not in "0123456789abcdef" for character in expected)
+        ):
+            raise GateError("behavioral-baseline file entry is malformed")
+    checked: list[str] = []
+    for relative, expected in sorted(files.items()):
+        if not isinstance(relative, str) or not isinstance(expected, str):
+            raise GateError("protected file entry is malformed")
+        path = (ROOT / relative).resolve()
+        try:
+            path.relative_to(ROOT)
+        except ValueError as exc:
+            raise GateError("protected file escapes the repository") from exc
+        if not path.is_file() or path.is_symlink() or _digest(path) != expected:
+            raise GateError(f"protected contract drifted: {relative}")
+        checked.append(relative)
+
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from backend.api.models import QueryRequest, TaskResource
+    from backend.api.telemetry import TELEMETRY_SCHEMA_VERSION, TIMING_KEYS
+    from backend.model_config import (
+        FIXED_CONVERSATION_CANDIDATE_COUNT,
+        FIXED_KNOWLEDGE_CANDIDATE_COUNT,
+        FIXED_POLICY_CANDIDATE_COUNT,
+        TOKEN_BUDGETS,
+    )
+
+    expected_keys = tuple(contracts.get("timing_keys", ()))
+    if TELEMETRY_SCHEMA_VERSION != contracts.get("telemetry_schema_version"):
+        raise GateError("telemetry schema drifted")
+    if TIMING_KEYS != expected_keys:
+        raise GateError("telemetry timing keys drifted")
+    if sorted(QueryRequest.model_fields) != contracts.get("query_request_fields"):
+        raise GateError("QueryRequest fields drifted")
+    if sorted(TaskResource.model_fields) != contracts.get("task_resource_fields"):
+        raise GateError("TaskResource fields drifted")
+    ceilings = contracts.get("candidate_ceilings")
+    if ceilings != {
+        "conversation": FIXED_CONVERSATION_CANDIDATE_COUNT,
+        "knowledge": FIXED_KNOWLEDGE_CANDIDATE_COUNT,
+        "policy": FIXED_POLICY_CANDIDATE_COUNT,
+    }:
+        raise GateError("retrieval candidate ceilings drifted")
+    budgets = contracts.get("context_budgets")
+    if budgets != {
+        "knowledge": TOKEN_BUDGETS.knowledge_tokens,
+        "policy": TOKEN_BUDGETS.policy_tokens,
+        "total": TOKEN_BUDGETS.total_context_tokens,
+    }:
+        raise GateError("context budgets drifted")
+    return {
+        "status": "passed",
+        "manifest_schema_version": "1.0",
+        "behavioral_baseline_commit": manifest.get("behavioral_baseline_commit"),
+        "approved_integration_commit": manifest.get("approved_integration_commit"),
+        "checked_file_count": len(checked),
+    }
+
+
+def validate_live_prerequisites(
+    *,
+    env_path: Path,
+    fixtures_path: Path,
+    queries_path: Path,
+    corpus_state_path: Path,
+) -> dict[str, object]:
+    """Read-only preflight for a later, separately authorized real run."""
+
+    protected = validate_protected_contracts()
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from deployment.e2e_diagnostic import (
+        load_query_selection,
+        validate_reusable_corpus_state,
+    )
+    from deployment.ragctl import load_dotenv, validate_config
+    from deployment.wizard_diagnostic import (
+        load_corpus_state,
+        validate_diagnostic_user,
+    )
+
+    try:
+        config = load_dotenv(env_path)
+        validate_config(config)
+        diagnostic_user, _ = validate_diagnostic_user(config)
+        selection = load_query_selection(queries_path, ROOT, start=0, limit=None)
+        state = load_corpus_state(corpus_state_path, diagnostic_user)
+        active = validate_reusable_corpus_state(state, diagnostic_user)
+    except Exception as exc:
+        raise GateError("live configuration, query, or corpus prerequisite failed") from exc
+    fixture_counts: dict[str, int] = {}
+    for collection in ("knowledge", "policy"):
+        folder = fixtures_path / collection
+        if not folder.is_dir() or folder.is_symlink():
+            raise GateError(f"live {collection} fixture folder is unavailable")
+        files = [
+            path
+            for path in sorted(folder.iterdir(), key=lambda item: item.name)
+            if path.is_file() and not path.is_symlink() and not path.name.startswith(".")
+        ]
+        if not files:
+            raise GateError(f"live {collection} fixtures are empty")
+        fixture_counts[collection] = len(files)
+    evaluator = ROOT / "evaluation" / ".venv" / "bin" / "rag-evaluate"
+    if not evaluator.is_file() or not os.access(evaluator, os.X_OK):
+        raise GateError("isolated evaluator environment is unavailable")
+    return {
+        "status": "passed",
+        "protected_contracts": protected,
+        "diagnostic_user_configured": True,
+        "query_count": len(selection.selected),
+        "fixture_counts": fixture_counts,
+        "active_generation": active.generation_id,
+        "evaluator_available": True,
+    }
+
+
+def _canonical_uuid(value: object, name: str) -> str:
+    if not isinstance(value, str):
+        raise GateError(f"{name} is missing")
+    try:
+        canonical = str(UUID(value))
+    except ValueError as exc:
+        raise GateError(f"{name} is malformed") from exc
+    if canonical != value:
+        raise GateError(f"{name} is not canonical")
+    return canonical
+
+
+def validate_evaluation_success(
+    observation: Mapping[str, object],
+    *,
+    expected_request: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Validate a real successful reference-free Ragas result and its record."""
+
+    if observation.get("status") != "succeeded":
+        raise GateError("live evaluation did not succeed")
+    record_value = observation.get("record_path")
+    result_value = observation.get("result_path")
+    expected_hash = observation.get("record_sha256")
+    if not all(isinstance(value, str) and value for value in (record_value, result_value)):
+        raise GateError("live evaluation artifact paths are missing")
+    if not isinstance(expected_hash, str) or len(expected_hash) != 64:
+        raise GateError("live evaluation record hash is malformed")
+    record_path = Path(str(record_value))
+    result_path = Path(str(result_value))
+    record = _load_object(record_path, "evaluation record")
+    result = _load_object(result_path, "evaluation result")
+    if _digest(record_path) != expected_hash:
+        raise GateError("evaluation record hash does not match bytes")
+    if result.get("schema_version") != "1.0" or result.get("status") != "succeeded":
+        raise GateError("evaluation result is not a successful schema-1.0 result")
+    if result.get("record_sha256") != expected_hash:
+        raise GateError("evaluation result record hash is inconsistent")
+    if (
+        frozenset(record) != EVALUATION_RECORD_FIELDS
+        or record.get("schema_version") != "1.0"
+        or record.get("source") not in {"e2e", "rag_ask"}
+    ):
+        raise GateError("evaluation record contract is invalid")
+    captured_at = record.get("captured_at")
+    if not isinstance(captured_at, str):
+        raise GateError("evaluation captured_at is invalid")
+    try:
+        parsed_captured_at = datetime.fromisoformat(
+            captured_at[:-1] + "+00:00" if captured_at.endswith("Z") else captured_at
+        )
+    except ValueError as exc:
+        raise GateError("evaluation captured_at is invalid") from exc
+    if parsed_captured_at.tzinfo is None or parsed_captured_at.utcoffset() is None:
+        raise GateError("evaluation captured_at is invalid")
+    for key in ("source", "request_id", "conversation_id"):
+        if result.get(key) != record.get(key):
+            raise GateError(f"evaluation {key} correlation is inconsistent")
+    _canonical_uuid(record.get("request_id"), "evaluation request ID")
+    _canonical_uuid(record.get("conversation_id"), "evaluation conversation ID")
+    for key in ("original_query", "rewritten_query", "response"):
+        if not isinstance(record.get(key), str) or not str(record[key]).strip():
+            raise GateError(f"evaluation record {key} is invalid")
+    knowledge = record.get("knowledge_contexts")
+    policy = record.get("policy_contexts")
+    knowledge_ids = record.get("knowledge_context_ids")
+    policy_ids = record.get("policy_context_ids")
+    retrieved = record.get("retrieved_contexts")
+    roles = record.get("context_roles")
+    if not all(
+        isinstance(value, list)
+        for value in (knowledge, policy, knowledge_ids, policy_ids, retrieved, roles)
+    ):
+        raise GateError("evaluation context evidence is malformed")
+    if (
+        len(knowledge) != len(knowledge_ids)
+        or len(policy) != len(policy_ids)
+        or retrieved != knowledge + policy
+        or roles != ["knowledge"] * len(knowledge) + ["policy"] * len(policy)
+    ):
+        raise GateError("evaluation context order is inconsistent")
+    for identifier in knowledge_ids + policy_ids:
+        _canonical_uuid(identifier, "evaluation context ID")
+    telemetry = record.get("telemetry")
+    if (
+        not isinstance(telemetry, Mapping)
+        or telemetry.get("schema_version") != "1.0"
+        or not isinstance(telemetry.get("timings_ms"), Mapping)
+    ):
+        raise GateError("evaluation telemetry is invalid")
+    if expected_request is not None:
+        expected = {
+            "original_query": expected_request.get("question"),
+            "response": expected_request.get("answer"),
+            "request_id": expected_request.get("request_id"),
+            "conversation_id": expected_request.get("conversation_id"),
+            "telemetry": expected_request.get("telemetry"),
+        }
+        for key, value in expected.items():
+            if value is not None and record.get(key) != value:
+                raise GateError(f"evaluation record does not match SSE {key}")
+        _validate_record_evidence(record, expected_request)
+    if not isinstance(result.get("ragas_version"), str):
+        raise GateError("Ragas version is missing")
+    judge = result.get("judge")
+    if not isinstance(judge, Mapping):
+        raise GateError("judge identity is missing")
+    judge_model = judge.get("model")
+    normalized_judge_model = (
+        ""
+        if not isinstance(judge_model, str)
+        else judge_model.strip().casefold().rsplit("/", 1)[-1].split(":", 1)[0]
+    )
+    if (
+        judge.get("provider") != "ollama"
+        or not isinstance(judge_model, str)
+        or not judge_model.strip()
+        or normalized_judge_model == "qwen3-4b-awq"
+        or not isinstance(judge.get("model_digest"), str)
+        or not str(judge["model_digest"]).strip()
+        or not isinstance(judge.get("ollama_version"), str)
+        or not str(judge["ollama_version"]).strip()
+    ):
+        raise GateError("local Ollama judge identity is invalid")
+    metrics = result.get("metrics")
+    if not isinstance(metrics, list):
+        raise GateError("evaluation metrics are missing")
+    seen: set[str] = set()
+    for metric in metrics:
+        if not isinstance(metric, Mapping) or not isinstance(metric.get("name"), str):
+            raise GateError("evaluation metric is malformed")
+        name = str(metric["name"])
+        if name in seen:
+            raise GateError("evaluation metric is duplicated")
+        seen.add(name)
+        if name in MANDATORY_METRICS:
+            score = metric.get("score")
+            if (
+                metric.get("status") != "succeeded"
+                or isinstance(score, bool)
+                or not isinstance(score, (int, float))
+                or not math.isfinite(float(score))
+                or not 0.0 <= float(score) <= 1.0
+            ):
+                raise GateError(f"mandatory metric failed: {name}")
+    if not MANDATORY_METRICS.issubset(seen):
+        raise GateError("mandatory reference-free metrics are incomplete")
+    return {
+        "status": "passed",
+        "request_id": record["request_id"],
+        "conversation_id": record["conversation_id"],
+        "record_sha256": expected_hash,
+        "mandatory_metrics": sorted(MANDATORY_METRICS),
+    }
+
+
+def _validate_record_evidence(
+    record: Mapping[str, object], expected_request: Mapping[str, object]
+) -> None:
+    trace_value = expected_request.get("deep_trace")
+    if trace_value is None:
+        trace_value = expected_request.get("evaluation_evidence")
+    trace = cast_mapping(trace_value)
+    operation = cast_mapping(trace.get("operation"))
+    session_id = trace.get("session_id")
+    user_id = operation.get("user_id")
+    operation_id = operation.get("operation_id")
+    chat_session_id = expected_request.get("session_id")
+    request_id = expected_request.get("request_id")
+    if not all(
+        isinstance(value, str)
+        for value in (session_id, user_id, operation_id, chat_session_id, request_id)
+    ):
+        raise GateError("live trace correlation is incomplete")
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from backend.wizard.diagnostics import framed_content_digest
+    from deployment.evaluation_bridge import parse_request_evidence
+
+    try:
+        evidence = parse_request_evidence(
+            operation,
+            user_id=str(user_id),
+            trace_session_id=str(session_id),
+            operation_id=str(operation_id),
+            chat_session_id=str(chat_session_id),
+            request_id=str(request_id),
+        )
+    except Exception as exc:
+        raise GateError("live trace evidence is invalid") from exc
+    if record.get("rewritten_query") != evidence.rewritten_query:
+        raise GateError("live rewritten-query evidence mismatch")
+
+    for name, identity in (("knowledge", evidence.knowledge), ("policy", evidence.policy)):
+        ids = record.get(f"{name}_context_ids")
+        contexts = record.get(f"{name}_contexts")
+        if not isinstance(ids, list) or not isinstance(contexts, list):
+            raise GateError(f"live {name} record evidence is malformed")
+        if tuple(ids) != identity.ids or len(contexts) != len(ids):
+            raise GateError(f"live {name} context identity/order mismatch")
+        rendered_bytes = max(0, len(contexts) - 1) * 2
+        digest_parts: list[bytes] = []
+        for identifier, text, expected_fingerprint in zip(
+            ids, contexts, identity.fingerprints, strict=True
+        ):
+            if not isinstance(identifier, str) or not isinstance(text, str):
+                raise GateError(f"live {name} context is malformed")
+            identifier_bytes = identifier.encode("utf-8")
+            text_bytes = text.encode("utf-8")
+            fingerprint = framed_content_digest(
+                "chat-kp-item-v1", (identifier_bytes, text_bytes)
+            )
+            if expected_fingerprint != f"{identifier}:{fingerprint}":
+                raise GateError(f"live {name} fingerprint mismatch")
+            rendered_bytes += len(text_bytes)
+            digest_parts.extend((identifier_bytes, text_bytes))
+        digest = framed_content_digest(
+            f"chat-qwen-{name}-context-v1", digest_parts
+        )
+        if digest != identity.digest or rendered_bytes != identity.rendered_utf8_bytes:
+            raise GateError(f"live {name} digest mismatch")
+
+
+def _finite_positive(value: object, name: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or float(value) <= 0
+    ):
+        raise GateError(f"{name} must be finite and positive")
+    return float(value)
+
+
+def paired_latency_gate(
+    samples: Sequence[Mapping[str, object]],
+    *,
+    baseline_mode: str = "off",
+    comparison_mode: str = "on",
+    minimum_pairs: int = 30,
+    resamples: int = 10_000,
+    seed: int = 20_260_911,
+    threshold_percent: float = 5.0,
+) -> dict[str, object]:
+    """Apply the deterministic paired-median one-sided latency gate."""
+
+    if minimum_pairs < 1 or resamples < 1:
+        raise GateError("latency pair and bootstrap counts must be positive")
+    indexed: dict[str, dict[str, Mapping[str, object]]] = {}
+    for sample in samples:
+        pair_key = sample.get("pair_key")
+        mode = sample.get("mode")
+        if not isinstance(pair_key, str) or not pair_key:
+            raise GateError("latency sample pair_key is invalid")
+        if mode not in {baseline_mode, comparison_mode}:
+            raise GateError("latency sample mode is invalid")
+        bucket = indexed.setdefault(pair_key, {})
+        if str(mode) in bucket:
+            raise GateError("duplicate latency sample for one pair and mode")
+        bucket[str(mode)] = sample
+    complete = [
+        pair for pair in indexed.values()
+        if baseline_mode in pair and comparison_mode in pair
+    ]
+    if len(complete) < minimum_pairs:
+        raise GateError("insufficient complete paired latency observations")
+    rng = random.Random(seed)
+    decisions: dict[str, object] = {}
+    for metric in LATENCY_METRICS:
+        changes: list[float] = []
+        for pair in complete:
+            before = _finite_positive(
+                cast_mapping(pair[baseline_mode].get("timings_ms")).get(metric),
+                f"{baseline_mode} {metric}",
+            )
+            after = _finite_positive(
+                cast_mapping(pair[comparison_mode].get("timings_ms")).get(metric),
+                f"{comparison_mode} {metric}",
+            )
+            changes.append(((after - before) / before) * 100.0)
+        bootstrap = [
+            statistics.median(rng.choice(changes) for _ in changes)
+            for _ in range(resamples)
+        ]
+        bootstrap.sort()
+        upper = bootstrap[math.ceil(0.95 * len(bootstrap)) - 1]
+        decisions[metric] = {
+            "paired_median_change_percent": round(statistics.median(changes), 6),
+            "one_sided_95pct_upper_bound_percent": round(upper, 6),
+            "status": "passed" if upper < threshold_percent else "failed",
+        }
+    return {
+        "schema_version": "1.0",
+        "status": (
+            "passed"
+            if all(value["status"] == "passed" for value in decisions.values())
+            else "failed"
+        ),
+        "complete_pair_count": len(complete),
+        "bootstrap_resamples": resamples,
+        "bootstrap_seed": seed,
+        "threshold_percent": threshold_percent,
+        "metrics": decisions,
+    }
+
+
+def cast_mapping(value: object) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise GateError("latency timings_ms is malformed")
+    return value
+
+
+def validate_contention_sample(sample: Mapping[str, object]) -> None:
+    """Require a real judge interval to contain the measured RAG request."""
+
+    judge_started = _finite_positive(sample.get("judge_started_monotonic"), "judge start")
+    request_started = _finite_positive(sample.get("request_started_monotonic"), "request start")
+    request_done = _finite_positive(sample.get("request_done_monotonic"), "request done")
+    judge_finished = _finite_positive(sample.get("judge_finished_monotonic"), "judge finish")
+    if not judge_started < request_started < request_done < judge_finished:
+        raise GateError("local judge did not overlap the complete RAG request")
+
+
+def verify_live_artifacts(
+    *,
+    ask_observation: Mapping[str, object],
+    e2e_rows: Sequence[Mapping[str, object]],
+    latency_samples: Sequence[Mapping[str, object]],
+    contention_samples: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    """Validate authorized real-run artifacts without making service calls."""
+
+    protected = validate_protected_contracts()
+    for name in ("question", "answer", "request_id", "conversation_id", "telemetry"):
+        if ask_observation.get(name) is None:
+            raise GateError(f"live ask {name} evidence is missing")
+    ask_evaluation = ask_observation.get("evaluation", ask_observation)
+    if not isinstance(ask_evaluation, Mapping):
+        raise GateError("live ask evaluation evidence is missing")
+    ask = validate_evaluation_success(
+        ask_evaluation,
+        expected_request=ask_observation,
+    )
+    if not e2e_rows:
+        raise GateError("live E2E evidence is missing")
+    for row in e2e_rows:
+        if row.get("status") != "succeeded":
+            raise GateError("live E2E request failed")
+        post = row.get("post_generation")
+        if not isinstance(post, Mapping) or any(
+            not isinstance(post.get(name), Mapping)
+            or post[name].get("status") != "succeeded"  # type: ignore[index]
+            for name in ("conversation_persistence", "session_title")
+        ):
+            raise GateError("live E2E post-generation work failed")
+        evaluation = row.get("evaluation")
+        if not isinstance(evaluation, Mapping):
+            raise GateError("live E2E evaluation evidence is missing")
+        validate_evaluation_success(evaluation, expected_request=row)
+    for sample in contention_samples:
+        validate_contention_sample(sample)
+    off_on = paired_latency_gate(latency_samples)
+    contention = paired_latency_gate(
+        contention_samples,
+        baseline_mode="uncontended",
+        comparison_mode="contended",
+    )
+    statuses = {
+        "protected_contracts": protected["status"],
+        "live_ask": "passed",
+        "live_e2e": "passed",
+        "off_on_latency": off_on["status"],
+        "evaluator_overlap_latency": contention["status"],
+        "real_ragas": "passed",
+    }
+    return {
+        "schema_version": "1.0",
+        "status": "passed" if set(statuses.values()) == {"passed"} else "failed",
+        "statuses": statuses,
+        "ask": ask,
+        "e2e_request_count": len(e2e_rows),
+        "off_on_latency": off_on,
+        "evaluator_overlap_latency": contention,
+    }
+
+
+def _load_jsonl(path: Path) -> list[Mapping[str, object]]:
+    if not path.is_file() or path.is_symlink():
+        raise GateError("JSONL evidence must be one regular file")
+    rows: list[Mapping[str, object]] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise GateError(f"invalid JSONL row {line_number}") from exc
+        if not isinstance(value, Mapping):
+            raise GateError(f"JSONL row {line_number} is not an object")
+        rows.append(value)
+    return rows
+
+
+def _write_private(path: Path, value: Mapping[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as target:
+        json.dump(value, target, ensure_ascii=True, allow_nan=False, indent=2, sort_keys=True)
+        target.write("\n")
+        target.flush()
+        os.fsync(target.fileno())
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("preflight", help="validate protected contracts offline")
+    live_preflight = commands.add_parser(
+        "live-preflight", help="validate real-run prerequisites without services"
+    )
+    live_preflight.add_argument("--env", type=Path, default=ROOT / ".env")
+    live_preflight.add_argument("--fixtures", type=Path, default=DEFAULT_FIXTURES)
+    live_preflight.add_argument("--queries", type=Path, default=DEFAULT_QUERIES)
+    live_preflight.add_argument(
+        "--corpus-state",
+        type=Path,
+        default=ROOT / ".local" / "diagnostics" / "wizard" / "corpus-state.json",
+    )
+    verify = commands.add_parser("verify", help="verify authorized live-run artifacts")
+    verify.add_argument("--ask-status", type=Path, required=True)
+    verify.add_argument("--e2e-requests", type=Path, required=True)
+    verify.add_argument("--latency-samples", type=Path, required=True)
+    verify.add_argument("--contention-samples", type=Path, required=True)
+    verify.add_argument("--output", type=Path, required=True)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        if args.command == "preflight":
+            result = validate_protected_contracts()
+        elif args.command == "live-preflight":
+            result = validate_live_prerequisites(
+                env_path=args.env,
+                fixtures_path=args.fixtures,
+                queries_path=args.queries,
+                corpus_state_path=args.corpus_state,
+            )
+        else:
+            # This must be the first gate step.  Real-run artifacts are not
+            # accepted when protected production contracts have drifted.
+            validate_protected_contracts()
+            result = verify_live_artifacts(
+                ask_observation=_load_object(args.ask_status, "ask status"),
+                e2e_rows=_load_jsonl(args.e2e_requests),
+                latency_samples=_load_jsonl(args.latency_samples),
+                contention_samples=_load_jsonl(args.contention_samples),
+            )
+            output = args.output.resolve()
+            if output.exists() or output.is_symlink():
+                raise GateError("gate output already exists")
+            _write_private(output, result)
+        print(json.dumps(result, sort_keys=True))
+        return 0 if result["status"] == "passed" else 1
+    except (GateError, OSError, UnicodeError) as exc:
+        print(f"non-regression gate failed: {type(exc).__name__}")
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
