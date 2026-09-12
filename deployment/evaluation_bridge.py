@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -17,7 +17,7 @@ import stat
 import subprocess
 import sys
 from threading import Event, Lock
-from time import perf_counter
+from time import monotonic, perf_counter
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -135,6 +135,7 @@ class _EvaluationJobState:
     lock: Lock = field(default_factory=Lock)
     launch: EvaluationLaunch | None = None
     worker: subprocess.Popen[bytes] | None = None
+    cancelled: Event = field(default_factory=Event)
 
 
 @dataclass(frozen=True)
@@ -639,6 +640,7 @@ def finish_local_evaluation(
         if (
             payload.get("schema_version") != EVALUATION_RESULT_SCHEMA_VERSION
             or status not in {"succeeded", "partial", "failed"}
+            or (status == "succeeded" and process.returncode != 0)
             or payload.get("record_sha256") != launch.record_sha256
             or payload.get("source") != launch.source
             or payload.get("request_id") != launch.request_id
@@ -708,10 +710,10 @@ def _acquire_evaluation_lock(
 def _release_evaluation_lock(descriptor: int | None) -> None:
     if descriptor is None:
         return
-    try:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-    finally:
-        os.close(descriptor)
+    # Inherited descriptors share the flock. An explicit LOCK_UN would release
+    # admission even if an orphan child still owns it during deadline cleanup.
+    # Closing releases the slot only after the last supervised owner exits.
+    os.close(descriptor)
 
 
 def _terminal_job(
@@ -889,7 +891,8 @@ def _stop_worker(process: subprocess.Popen[bytes]) -> None:
     except ProcessLookupError:
         pass
     try:
-        process.wait(timeout=_PROCESS_STOP_GRACE_SECONDS)
+        # Allow the supervisor to stop/reap its admitted process group first.
+        process.wait(timeout=_PROCESS_STOP_GRACE_SECONDS + 2.0)
     except subprocess.TimeoutExpired:
         try:
             os.killpg(process.pid, signal.SIGKILL)
@@ -960,8 +963,8 @@ def _run_supervised_worker(
             "deployment.evaluation_bridge_worker",
             "--lock-fd",
             str(descriptor),
-            "--timeout-seconds",
-            str(timeout_seconds),
+            "--deadline-monotonic",
+            str(monotonic() + timeout_seconds),
         ],
         cwd=PROJECT_ROOT,
         env=_sanitized_child_environment(evaluator=True),
@@ -973,11 +976,23 @@ def _run_supervised_worker(
     )
     with state.lock:
         state.worker = worker
+        cancelled = state.cancelled.is_set()
     try:
-        output, _ = worker.communicate(input=payload, timeout=timeout_seconds)
+        if cancelled:
+            _stop_worker(worker)
+            raise EvaluationBridgeError("evaluation was cancelled")
+        output, _ = worker.communicate(
+            input=payload,
+            timeout=timeout_seconds + _PROCESS_STOP_GRACE_SECONDS + 2.0,
+        )
     except subprocess.TimeoutExpired:
         _stop_worker(worker)
         raise TimeoutError from None
+    except BaseException:
+        _stop_worker(worker)
+        raise
+    if worker.returncode == 124:
+        raise TimeoutError
     if worker.returncode != 0 or len(output) > _WORKER_MAX_OUTPUT_BYTES:
         raise EvaluationBridgeError("evaluation worker failed")
     try:
@@ -989,7 +1004,7 @@ def _run_supervised_worker(
     return result
 
 
-def _run_evaluation_job(
+def _execute_evaluation_job(
     *,
     submitted_at: float,
     cancel_event: Event,
@@ -1134,7 +1149,7 @@ def _run_evaluation_job(
         )
         return EvaluationObservation(
             "failed",
-            "EVALUATION_PROCESS_FAILED",
+            "EVALUATION_CANCELLED" if cancel_event.is_set() else "EVALUATION_PROCESS_FAILED",
             (perf_counter() - submitted_at) * 1000.0,
             None,
             None,
@@ -1152,12 +1167,26 @@ def _run_evaluation_job(
             _LOCAL_JOB_PENDING = False
 
 
+def _run_evaluation_job(*, submitted_at: float, **kwargs: Any) -> EvaluationObservation:
+    # Freeze clocks after the inner finally has reaped children and released
+    # admission. A later caller join cannot inflate these observations.
+    observation = _execute_evaluation_job(submitted_at=submitted_at, **kwargs)
+    total_ms = (perf_counter() - submitted_at) * 1000.0
+    admitted = observation.execution_ms > 0.0
+    return replace(
+        observation,
+        duration_ms=total_ms,
+        queue_wait_ms=observation.queue_wait_ms if admitted else total_ms,
+        execution_ms=max(0.0, total_ms - observation.queue_wait_ms) if admitted else 0.0,
+    )
+
+
 def submit_local_evaluation(
     *,
     config: Mapping[str, str],
     user_id: str,
     evidence: RequestEvidence,
-    allowed_document_ids: Mapping[str, frozenset[str]] | None,
+    allowed_document_ids: Mapping[str, frozenset[str]] | None = None,
     source: str,
     request_id: str,
     conversation_id: str,
@@ -1233,6 +1262,7 @@ def finish_evaluation_job(job: EvaluationJob) -> EvaluationObservation:
 
 def cancel_evaluation_job(job: EvaluationJob) -> None:
     job.cancel_event.set()
+    job.state.cancelled.set()
     with job.state.lock:
         launch = job.state.launch
         worker = job.state.worker

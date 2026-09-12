@@ -124,6 +124,12 @@ environment and does not inherit Modal, Weaviate, SGLang, cloud-provider, proxy,
 or Python-path credentials. This serializes only post-response evaluation,
 never inference.
 
+The supervisor runs separately from blocking hydration/model imports. It owns
+one absolute admitted deadline, sends termination to the admitted process group,
+escalates after a bounded grace period, and reaps the child. An independent child
+deadline handles unexpected supervisor loss. Closing inherited lock descriptors
+keeps admission owned until the last surviving local child exits.
+
 E2E submits local evaluation before polling existing remote persistence/title
 tasks, so those activities may overlap. Its historical `duration_ms` stops at
 the original post-generation diagnostic boundary before evaluator join.
@@ -153,6 +159,15 @@ all mandatory reference-free Ragas metrics, successful post-generation work,
 and both OFF/ON and evaluator-contention latency gates. Independent live Qwen
 answers are stochastic and are not required to have equal bytes. See
 `NON_REGRESSION_REPORT.md` for the current gate status.
+
+The verifier takes enriched collector envelopes, not ordinary ask's standalone
+evaluation `status.json`. Each live request must carry its validated SSE values,
+correlated terminal evidence and post-generation task observations. Latency
+samples also record protected-contract/configuration/corpus/model hashes,
+runtime/block IDs, ordered query indices, and warmup flags. Contention samples
+record actual Ollama HTTP request intervals and the other evaluated request.
+Missing evidence fails closed. Live collection and service execution remain
+separately authorized; these commands do not deploy or benchmark services.
 
 ## Tests
 

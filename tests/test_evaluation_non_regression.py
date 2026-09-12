@@ -6,6 +6,7 @@ import json
 import math
 import os
 from pathlib import Path
+import subprocess
 from uuid import uuid4
 
 import pytest
@@ -69,6 +70,43 @@ def test_protected_contract_manifest_is_a_mandatory_exact_preflight(tmp_path: Pa
     drifted.write_text(json.dumps(manifest))
     with pytest.raises(gate.GateError, match="drifted"):
         gate.validate_protected_contracts(drifted)
+    manifest["files"] = {}
+    drifted.write_text(json.dumps(manifest))
+    with pytest.raises(gate.GateError, match="incomplete"):
+        gate.validate_protected_contracts(drifted)
+
+
+def test_only_the_two_literal_observation_hooks_differ_in_generation_sources() -> None:
+    expected = {
+        "backend/rag/generator.py": [
+            "+    capture_evaluation_contexts,",
+            "+            capture_evaluation_contexts(knowledge, policy)",
+        ],
+        "backend/providers/sglang_query_rewriter.py": [
+            "+    capture_evaluation_rewrite,",
+            "+        capture_evaluation_rewrite(result)",
+        ],
+    }
+    for relative, allowed in expected.items():
+        diff = subprocess.check_output(
+            ["git", "diff", "--no-ext-diff", gate.BEHAVIORAL_BASELINE_COMMIT, "--", relative],
+            cwd=gate.ROOT, text=True,
+        )
+        changes = [line for line in diff.splitlines()
+                   if line[:1] in {"+", "-"} and not line.startswith(("+++", "---"))]
+        assert changes == allowed
+
+
+def test_all_other_protected_rag_sources_are_identical_to_behavioral_baseline() -> None:
+    manifest = json.loads(gate.MANIFEST_PATH.read_text())
+    exceptions = gate.APPROVED_EVIDENCE_HOOK_FILES | {"deployment/evaluation_bridge_worker.py"}
+    for relative in manifest["files"]:
+        if relative in exceptions:
+            continue
+        original = subprocess.check_output(
+            ["git", "show", f"{gate.BEHAVIORAL_BASELINE_COMMIT}:{relative}"], cwd=gate.ROOT
+        )
+        assert (gate.ROOT / relative).read_bytes() == original, relative
 
 
 def test_deep_malformed_correlation_faults_deep_session_only() -> None:
@@ -356,6 +394,8 @@ def _terminal_evidence_request(
 def test_live_ragas_success_requires_all_mandatory_metrics(tmp_path: Path) -> None:
     observation = _write_successful_evaluation(tmp_path)
     assert gate.validate_evaluation_success(observation)["status"] == "passed"
+    with pytest.raises(gate.GateError, match="record contract"):
+        gate.validate_evaluation_success(observation, expected_source="rag_ask")
     result_path = Path(str(observation["result_path"]))
     result = json.loads(result_path.read_text())
     result["metrics"][0]["status"] = "failed"
@@ -494,9 +534,35 @@ def test_latency_gate_and_contention_overlap_contract() -> None:
                 "judge_started_monotonic": 1.0,
                 "request_started_monotonic": 2.0,
                 "request_done_monotonic": 5.0,
-                "judge_finished_monotonic": 4.0,
+                "judge_finished_monotonic": 1.5,
             }
         )
+
+
+def test_latency_rejects_unpaired_data_instead_of_silently_dropping_it() -> None:
+    rows = [
+        {"pair_key": "paired", "mode": mode, "timings_ms": {name: 100 for name in gate.LATENCY_METRICS}}
+        for mode in ("off", "on")
+    ]
+    rows.append({"pair_key": "missing-peer", "mode": "off"})
+    with pytest.raises(gate.GateError, match="unpaired"):
+        gate.paired_latency_gate(rows, minimum_pairs=1)
+
+
+def test_live_timing_triples_cannot_pass_without_runtime_provenance() -> None:
+    with pytest.raises(gate.GateError, match="identity is missing"):
+        gate.validate_latency_schedule([
+            {"pair_key": "one", "mode": "on", "timings_ms": {name: 1 for name in gate.LATENCY_METRICS}}
+        ])
+
+
+def test_contention_requires_actual_overlap_but_not_full_request_containment() -> None:
+    gate.validate_contention_sample({
+        "judge_started_monotonic": 1.0,
+        "request_started_monotonic": 2.0,
+        "request_done_monotonic": 4.0,
+        "judge_finished_monotonic": 3.0,
+    })
 
 
 def test_production_dependency_and_import_isolation() -> None:

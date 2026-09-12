@@ -42,6 +42,16 @@ APPROVED_EVIDENCE_HOOK_FILES = frozenset(
         "deployment/ragctl.py",
     }
 )
+REQUIRED_PROTECTED_FILES = APPROVED_EVIDENCE_HOOK_FILES | frozenset({
+    "backend/api/chat.py", "backend/api/models.py", "backend/api/telemetry.py",
+    "backend/model_config.py", "backend/providers/sglang_qwen_llm.py",
+    "backend/rag/embedder.py", "backend/rag/pipeline.py", "backend/rag/query_rewriter.py",
+    "backend/rag/retrieval.py", "backend/rag/session_title.py", "backend/requirements.txt",
+    "backend/task_queue.py", "backend/weaviate_client/_base.py",
+    "backend/weaviate_client/_chunk_collection.py", "backend/weaviate_client/conversation.py",
+    "backend/weaviate_client/knowledge.py", "backend/weaviate_client/policy.py",
+    "deployment/compose.weaviate-secure.yaml", "deployment/evaluation_bridge_worker.py",
+})
 EVALUATION_RECORD_FIELDS = frozenset(
     {
         "schema_version",
@@ -104,6 +114,7 @@ def validate_protected_contracts(
     baseline_files = manifest.get("behavioral_baseline_files")
     if (
         not isinstance(files, Mapping)
+        or frozenset(files) != REQUIRED_PROTECTED_FILES
         or not isinstance(contracts, Mapping)
         or not isinstance(hooks, Mapping)
         or frozenset(hooks) != APPROVED_EVIDENCE_HOOK_FILES
@@ -123,7 +134,10 @@ def validate_protected_contracts(
     for relative, expected in sorted(files.items()):
         if not isinstance(relative, str) or not isinstance(expected, str):
             raise GateError("protected file entry is malformed")
-        path = (ROOT / relative).resolve()
+        unresolved = ROOT / relative
+        if unresolved.is_symlink():
+            raise GateError(f"protected source is a symlink: {relative}")
+        path = unresolved.resolve()
         try:
             path.relative_to(ROOT)
         except ValueError as exc:
@@ -249,6 +263,7 @@ def validate_evaluation_success(
     observation: Mapping[str, object],
     *,
     expected_request: Mapping[str, object] | None = None,
+    expected_source: str | None = None,
 ) -> dict[str, object]:
     """Validate a real successful reference-free Ragas result and its record."""
 
@@ -275,6 +290,7 @@ def validate_evaluation_success(
         frozenset(record) != EVALUATION_RECORD_FIELDS
         or record.get("schema_version") != "1.0"
         or record.get("source") not in {"e2e", "rag_ask"}
+        or (expected_source is not None and record.get("source") != expected_source)
     ):
         raise GateError("evaluation record contract is invalid")
     captured_at = record.get("captured_at")
@@ -497,6 +513,8 @@ def paired_latency_gate(
         pair for pair in indexed.values()
         if baseline_mode in pair and comparison_mode in pair
     ]
+    if len(complete) != len(indexed):
+        raise GateError("unpaired latency observations cannot be discarded")
     if len(complete) < minimum_pairs:
         raise GateError("insufficient complete paired latency observations")
     rng = random.Random(seed)
@@ -546,14 +564,149 @@ def cast_mapping(value: object) -> Mapping[str, object]:
 
 
 def validate_contention_sample(sample: Mapping[str, object]) -> None:
-    """Require a real judge interval to contain the measured RAG request."""
+    """Require the RAG request to start during an actual judge request."""
 
     judge_started = _finite_positive(sample.get("judge_started_monotonic"), "judge start")
     request_started = _finite_positive(sample.get("request_started_monotonic"), "request start")
     request_done = _finite_positive(sample.get("request_done_monotonic"), "request done")
     judge_finished = _finite_positive(sample.get("judge_finished_monotonic"), "judge finish")
-    if not judge_started < request_started < request_done < judge_finished:
-        raise GateError("local judge did not overlap the complete RAG request")
+    if not judge_started < request_started < min(request_done, judge_finished):
+        raise GateError("local judge did not overlap the RAG request")
+
+
+def _validate_post_generation(row: Mapping[str, object]) -> None:
+    post = cast_mapping(row.get("post_generation"))
+    tasks = []
+    for name in ("conversation_persistence", "session_title"):
+        task = cast_mapping(post.get(name))
+        if task.get("status") != "succeeded":
+            raise GateError("live post-generation work failed")
+        _canonical_uuid(task.get("task_id"), "post-generation task ID")
+        dates = []
+        for key in ("created_at", "started_at", "finished_at"):
+            value = task.get(key)
+            if not isinstance(value, str):
+                raise GateError("post-generation timestamps are missing")
+            try:
+                date = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise GateError("post-generation timestamp is malformed") from exc
+            if date.tzinfo is None:
+                raise GateError("post-generation timestamp lacks timezone")
+            dates.append(date)
+        if not dates[0] <= dates[1] <= dates[2]:
+            raise GateError("post-generation timestamps are inconsistent")
+        tasks.append(dates)
+    if tasks[0][2] > tasks[1][1]:
+        raise GateError("post-generation tasks violated FIFO")
+
+
+def _validate_live_sample(sample: Mapping[str, object], *, evaluation: bool) -> None:
+    if sample.get("status") != "succeeded" or sample.get("answer_complete") is not True:
+        raise GateError("live measured RAG request did not succeed")
+    _canonical_uuid(sample.get("request_id"), "live sample request ID")
+    _canonical_uuid(sample.get("conversation_id"), "live sample conversation ID")
+    answer = sample.get("answer")
+    if not isinstance(answer, str) or not answer:
+        raise GateError("live answer is missing")
+    if sample.get("answer_sha256") != hashlib.sha256(answer.encode("utf-8")).hexdigest():
+        raise GateError("live answer digest is inconsistent")
+    telemetry = cast_mapping(sample.get("telemetry"))
+    if (
+        telemetry.get("schema_version") != "1.0"
+        or telemetry.get("request_id") != sample.get("request_id")
+        or telemetry.get("timings_ms") != sample.get("timings_ms")
+    ):
+        raise GateError("live timing sample differs from authoritative telemetry")
+    _validate_post_generation(sample)
+    if evaluation:
+        validate_evaluation_success(
+            cast_mapping(sample.get("evaluation")), expected_request=sample
+        )
+
+
+def validate_latency_schedule(
+    samples: Sequence[Mapping[str, object]], *, contention: bool = False
+) -> list[Mapping[str, object]]:
+    """Validate run provenance/schedule before calculating any performance PASS.
+
+    The local authorized collector must add this evidence to its raw samples;
+    plain timing triples cannot stand in for a completed live acceptance run.
+    """
+    if not samples:
+        raise GateError("live latency samples are missing")
+    identities = set()
+    seen_requests = set()
+    blocks: dict[int, list[Mapping[str, object]]] = {}
+    for sample in samples:
+        identity = []
+        for key in ("protected_contract_sha256", "configuration_sha256", "corpus_sha256", "models_sha256"):
+            value = sample.get(key)
+            if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+                raise GateError("live runtime/configuration identity is missing")
+            identity.append(value)
+        if sample["protected_contract_sha256"] != _digest(MANIFEST_PATH):
+            raise GateError("live sample used different protected contracts")
+        identities.add(tuple(identity))
+        if sample.get("request_id") in seen_requests:
+            raise GateError("live request is duplicated")
+        seen_requests.add(sample.get("request_id"))
+        mode = sample.get("mode")
+        if contention:
+            if mode not in {"uncontended", "contended"}:
+                raise GateError("contention mode is invalid")
+            if mode == "contended":
+                if sample.get("judge_activity_source") != "ollama_http":
+                    raise GateError("actual Ollama request activity is required")
+                validate_contention_sample(sample)
+                other = cast_mapping(sample.get("overlapping_evaluation_request"))
+                if other.get("request_id") == sample.get("request_id"):
+                    raise GateError("contention must involve another request")
+                _validate_live_sample(other, evaluation=True)
+            _validate_live_sample(sample, evaluation=True)
+        else:
+            block = sample.get("block_sequence")
+            if type(block) is not int or block not in range(4):
+                raise GateError("OFF/ON block sequence is invalid")
+            if mode != ("off", "on", "on", "off")[block]:
+                raise GateError("OFF/ON schedule must be OFF ON ON OFF")
+            blocks.setdefault(block, []).append(sample)
+            _validate_live_sample(sample, evaluation=mode == "on")
+    if len(identities) != 1:
+        raise GateError("live runtime/configuration drifted between samples")
+    if contention:
+        return list(samples)
+    if set(blocks) != set(range(4)):
+        raise GateError("all four fresh-runtime blocks are required")
+    if [sample["block_sequence"] for sample in samples] != sorted(sample["block_sequence"] for sample in samples):
+        raise GateError("live blocks are not in execution order")
+    runtime_ids = []
+    selected = []
+    for block in range(4):
+        group = blocks[block]
+        runtime_id = group[0].get("runtime_instance_id")
+        if not isinstance(runtime_id, str) or not runtime_id or any(item.get("runtime_instance_id") != runtime_id for item in group):
+            raise GateError("fresh-runtime identity is missing or inconsistent")
+        runtime_ids.append(runtime_id)
+        if len(group) <= 3:
+            raise GateError("three warmups plus measured observations are required")
+        for index, sample in enumerate(group):
+            if sample.get("block_request_index") != index or sample.get("warmup") is not (index < 3):
+                raise GateError("live warmup schedule is inconsistent")
+            if index >= 3:
+                selected.append(sample)
+    if len(set(runtime_ids)) != 4:
+        raise GateError("runtime blocks must be independently started")
+    paired_questions: dict[str, str] = {}
+    for sample in selected:
+        question = sample.get("question")
+        key = sample.get("pair_key")
+        if not isinstance(question, str) or not question.strip() or not isinstance(key, str):
+            raise GateError("paired live query schedule is missing")
+        if key in paired_questions and paired_questions[key] != question:
+            raise GateError("paired query text differs")
+        paired_questions[key] = question
+    return selected
 
 
 def verify_live_artifacts(
@@ -575,28 +728,22 @@ def verify_live_artifacts(
     ask = validate_evaluation_success(
         ask_evaluation,
         expected_request=ask_observation,
+        expected_source="rag_ask",
     )
+    _validate_post_generation(ask_observation)
     if not e2e_rows:
         raise GateError("live E2E evidence is missing")
     for row in e2e_rows:
         if row.get("status") != "succeeded":
             raise GateError("live E2E request failed")
-        post = row.get("post_generation")
-        if not isinstance(post, Mapping) or any(
-            not isinstance(post.get(name), Mapping)
-            or post[name].get("status") != "succeeded"  # type: ignore[index]
-            for name in ("conversation_persistence", "session_title")
-        ):
-            raise GateError("live E2E post-generation work failed")
+        _validate_post_generation(row)
         evaluation = row.get("evaluation")
         if not isinstance(evaluation, Mapping):
             raise GateError("live E2E evaluation evidence is missing")
-        validate_evaluation_success(evaluation, expected_request=row)
-    for sample in contention_samples:
-        validate_contention_sample(sample)
-    off_on = paired_latency_gate(latency_samples)
+        validate_evaluation_success(evaluation, expected_request=row, expected_source="e2e")
+    off_on = paired_latency_gate(validate_latency_schedule(latency_samples))
     contention = paired_latency_gate(
-        contention_samples,
+        validate_latency_schedule(contention_samples, contention=True),
         baseline_mode="uncontended",
         comparison_mode="contended",
     )

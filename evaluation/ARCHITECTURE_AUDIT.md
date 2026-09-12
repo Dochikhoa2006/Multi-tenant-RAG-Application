@@ -91,8 +91,10 @@ flowchart TD
     X -. unchanged background work .-> CP[Conversation persistence]
     CP -. same-user FIFO .-> ST[Session title]
     T --> EGET[Authenticated terminal trace GET]
-    EGET --> EDEL[Explicit trace DELETE]
+    EGET --> EDEL[Ask: explicit trace DELETE]
     EDEL --> SUB[Submit local evaluation job]
+    EGET --> E2E[E2E: retain deep session for post-generation verification]
+    E2E --> SUB
     SUB --> LOCK[Cross-process exclusive execution lock]
     LOCK --> HY[Read-only vector-free Weaviate hydration]
     HY --> VERIFY[Verify owner, IDs, order, fingerprints, digests]
@@ -172,9 +174,14 @@ proxy, and Python-path credentials or overrides.
 Waiting is cancellable and does not consume the 1,800-second admitted execution
 deadline. That deadline begins when the lock is acquired and includes hydration,
 record construction, evaluator execution, result validation, and cleanup. A
-timeout or interruption terminates and reaps the supervised process group before
-the slot is released. Each CLI process permits at most one pending evaluation
-job; E2E remains sequential.
+timeout or interruption terminates the admitted process group and reaps its
+child before the slot is released. The supervisor enforces an absolute monotonic
+deadline, including receipt of private input, while a child deadline handles
+unexpected supervisor loss. Inherited descriptors are closed without an explicit
+unlock, preserving admission until every remaining owner exits. Cleanup permits
+a bounded five-second termination grace (plus a one-second orphan fallback
+margin). Each CLI process permits at most one pending evaluation job; E2E remains
+sequential. A reported evaluator success additionally requires child exit zero.
 
 For E2E, the job is submitted after successful SSE and deep-evidence validation
 but before existing remote persistence/title polling. The remote checks and

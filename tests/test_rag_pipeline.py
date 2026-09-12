@@ -472,6 +472,72 @@ def test_knowledge_and_policy_retrieval_run_concurrently() -> None:
     assert asyncio.run(_collect(harness)) == ["MMR ", "balances diversity."]
 
 
+def test_evaluation_off_on_preserves_pipeline_calls_prompts_and_persistence() -> None:
+    """Compare real pipeline/retrieval/budgeting with identical provider streams.
+
+    Preserve order within each concurrent branch; imposing a global order on
+    Knowledge/Policy worker scheduling would assert behavior production lacks.
+    """
+    transcripts = []
+    for enabled in (False, True):
+        harness = _harness(rendezvous=threading.Barrier(2))
+        hydration_calls: dict[str, list[list[str]]] = {}
+        for collection in (harness.conversation, harness.knowledge, harness.policy):
+            hydration_calls[collection.name] = []
+            original = collection.hydrate_mmr_head
+
+            def hydrated(candidates, *, _original=original, _name=collection.name):
+                hydration_calls[_name].append([item.object_id for item in candidates])
+                return _original(candidates)
+
+            collection.hydrate_mmr_head = hydrated
+        registry = DiagnosticTraceRegistry(USER_ID, capture_mode="evaluation")
+        session_id, operation_id = str(uuid4()), str(uuid4())
+        registry.start(USER_ID, session_id, "controlled-off-on")
+        handle = registry.begin_operation(
+            user_id=USER_ID, session_id=session_id, operation_id=operation_id,
+            kind="chat_query", collection_type="conversations", wizard_id=str(uuid4()),
+        )
+        if enabled:
+            install_registry(registry)
+        try:
+            with activate_operation(handle if enabled else None):
+                answer = asyncio.run(_collect(harness))
+            queued = [(user, name) for user, name, _ in harness.queue.jobs]
+            asyncio.run(harness.queue.run_next())
+            if enabled:
+                registry.finish(handle, "succeeded")
+                operation = registry.snapshot(USER_ID, session_id, operation_id)["operations"][0]
+                assert operation["samples"]["qwen_knowledge_used_ids"]["items"] == [_uuid(3)]
+                assert operation["samples"]["qwen_policy_used_ids"]["items"] == [_uuid(4)]
+                assert operation["stages"] == {}
+        finally:
+            if enabled:
+                uninstall_registry(registry)
+        transcripts.append({
+            "answer_bytes": "".join(answer).encode("utf-8"),
+            "rewriter": [call[:2] for call in harness.llm.complete_calls],
+            "qwen": [call[:2] for call in harness.llm.stream_calls],
+            "lateon": [call[:2] for call in harness.runtime.multi_vectors.calls],
+            "gte": [call[:2] for call in harness.embeddings.calls],
+            "search": {
+                item.name: [call[:3] for call in item.calls]
+                for item in (harness.conversation, harness.knowledge, harness.policy)
+            },
+            "bge": sorted(
+                [{key: value for key, value in call.items() if key != "thread"}
+                 for call in harness.reranker.calls],
+                key=lambda call: tuple(call["documents"]),
+            ),
+            "hydration": hydration_calls,
+            "queue": queued,
+            "storage": [call[:5] for call in harness.writer.inserts],
+        })
+        assert harness.events.index("stream_complete") < harness.events.index("queue_accept")
+        assert harness.events.index("queue_accept") < harness.events.index("conversation_insert")
+    assert transcripts[0] == transcripts[1]
+
+
 def test_pipeline_trace_keeps_two_query_encodes_and_one_concurrent_join() -> None:
     harness = _harness(rendezvous=threading.Barrier(2))
     registry = DiagnosticTraceRegistry(USER_ID)

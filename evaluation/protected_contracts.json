@@ -54,8 +54,8 @@
     "deployment/compose.weaviate-secure.yaml": "ccf42512ed9bd6cb7e237da67b33e1f5166fa7661154739a43384f48ef4402f7",
     "deployment/e2e_diagnostic.py": "e4157b0a30e815c9a0fea24139bde6344caa681c09edd7ca6488f72319136d14",
     "deployment/e2e_diagnostic_api.py": "ab93a0240d14c0c6a67d1b7fbf684f14a0453186a3b09a12bfa3e895749af4e2",
-    "deployment/evaluation_bridge.py": "39a6234ffc3710d47995115a29031a9e45c1f2257de48bfd856a15a2acbef1bc",
-    "deployment/evaluation_bridge_worker.py": "e91a703ca9b4cc8c9ce23351d57891935b46aae31c21dab042277a2a58e1ba3c",
+    "deployment/evaluation_bridge.py": "b637c8763bf3eef22d5610d96016edee60ee05fc49f2de2e648b226c9ff3f36c",
+    "deployment/evaluation_bridge_worker.py": "fdbdda154394697ede0a80160ab727c41de89864be04dea6d29172f1008bcff7",
     "deployment/modal_runtime.py": "c72c56380840855391f9667f7c548873df08e132fff51a6d2653efe182637a4e",
     "deployment/ragctl.py": "3cb158cc0c22c5f12b1da261e15995f4b1df2ec2f86c079aeecf805b583c38f5"
   },
