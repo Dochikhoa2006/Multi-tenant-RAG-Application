@@ -497,7 +497,18 @@ def _http_headers(api_key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
 
 
-def verify_weaviate(config: Mapping[str, str]) -> None:
+def _validate_user_collection_presence(
+    existing: set[str], expected: set[str], *, allow_empty: bool
+) -> None:
+    present = existing & expected
+    if present == expected or (allow_empty and not present):
+        return
+    raise RagCtlError("The persisted user does not have all three collections")
+
+
+def verify_weaviate(
+    config: Mapping[str, str], *, allow_empty_user_collections: bool = False
+) -> None:
     key = config["WEAVIATE_API_KEY"]
     local = LOCAL_WEAVIATE_REST_URL
     external = config["WEAVIATE_URL"].rstrip("/")
@@ -566,8 +577,9 @@ def verify_weaviate(config: Mapping[str, str]) -> None:
                 raise RagCtlError("Pinned Weaviate client did not report ready")
             names = set(client.collections.list_all(simple=True))
             expected = user_collection_names(config["RAG_USER_ID"])
-            if not expected.issubset(names):
-                raise RagCtlError("The persisted user does not have all three collections")
+            _validate_user_collection_presence(
+                names, expected, allow_empty=allow_empty_user_collections
+            )
         except RagCtlError:
             raise
         except Exception as exc:
@@ -1035,6 +1047,7 @@ def up(
     evaluation_evidence_enabled: bool = True,
     acceptance_observer_enabled: bool = False,
     acceptance_experiment_sha256: str | None = None,
+    allow_empty_user_collections: bool = False,
 ) -> None:
     validate_config(config)
     try:
@@ -1045,7 +1058,10 @@ def up(
         print("[2/8] Starting authenticated Weaviate and HAProxy", flush=True)
         compose_up(runner)
         configure_funnels(hostname, runner)
-        verify_weaviate(config)
+        if allow_empty_user_collections:
+            verify_weaviate(config, allow_empty_user_collections=True)
+        else:
+            verify_weaviate(config)
 
         print("[3/8] Deploying and validating private Granite", flush=True)
         bearer = proxy_bearer(config)
@@ -1183,6 +1199,7 @@ def diagnose_wizard(
     fixtures_path: Path,
     *,
     reseed_corpus: bool = False,
+    bootstrap_primary_user_collections: bool = False,
 ) -> None:
     """Exercise the real Wizard API and retain its verified retrieval corpus."""
 
@@ -1200,6 +1217,11 @@ def diagnose_wizard(
     from deployment.wizard_diagnostic_api import run_wizard_phase_1c
 
     diagnostic_user_id, other_user_id = validate_diagnostic_user(config)
+    if bootstrap_primary_user_collections:
+        if reseed_corpus:
+            raise RagCtlError("Primary collection bootstrap cannot reseed corpus data")
+        if diagnostic_user_id != config["RAG_USER_ID"]:
+            raise RagCtlError("Primary collection bootstrap requires RAG_USER_ID")
     fixtures = preflight_wizard_fixtures(fixtures_path, PROJECT_ROOT, config)
     with corpus_state_lock(WIZARD_CORPUS_LOCK_PATH):
         corpus_state = load_corpus_state(
@@ -1272,6 +1294,9 @@ def diagnose_wizard(
                 config,
                 runner,
                 wizard_diagnostic_user_id=diagnostic_user_id,
+                allow_empty_user_collections=(
+                    bootstrap_primary_user_collections and corpus_state is None
+                ),
             )
         except KeyboardInterrupt:
             update_run_summary(
@@ -1327,6 +1352,9 @@ def diagnose_wizard(
                 reseed_corpus,
                 recorder,
                 progress,
+                bootstrap_isolation_user_collections=(
+                    bootstrap_primary_user_collections and corpus_state is None
+                ),
             )
         except BaseException as exc:
             phase_error = exc

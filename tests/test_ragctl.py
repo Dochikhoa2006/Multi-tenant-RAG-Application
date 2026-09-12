@@ -222,6 +222,22 @@ def test_user_collection_names_use_exact_physical_suffixes() -> None:
     }
 
 
+def test_user_collection_presence_allows_only_complete_or_authorized_empty() -> None:
+    expected = ragctl.user_collection_names("usr_abc123")
+    ordered = sorted(expected)
+
+    ragctl._validate_user_collection_presence(expected, expected, allow_empty=False)
+    ragctl._validate_user_collection_presence(set(), expected, allow_empty=True)
+
+    for existing in (set(), {ordered[0]}, set(ordered[:2])):
+        with pytest.raises(ragctl.RagCtlError, match="all three collections"):
+            ragctl._validate_user_collection_presence(
+                existing,
+                expected,
+                allow_empty=bool(existing),
+            )
+
+
 def test_runtime_secret_uses_mode_0600_temporary_file_and_removes_it() -> None:
     runner = FakeRunner()
     secret = ragctl.build_runtime_secret(
@@ -469,15 +485,93 @@ def _prepare_diagnostic_test(
 def test_diagnostic_lifecycle_is_pre_down_up_diagnostic_down(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    from deployment import wizard_diagnostic_api
+
     config, runner, events, fixtures = _prepare_diagnostic_test(
         monkeypatch, tmp_path
     )
+    isolation_bootstrap: list[bool] = []
     monkeypatch.setattr(ragctl, "down", lambda *_: events.append("down"))
     monkeypatch.setattr(ragctl, "up", lambda *_, **__: events.append("up"))
+    monkeypatch.setattr(
+        wizard_diagnostic_api,
+        "run_wizard_phase_1c",
+        lambda *_, **kwargs: (
+            isolation_bootstrap.append(
+                bool(kwargs.get("bootstrap_isolation_user_collections"))
+            ),
+            events.append("diagnostic"),
+        ),
+    )
 
     ragctl.diagnose_wizard(config, runner, fixtures)
 
     assert events == ["down", "up", "diagnostic", "down"]
+    assert isolation_bootstrap == [False]
+
+
+def test_primary_bootstrap_is_allowed_only_for_absent_corpus_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from deployment import wizard_diagnostic, wizard_diagnostic_api
+
+    config, runner, events, fixtures = _prepare_diagnostic_test(monkeypatch, tmp_path)
+    config["RAG_USER_ID"] = config["RAG_DIAGNOSTIC_USER_ID"]
+    allowances: list[bool] = []
+    isolation_bootstrap: list[bool] = []
+    monkeypatch.setattr(ragctl, "down", lambda *_: events.append("down"))
+    monkeypatch.setattr(
+        wizard_diagnostic_api,
+        "run_wizard_phase_1c",
+        lambda *_, **kwargs: isolation_bootstrap.append(
+            bool(kwargs.get("bootstrap_isolation_user_collections"))
+        ),
+    )
+
+    def startup(*_: object, **kwargs: object) -> None:
+        allowances.append(bool(kwargs.get("allow_empty_user_collections")))
+        events.append("up")
+
+    monkeypatch.setattr(ragctl, "up", startup)
+    ragctl.diagnose_wizard(
+        config, runner, fixtures, bootstrap_primary_user_collections=True
+    )
+    assert allowances == [True]
+    assert isolation_bootstrap == [True]
+
+    events.clear()
+    allowances.clear()
+    isolation_bootstrap.clear()
+    monkeypatch.setattr(wizard_diagnostic, "load_corpus_state", lambda *_: object())
+    monkeypatch.setattr(wizard_diagnostic, "validate_corpus_preflight", lambda *_args, **_kwargs: None)
+    ragctl.diagnose_wizard(
+        config, runner, fixtures, bootstrap_primary_user_collections=True
+    )
+    assert allowances == [False]
+    assert isolation_bootstrap == [False]
+
+
+def test_primary_bootstrap_rejects_reseed_or_different_diagnostic_user(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config, runner, events, fixtures = _prepare_diagnostic_test(monkeypatch, tmp_path)
+    monkeypatch.setattr(ragctl, "down", lambda *_: events.append("down"))
+
+    with pytest.raises(ragctl.RagCtlError, match="requires RAG_USER_ID"):
+        ragctl.diagnose_wizard(
+            config, runner, fixtures, bootstrap_primary_user_collections=True
+        )
+
+    config["RAG_USER_ID"] = config["RAG_DIAGNOSTIC_USER_ID"]
+    with pytest.raises(ragctl.RagCtlError, match="cannot reseed"):
+        ragctl.diagnose_wizard(
+            config,
+            runner,
+            fixtures,
+            reseed_corpus=True,
+            bootstrap_primary_user_collections=True,
+        )
+    assert events == []
 
 
 def test_diagnostic_pre_down_failure_stops_before_startup(

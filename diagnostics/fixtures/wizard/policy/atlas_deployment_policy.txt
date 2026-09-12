@@ -1,0 +1,17 @@
+Atlas Production Deployment Policy
+
+Production deployments must have a rollback plan before release.
+
+The rollback checklist must identify the previous stable release and confirm
+that a usable backup exists.
+
+If a deployment causes a critical service failure, the operations team must
+stop further rollout and evaluate whether rollback is required.
+
+Rollback of a critical production deployment requires manager approval.
+
+After rollback, the operations team must verify service health and document the
+incident outcome.
+
+A failed production change must not be silently retried without reviewing the
+cause of the failure.

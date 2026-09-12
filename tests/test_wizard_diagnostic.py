@@ -91,6 +91,93 @@ def _complete_state(fixtures_path: Path, project_root: Path, run_id: str = "run-
     return promote_replacement(state), fixtures
 
 
+class _IsolationPhysical:
+    def __init__(self, items: list[object] | None = None) -> None:
+        self.items = items or []
+        self.iterator_calls: list[dict[str, object]] = []
+
+    def iterator(self, **kwargs: object):
+        self.iterator_calls.append(kwargs)
+        return iter(self.items)
+
+
+class _IsolationCollections:
+    def __init__(self, present: set[str], physical: dict[str, _IsolationPhysical]):
+        self.present = present
+        self.physical = physical
+
+    def exists(self, name: str) -> bool:
+        return name in self.present
+
+    def use(self, name: str) -> _IsolationPhysical:
+        return self.physical[name]
+
+
+class _IsolationManager:
+    def __init__(self, user_id: str, present_count: int) -> None:
+        self.user_id = user_id
+        self.names = tuple(
+            wizard_diagnostic_api.get_collection_name(user_id, collection_type)
+            for collection_type in ("conversations", "knowledge_facts", "policy")
+        )
+        self.physical = {name: _IsolationPhysical() for name in self.names}
+        self.collections = _IsolationCollections(
+            set(self.names[:present_count]), self.physical
+        )
+        self.client = type("Client", (), {"collections": self.collections})()
+        self.ensure_calls: list[str] = []
+
+    def ensure_user_collections(self, user_id: str) -> None:
+        self.ensure_calls.append(user_id)
+        self.collections.present.update(self.names)
+
+
+def _isolation_storage(manager: _IsolationManager):
+    storage = wizard_diagnostic_api.CorpusStorage({}, "primary")
+    storage.manager = manager
+    return storage
+
+
+@pytest.mark.parametrize("present_count", [0, 3])
+def test_isolation_bootstrap_creates_or_reuses_three_empty_collections(
+    present_count: int,
+) -> None:
+    user_id = "primary_other"
+    manager = _IsolationManager(user_id, present_count)
+
+    _isolation_storage(manager).ensure_empty_user_collections(user_id)
+
+    assert manager.collections.present == set(manager.names)
+    assert manager.ensure_calls == [user_id]
+    assert all(
+        physical.iterator_calls
+        == [{"include_vector": False, "return_properties": []}]
+        for physical in manager.physical.values()
+    )
+
+
+@pytest.mark.parametrize("present_count", [1, 2])
+def test_isolation_bootstrap_rejects_partial_collection_state(
+    present_count: int,
+) -> None:
+    user_id = "primary_other"
+    manager = _IsolationManager(user_id, present_count)
+
+    with pytest.raises(WizardDiagnosticError, match="zero or all three"):
+        _isolation_storage(manager).ensure_empty_user_collections(user_id)
+
+    assert manager.ensure_calls == []
+
+
+def test_isolation_bootstrap_rejects_unexpected_existing_data() -> None:
+    user_id = "primary_other"
+    manager = _IsolationManager(user_id, 3)
+    manager.physical[manager.names[1]].items.append(object())
+
+    with pytest.raises(WizardDiagnosticError, match="unexpected data"):
+        _isolation_storage(manager).ensure_empty_user_collections(user_id)
+
+
 def test_parser_accepts_reseed_and_preserves_existing_commands() -> None:
     cli = ragctl.parser()
 

@@ -1272,6 +1272,40 @@ class CorpusStorage:
     def validate_membership(self, state: CorpusState | None) -> None:
         validate_physical_membership(state, self.inventories())
 
+    def ensure_empty_user_collections(self, user_id: str) -> None:
+        """Create or validate exactly three empty isolation-user collections."""
+
+        collections = self.manager.client.collections
+        names = tuple(
+            get_collection_name(user_id, collection_type)
+            for collection_type in ("conversations", "knowledge_facts", "policy")
+        )
+        existing = {name for name in names if collections.exists(name)}
+        if existing and len(existing) != len(names):
+            raise WizardDiagnosticError(
+                "Isolation user does not have zero or all three collections"
+            )
+
+        self.manager.ensure_user_collections(user_id)
+        if not all(collections.exists(name) for name in names):
+            raise WizardDiagnosticError(
+                "Isolation user collection creation did not complete"
+            )
+        for name in names:
+            physical = collections.use(name)
+            if next(
+                iter(
+                    physical.iterator(
+                        include_vector=False,
+                        return_properties=[],
+                    )
+                ),
+                None,
+            ) is not None:
+                raise WizardDiagnosticError(
+                    "Isolation user collections contain unexpected data"
+                )
+
     def delete_document(self, document: CorpusDocument) -> int:
         report = self._collection(
             self.diagnostic_user_id, document.collection
@@ -2513,6 +2547,8 @@ def run_wizard_phase_1c(
     reseed: bool,
     recorder: OperationRecorder,
     progress: dict[str, str],
+    *,
+    bootstrap_isolation_user_collections: bool = False,
 ) -> str:
     api = WizardApi(
         runtime_url,
@@ -2529,6 +2565,8 @@ def run_wizard_phase_1c(
         with CorpusStorage(config, diagnostic_user_id) as storage:
             # Unknown persistent objects fail before scratch or any deletion.
             storage.validate_membership(state)
+            if bootstrap_isolation_user_collections:
+                storage.ensure_empty_user_collections(other_user_id)
             run_scratch_diagnostic(
                 api,
                 storage,

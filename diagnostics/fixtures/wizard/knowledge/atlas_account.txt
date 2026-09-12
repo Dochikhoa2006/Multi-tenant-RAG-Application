@@ -1,0 +1,19 @@
+Atlas Account and Service Information
+
+To create an Atlas account, a customer provides a name, email address, and
+organization name.
+
+Identity verification may require an identity document when additional account
+verification is requested.
+
+Normal verification takes up to two business days after all required documents
+are received.
+
+Customers can review active and resolved support tickets in the customer
+portal.
+
+Priority incidents are handled before ordinary support requests.
+
+The support assistant can answer common questions automatically, but cases
+requiring authorization or manual investigation are escalated to a human
+support specialist.
