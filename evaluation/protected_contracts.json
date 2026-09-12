@@ -60,7 +60,7 @@
     "deployment/evaluation_bridge.py": "1632878f35f8e332dac9ba2a88fb362a27b0b558c3bf2c90d2124624caec6a20",
     "deployment/evaluation_bridge_worker.py": "fdbdda154394697ede0a80160ab727c41de89864be04dea6d29172f1008bcff7",
     "deployment/modal_runtime.py": "780704f3e25d62e9fef7ebf079a7d31226c51d3193892c145a804e2090658a99",
-    "deployment/ragctl.py": "8b4fec6eae3646aec5f8121e99ec261a2b1b8a9b3a04569d85765dd515e10a9b"
+    "deployment/ragctl.py": "bdd6b7b613069c4e4a369a93ad46a09aa0c63221b5134ba97c0c430a72d0ee48"
   },
   "contracts": {
     "telemetry_schema_version": "1.0",

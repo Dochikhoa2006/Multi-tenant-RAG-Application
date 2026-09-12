@@ -1733,6 +1733,15 @@ def validate_chat_result(
     return answer, timings
 
 
+def _best_effort_private_json(
+    writer: Callable[..., object], path: Path, value: Mapping[str, object]
+) -> None:
+    try:
+        writer(path, value)
+    except Exception:
+        pass
+
+
 def ask(
     config: Mapping[str, str],
     question: str | None,
@@ -1874,7 +1883,8 @@ def ask(
                         ("digests", trace_digests, ("granite_rewritten_query_sha256", "qwen_knowledge_context_sha256", "qwen_policy_context_sha256")),
                         ("samples", trace_samples, ("qwen_knowledge_used_ids", "qwen_knowledge_used_item_fingerprints", "qwen_policy_used_ids", "qwen_policy_used_item_fingerprints")),
                     )
-                    write_private_json(
+                    _best_effort_private_json(
+                        write_private_json,
                         ASK_DIAGNOSTICS_PATH / run_id / "evidence.json",
                         {
                             "schema_version": "1.0",

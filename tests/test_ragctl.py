@@ -1297,6 +1297,8 @@ def test_concurrent_asks_overlap_inference_and_each_attempts_bounded_evaluation(
             )
 
     class Trace:
+        deletions = 0
+
         def __init__(
             self, _client: object, _url: str, _user: str, _run: str
         ) -> None:
@@ -1320,6 +1322,7 @@ def test_concurrent_asks_overlap_inference_and_each_attempts_bounded_evaluation(
 
         def delete(self) -> None:
             self.started = False
+            type(self).deletions += 1
 
     def submit(**_kwargs: object) -> object:
         nonlocal evaluation_submissions
@@ -1349,6 +1352,17 @@ def test_concurrent_asks_overlap_inference_and_each_attempts_bounded_evaluation(
     monkeypatch.setattr(
         evaluation_bridge, "parse_request_evidence", lambda *_args, **_kwargs: object()
     )
+    original_write = evaluation_bridge.write_private_json
+    failed_evidence_write = False
+
+    def fail_one_evidence_write(path: Path, value: object) -> str:
+        nonlocal failed_evidence_write
+        if path.name == "evidence.json" and not failed_evidence_write:
+            failed_evidence_write = True
+            raise OSError("synthetic evidence artifact failure")
+        return original_write(path, value)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(evaluation_bridge, "write_private_json", fail_one_evidence_write)
     monkeypatch.setattr(evaluation_bridge, "submit_local_evaluation", submit)
     monkeypatch.setattr(evaluation_bridge, "finish_evaluation_job", finish)
 
@@ -1363,9 +1377,11 @@ def test_concurrent_asks_overlap_inference_and_each_attempts_bounded_evaluation(
     assert maximum_active_streams == request_count
     assert evaluation_submissions == request_count
     assert maximum_active_evaluations == 1
+    assert Trace.deletions == request_count
     assert len(list((tmp_path / "ask").glob("*/status.json"))) == request_count
     evidence_files = list((tmp_path / "ask").glob("*/evidence.json"))
-    assert len(evidence_files) == request_count
+    assert failed_evidence_write is True
+    assert len(evidence_files) == request_count - 1
     for path in evidence_files:
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
         rendered = path.read_text(encoding="utf-8")
