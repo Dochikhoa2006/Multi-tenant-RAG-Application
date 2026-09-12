@@ -9,14 +9,19 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import importlib.metadata
 import inspect
+import json
 import math
 import os
 from pathlib import Path
+import stat
+from time import monotonic
 from typing import Any, Literal, Protocol
 from urllib.parse import urlparse
+from uuid import UUID
 
 from .models import EvaluationRecord
 
@@ -32,6 +37,72 @@ EXPECTED_EMBEDDING_DIMENSION = 384
 PRODUCTION_MODEL_IDS = frozenset(
     {"qwen3-4b-awq", "merged-granite-4.1-3b-query-rewrite"}
 )
+
+
+def _judge_activity_hooks(
+    judge: Mapping[str, Any],
+) -> tuple[Mapping[str, list[Any]] | None, int | None]:
+    values = {
+        "path": os.environ.get("RAG_EVAL_ACTIVITY_PATH"),
+        "job_id": os.environ.get("RAG_EVAL_JOB_ID"),
+        "request_id": os.environ.get("RAG_EVAL_REQUEST_ID"),
+        "record_sha256": os.environ.get("RAG_EVAL_RECORD_SHA256"),
+    }
+    if all(value is None for value in values.values()):
+        return None, None
+    try:
+        if any(not isinstance(value, str) or not value for value in values.values()):
+            raise ValueError
+        for name in ("job_id", "request_id"):
+            if str(UUID(str(values[name]))) != values[name]:
+                raise ValueError
+        digest = str(values["record_sha256"])
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise ValueError
+        path = Path(str(values["path"]))
+        flags = os.O_WRONLY | os.O_APPEND
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            os.close(descriptor)
+            raise ValueError
+    except (OSError, ValueError) as exc:
+        raise EvaluationSetupError("acceptance activity capture is invalid") from exc
+
+    sequence = 0
+
+    def write(event: str, request_sequence: int, success: bool | None) -> None:
+        payload = {
+            "schema_version": "1.0",
+            "event": event,
+            "evaluation_job_id": values["job_id"],
+            "request_id": values["request_id"],
+            "record_sha256": values["record_sha256"],
+            "sequence": request_sequence,
+            "judge_id": judge["model"],
+            "judge_digest": judge["model_digest"],
+            "monotonic": monotonic(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "success": success,
+        }
+        os.write(
+            descriptor,
+            (json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n").encode(),
+        )
+
+    async def request_hook(request: Any) -> None:
+        nonlocal sequence
+        sequence += 1
+        request.extensions["rag_evaluation_sequence"] = sequence
+        write("start", sequence, None)
+
+    async def response_hook(response: Any) -> None:
+        request_sequence = response.request.extensions.get("rag_evaluation_sequence")
+        if isinstance(request_sequence, int):
+            write("end", request_sequence, 200 <= response.status_code < 300)
+
+    return {"request": [request_hook], "response": [response_hook]}, descriptor
 
 
 class EvaluationSetupError(RuntimeError):
@@ -303,6 +374,7 @@ class RagasMetricBackend:
         ragas_version: str,
         judge_metadata: Mapping[str, Any],
         embedding_metadata: Mapping[str, Any],
+        activity_descriptor: int | None = None,
     ) -> None:
         self._client = client
         self._metrics = dict(metrics)
@@ -310,6 +382,7 @@ class RagasMetricBackend:
         self.ragas_version = ragas_version
         self.judge_metadata = dict(judge_metadata)
         self.embedding_metadata = dict(embedding_metadata)
+        self._activity_descriptor = activity_descriptor
 
     @classmethod
     async def create(cls, settings: EvaluationSettings) -> "RagasMetricBackend":
@@ -322,7 +395,9 @@ class RagasMetricBackend:
         config_digest = _model_configuration_digest(model_path)
 
         client: Any | None = None
+        activity_descriptor: int | None = None
         try:
+            activity_hooks, activity_descriptor = _judge_activity_hooks(judge_metadata)
             import httpx
             from openai import AsyncOpenAI
             from ragas.embeddings import HuggingFaceEmbeddings
@@ -342,7 +417,10 @@ class RagasMetricBackend:
                 base_url=settings.openai_base_url,
                 max_retries=0,
                 timeout=settings.request_timeout_seconds,
-                http_client=httpx.AsyncClient(trust_env=False),
+                http_client=httpx.AsyncClient(
+                    trust_env=False,
+                    event_hooks={} if activity_hooks is None else activity_hooks,
+                ),
             )
             llm = llm_factory(
                 settings.judge_model,
@@ -387,6 +465,7 @@ class RagasMetricBackend:
                 ragas_version=ragas_version,
                 judge_metadata=judge_metadata,
                 embedding_metadata=embedding_metadata,
+                activity_descriptor=activity_descriptor,
             )
         except EvaluationSetupError:
             if client is not None:
@@ -394,6 +473,8 @@ class RagasMetricBackend:
                     await client.close()
                 except Exception:
                     pass
+            if activity_descriptor is not None:
+                os.close(activity_descriptor)
             raise
         except Exception as exc:
             if client is not None:
@@ -401,6 +482,8 @@ class RagasMetricBackend:
                     await client.close()
                 except Exception:
                     pass
+            if activity_descriptor is not None:
+                os.close(activity_descriptor)
             raise EvaluationSetupError("local Ragas runtime initialization failed") from exc
 
     async def score(self, plan: MetricPlan, record: EvaluationRecord) -> float:
@@ -452,7 +535,12 @@ class RagasMetricBackend:
         return float(result.value)
 
     async def close(self) -> None:
-        await self._client.close()
+        try:
+            await self._client.close()
+        finally:
+            if self._activity_descriptor is not None:
+                os.close(self._activity_descriptor)
+                self._activity_descriptor = None
 
     async def smoke_embedding(self) -> int:
         vector = await asyncio.to_thread(

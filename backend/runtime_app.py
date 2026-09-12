@@ -21,7 +21,7 @@ from backend.config import (
     RAG_EVALUATION_USER_ID,
     WIZARD_DIAGNOSTICS_ENABLED,
 )
-from backend.model_config import TEXT_PROCESSING
+from backend.model_config import EMBEDDING_MODEL, RERANKER_MODEL, TEXT_PROCESSING
 from backend.processing.chunker import _get_tokenizer as _get_chunk_tokenizer
 from backend.processing.paragraph_splitter import (
     _get_sentence_transformer,
@@ -241,9 +241,26 @@ def create_runtime_app(
         raise
 
     application: FastAPI
+    startup_user_id = (
+        RAG_DIAGNOSTIC_USER_ID
+        if WIZARD_DIAGNOSTICS_ENABLED
+        else RAG_EVALUATION_USER_ID if RAG_EVALUATION_EVIDENCE_ENABLED else None
+    )
 
     async def startup() -> None:
         await asyncio.to_thread(processing_warmup)
+        await asyncio.to_thread(
+            embedding.embed, "GTE startup warmup", model=EMBEDDING_MODEL
+        )
+        await asyncio.to_thread(
+            reranker.rerank,
+            "BGE startup warmup",
+            ["BGE startup warmup"],
+            model=RERANKER_MODEL,
+            top_n=1,
+        )
+        if startup_user_id is not None:
+            await asyncio.to_thread(manager.ensure_user_collections, startup_user_id)
         await asyncio.gather(
             asyncio.to_thread(
                 model_endpoint_validator,

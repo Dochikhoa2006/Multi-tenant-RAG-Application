@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+import hashlib
 import json
 import math
 import os
@@ -847,15 +848,19 @@ def deploy_runtime(
     runner: CommandRunner,
     *,
     wizard_diagnostic_user_id: str | None = None,
+    evaluation_evidence_enabled: bool = True,
 ) -> str:
     evaluation_user_id = (
         config.get("RAG_USER_ID", DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
     )
     overrides = {
         "WIZARD_DIAGNOSTICS_ENABLED": "false",
-        "RAG_EVALUATION_EVIDENCE_ENABLED": "true",
-        "RAG_EVALUATION_USER_ID": evaluation_user_id,
+        "RAG_EVALUATION_EVIDENCE_ENABLED": (
+            "true" if evaluation_evidence_enabled else "false"
+        ),
     }
+    if evaluation_evidence_enabled:
+        overrides["RAG_EVALUATION_USER_ID"] = evaluation_user_id
     if wizard_diagnostic_user_id is not None:
         overrides = {
             "WIZARD_DIAGNOSTICS_ENABLED": "true",
@@ -1011,6 +1016,7 @@ def up(
     runner: CommandRunner,
     *,
     wizard_diagnostic_user_id: str | None = None,
+    evaluation_evidence_enabled: bool = True,
 ) -> None:
     validate_config(config)
     try:
@@ -1042,7 +1048,13 @@ def up(
         print("[6/8] Deploying the singleton CUDA runtime", flush=True)
         runtime_gpu = gpu_request(config, "MODAL_RAG_GPU")
         if wizard_diagnostic_user_id is None:
-            runtime_url = deploy_runtime(config, runner)
+            runtime_url = (
+                deploy_runtime(config, runner)
+                if evaluation_evidence_enabled
+                else deploy_runtime(
+                    config, runner, evaluation_evidence_enabled=False
+                )
+            )
         else:
             runtime_url = deploy_runtime(
                 config,
@@ -1671,7 +1683,8 @@ def ask(
     question: str | None,
     *,
     verify_atlas_grounding: bool = False,
-) -> None:
+    acceptance_activity_path: Path | None = None,
+) -> Mapping[str, object]:
     from deployment.e2e_diagnostic import utc_timestamp
     from deployment.e2e_diagnostic_api import _DeepTraceSession
     from deployment.evaluation_bridge import (
@@ -1697,6 +1710,9 @@ def ask(
     trace_operation: Mapping[str, Any] | None = None
     trace: _DeepTraceSession | None = None
     response_request_id: str | None = None
+    done_received_monotonic: float | None = None
+    done_validated_monotonic: float | None = None
+    request_started_monotonic: float | None = None
     with httpx.Client(headers=headers, timeout=timeout) as client:
         health = client.get(f"{runtime_url}/health")
         if health.status_code != 200:
@@ -1740,6 +1756,7 @@ def ask(
                         "X-Wizard-Diagnostic-Operation-ID": trace_operation_id,
                     }
                 )
+            request_started_monotonic = time.monotonic()
             with client.stream(
                 "POST",
                 f"{runtime_url}/api/chat/query",
@@ -1772,6 +1789,7 @@ def ask(
                         if done_payload is not None or not isinstance(payload, Mapping):
                             raise RagCtlError("RAG stream returned an invalid done event")
                         done_payload = payload
+                        done_received_monotonic = time.monotonic()
                     else:
                         raise RagCtlError(
                             f"RAG stream returned unexpected event {event_name!r}"
@@ -1784,6 +1802,7 @@ def ask(
                 done_payload,
                 verify_atlas_grounding=verify_atlas_grounding,
             )
+            done_validated_monotonic = time.monotonic()
             if trace is not None:
                 try:
                     _, trace_operation, _ = trace.wait_operation(trace_operation_id)
@@ -1803,6 +1822,8 @@ def ask(
             raise
 
     summary = {name: timings[name] for name in CHAT_TIMING_KEYS}
+    request_id = done_payload.get("request_id")
+    conversation_id = done_payload.get("conversation_id")
     print("Telemetry (ms): " + json.dumps(summary, sort_keys=True))
     print("Done: " + json.dumps(dict(done_payload), sort_keys=True))
     print(f"SSE verified: {events.count('token')} token event(s) -> telemetry -> done")
@@ -1815,8 +1836,6 @@ def ask(
             )
         if not isinstance(telemetry, Mapping) or not isinstance(done_payload, Mapping):
             raise EvaluationBridgeError("public response evidence is unavailable")
-        request_id = done_payload.get("request_id")
-        conversation_id = done_payload.get("conversation_id")
         if request_id != response_request_id or telemetry.get("request_id") != request_id:
             raise EvaluationBridgeError("public request correlation is invalid")
         evidence = parse_request_evidence(
@@ -1841,6 +1860,7 @@ def ask(
             directory=ASK_DIAGNOSTICS_PATH / run_id,
             stem="evaluation",
             exact_names=True,
+            acceptance_activity_path=acceptance_activity_path,
         )
         try:
             evaluation = finish_evaluation_job(evaluation_job)
@@ -1888,6 +1908,30 @@ def ask(
         f"status_artifact={status_artifact_path}",
         flush=True,
     )
+    return {
+        "status": "succeeded",
+        "answer_complete": True,
+        "question": question_text,
+        "answer": answer,
+        "answer_sha256": hashlib.sha256(answer.encode("utf-8")).hexdigest(),
+        "session_id": session_id,
+        "request_id": request_id,
+        "conversation_id": conversation_id,
+        "telemetry": dict(telemetry),
+        "timings_ms": summary,
+        "sse_events": list(events),
+        "trace_session_id": None if trace is None else trace.session_id,
+        "operation_id": trace_operation_id if trace_operation is not None else None,
+        "evaluation_evidence": (
+            None
+            if trace_operation is None or trace is None
+            else {"session_id": trace.session_id, "operation": dict(trace_operation)}
+        ),
+        "done_received_monotonic": done_received_monotonic,
+        "done_validated_monotonic": done_validated_monotonic,
+        "request_started_monotonic": request_started_monotonic,
+        "evaluation": evaluation_artifact,
+    }
 
 
 def status(config: Mapping[str, str], runner: CommandRunner) -> None:

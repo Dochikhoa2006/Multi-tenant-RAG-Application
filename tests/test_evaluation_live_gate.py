@@ -12,11 +12,17 @@ def _schedule():
     rows = []
     for block, mode in enumerate(("off", "on", "on", "off")):
         for index in range(18):
-            pair = (index - 3) + (15 if block >= 2 else 0)
+            pair = index - 3
+            question = f"question-{pair}"
             rows.append({
                 "block_sequence": block, "block_request_index": index,
                 "runtime_instance_id": f"runtime-{block}", "warmup": index < 3,
-                "mode": mode, "pair_key": str(pair), "question": f"question-{pair}",
+                "runtime_worker_id": f"worker-{block}",
+                "evaluation_evidence_enabled": mode == "on",
+                "mode": mode, "pair_key": f"{block // 2}-{pair}", "question": question,
+                "query_identity": gate._canonical_digest(question),
+                "query_source_index": max(pair, 0),
+                "query_schedule_index": max(pair, 0), "query_repetition": 0,
                 "request_id": str(uuid4()),
                 "protected_contract_sha256": gate._digest(gate.MANIFEST_PATH),
                 "configuration_sha256": "a" * 64, "corpus_sha256": "b" * 64,
@@ -60,13 +66,25 @@ def test_contention_baseline_is_uncontended_and_other_judge_must_be_verified(mon
     monkeypatch.setattr(gate, "_validate_live_sample", lambda row, *, evaluation: checked.append(row["request_id"]))
     baseline = _schedule()[0]
     baseline["mode"] = "uncontended"
+    baseline["evaluation_evidence_enabled"] = True
     contended = deepcopy(baseline)
+    donor_id = str(uuid4())
+    job_id = str(uuid4())
     contended.update({
         "mode": "contended", "request_id": str(uuid4()),
-        "judge_activity_source": "ollama_http", "judge_started_monotonic": 1.0,
-        "request_started_monotonic": 2.0, "judge_finished_monotonic": 3.0,
+        "judge_activity_source": "ollama_http",
+        "judge_activity": {
+            "evaluation_job_id": job_id, "request_id": donor_id,
+            "record_sha256": "d" * 64, "sequence": 1, "judge_id": "local",
+            "started_monotonic": 1.0, "finished_monotonic": 3.0,
+            "success": True,
+        },
+        "request_started_monotonic": 2.0,
         "request_done_monotonic": 4.0,
-        "overlapping_evaluation_request": {"request_id": str(uuid4())},
+        "overlapping_evaluation_request": {
+            "request_id": donor_id,
+            "evaluation": {"evaluation_job_id": job_id, "record_sha256": "d" * 64},
+        },
     })
     assert gate.validate_latency_schedule([baseline, contended], contention=True)
     assert len(checked) == 3  # baseline, actual overlapping job, measured request
@@ -80,5 +98,8 @@ def test_exact_five_percent_upper_bound_does_not_pass():
     for index in range(30):
         for mode, value in (("off", 100.0), ("on", 105.0)):
             rows.append({"pair_key": str(index), "mode": mode,
+                         "question": f"q-{index}", "query_identity": "a" * 64,
+                         "query_source_index": index, "query_schedule_index": index,
+                         "query_repetition": 0,
                          "timings_ms": {name: value for name in gate.LATENCY_METRICS}})
     assert gate.paired_latency_gate(rows)["status"] == "failed"

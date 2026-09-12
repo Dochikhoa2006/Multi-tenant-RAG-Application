@@ -3,6 +3,7 @@
   "behavioral_baseline_commit": "fba3c3481d5dc438b6081ab85afcbaa99dbc2987",
   "approved_integration_commit": "d37c82710a8bd166af4c68f5f57d1068a7cdc880",
   "approved_evidence_hook_files": {
+    "backend/api/tasks.py": "hidden authenticated read-only post-generation acceptance observation",
     "backend/api/wizard_diagnostics.py": "three authenticated hidden trace endpoints only",
     "backend/config.py": "default-off diagnostic and evaluation-evidence configuration",
     "backend/providers/sglang_query_rewriter.py": "copy the already accepted Granite rewrite into bounded evidence",
@@ -16,6 +17,7 @@
     "deployment/ragctl.py": "ordinary ask and diagnostic local orchestration"
   },
   "behavioral_baseline_files": {
+    "backend/api/tasks.py": "263f5532c37ba1078a8002326e59b84d9401a5764a0d69080564d4c9065efe20",
     "backend/api/wizard_diagnostics.py": "4db1ec576c6df4d721010a34f4d63c510a393fd39bb56e5ce3f24bcf11053290",
     "backend/config.py": "00e7a1e45fd6dd603b24968dde6fe60f2477948b3f242c4977837d04f3bc0ab2",
     "backend/providers/sglang_query_rewriter.py": "2812434376c6ae50d6147f28a97573b5421c1c4138692012939b99c1b7ac02b0",
@@ -28,6 +30,7 @@
     "deployment/ragctl.py": "979286038e58d84acd19b4411f5aa7e832a5a03edf1c73ecf8035f8d1f16786f"
   },
   "files": {
+    "backend/api/tasks.py": "0f3f10da9fe35d45360b1831b9008a56a57db2d3e3e843fac66072c27f3d8db1",
     "backend/api/wizard_diagnostics.py": "062d447e1b4df74ee02c29bcf708c6845791007f589166d395a4a3e2e8729221",
     "backend/api/chat.py": "daac2821e9e4f43a85d346df6e43aea960d4826cca535e470388386e4ef6a3d4",
     "backend/api/models.py": "23a22c5668fbd6abf0c6f5527b118c8abecaa3f2f56c3a78660175c1685e326a",
@@ -54,10 +57,10 @@
     "deployment/compose.weaviate-secure.yaml": "ccf42512ed9bd6cb7e237da67b33e1f5166fa7661154739a43384f48ef4402f7",
     "deployment/e2e_diagnostic.py": "e4157b0a30e815c9a0fea24139bde6344caa681c09edd7ca6488f72319136d14",
     "deployment/e2e_diagnostic_api.py": "ab93a0240d14c0c6a67d1b7fbf684f14a0453186a3b09a12bfa3e895749af4e2",
-    "deployment/evaluation_bridge.py": "b637c8763bf3eef22d5610d96016edee60ee05fc49f2de2e648b226c9ff3f36c",
+    "deployment/evaluation_bridge.py": "b21b9f3bfb702b7b1f984896e5c587e0713d06ef6aab755ea9df631ad323aba0",
     "deployment/evaluation_bridge_worker.py": "fdbdda154394697ede0a80160ab727c41de89864be04dea6d29172f1008bcff7",
     "deployment/modal_runtime.py": "c72c56380840855391f9667f7c548873df08e132fff51a6d2653efe182637a4e",
-    "deployment/ragctl.py": "3cb158cc0c22c5f12b1da261e15995f4b1df2ec2f86c079aeecf805b583c38f5"
+    "deployment/ragctl.py": "d70151c6ce80df85d79c0f432f7de4b31f66784723aaec70fd8350bd5c0dcc89"
   },
   "contracts": {
     "telemetry_schema_version": "1.0",

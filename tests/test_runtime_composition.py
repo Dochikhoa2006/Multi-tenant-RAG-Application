@@ -8,6 +8,7 @@ import pytest
 
 from backend.main import create_app
 from backend import runtime_app as runtime_app_module
+from backend.model_config import EMBEDDING_MODEL, RERANKER_MODEL
 from backend.providers.granite_query_rewriter import RoleRoutingLLMClient
 from backend.runtime_app import RuntimeDependencyError, create_runtime_app
 from backend.services import AppServices
@@ -18,6 +19,7 @@ class RecordingManager:
         self.events = events
         self.connect_error = connect_error
         self.client = SimpleNamespace()
+        self.collection_users: list[str] = []
 
     def connect(self) -> object:
         self.events.append("manager.connect")
@@ -27,6 +29,9 @@ class RecordingManager:
 
     def disconnect(self) -> None:
         self.events.append("manager.disconnect")
+
+    def ensure_user_collections(self, user_id: str) -> None:
+        self.collection_users.append(user_id)
 
 
 class RecordingQueue:
@@ -43,8 +48,10 @@ class RecordingQueue:
 class RecordingEmbedding:
     def __init__(self, events: list[str]) -> None:
         self.events = events
+        self.embed_calls: list[tuple[str, str]] = []
 
     def embed(self, text: str, *, model: str) -> Sequence[float]:
+        self.embed_calls.append((text, model))
         return [1.0]
 
     def embed_many(self, texts: Sequence[str], *, model: str) -> Sequence[Sequence[float]]:
@@ -57,8 +64,17 @@ class RecordingEmbedding:
 class RecordingReranker:
     def __init__(self, events: list[str]) -> None:
         self.events = events
+        self.rerank_calls: list[tuple[str, tuple[str, ...], str, int]] = []
 
-    def rerank(self, *args: object, **kwargs: object) -> list[object]:
+    def rerank(
+        self,
+        query: str,
+        documents: Sequence[str],
+        *,
+        model: str,
+        top_n: int,
+    ) -> list[object]:
+        self.rerank_calls.append((query, tuple(documents), model, top_n))
         return []
 
     def close(self) -> None:
@@ -241,6 +257,17 @@ def test_runtime_composes_singletons_and_closes_owned_resources_in_order() -> No
         assert client.get("/health").json() == {"status": "ok"}
         assert app.state.runtime_ready is True
         assert len(validations) == 2
+        assert created["embedding"].embed_calls == [  # type: ignore[union-attr]
+            ("GTE startup warmup", EMBEDDING_MODEL)
+        ]
+        assert created["reranker"].rerank_calls == [  # type: ignore[union-attr]
+            (
+                "BGE startup warmup",
+                ("BGE startup warmup",),
+                RERANKER_MODEL,
+                1,
+            )
+        ]
 
     assert app.state.runtime_ready is False
     assert events == [
@@ -290,10 +317,14 @@ def test_runtime_mounts_diagnostic_routes_only_when_explicitly_enabled(
     monkeypatch.setattr(
         runtime_app_module, "RAG_DIAGNOSTIC_USER_ID", "wizard_diagnostic"
     )
-    diagnostic, _, _ = _application([])
+    diagnostic, created, _ = _application([])
     try:
         assert paths(diagnostic).count(hidden_path) == 3
         assert hidden_path not in diagnostic.openapi()["paths"]
+        with TestClient(diagnostic):
+            assert created["manager"].collection_users == [  # type: ignore[union-attr]
+                "wizard_diagnostic"
+            ]
     finally:
         uninstall_registry(diagnostic.state.wizard_diagnostic_registry)
 
@@ -306,7 +337,7 @@ def test_runtime_mounts_metadata_only_evidence_for_configured_user(
     monkeypatch.setattr(runtime_app_module, "WIZARD_DIAGNOSTICS_ENABLED", False)
     monkeypatch.setattr(runtime_app_module, "RAG_EVALUATION_EVIDENCE_ENABLED", True)
     monkeypatch.setattr(runtime_app_module, "RAG_EVALUATION_USER_ID", "evaluation_user")
-    application, _, _ = _application([])
+    application, created, _ = _application([])
     try:
         registry = application.state.wizard_diagnostic_registry
         assert registry.configured_user_id == "evaluation_user"
@@ -326,6 +357,45 @@ def test_runtime_mounts_metadata_only_evidence_for_configured_user(
 
         visit(application.routes)
         assert paths.count("/api/_diagnostics/wizard/trace") == 3
+        with TestClient(application):
+            assert created["manager"].collection_users == [  # type: ignore[union-attr]
+                "evaluation_user"
+            ]
+    finally:
+        uninstall_registry(application.state.wizard_diagnostic_registry)
+
+
+@pytest.mark.parametrize(
+    ("resource_name", "method_name"),
+    (
+        ("embedding", "embed"),
+        ("reranker", "rerank"),
+        ("manager", "ensure_user_collections"),
+    ),
+)
+def test_request_critical_warmup_failure_prevents_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+    resource_name: str,
+    method_name: str,
+) -> None:
+    from backend.wizard.diagnostics import uninstall_registry
+
+    monkeypatch.setattr(runtime_app_module, "WIZARD_DIAGNOSTICS_ENABLED", False)
+    monkeypatch.setattr(runtime_app_module, "RAG_EVALUATION_EVIDENCE_ENABLED", True)
+    monkeypatch.setattr(runtime_app_module, "RAG_EVALUATION_USER_ID", "evaluation_user")
+    events: list[str] = []
+    application, created, _ = _application(events, validator=lambda *args: None)
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise RuntimeError(f"{resource_name} warmup failed")
+
+    setattr(created[resource_name], method_name, fail)
+    try:
+        with pytest.raises(RuntimeError, match=f"{resource_name} warmup failed"):
+            with TestClient(application):
+                pass
+        assert application.state.runtime_ready is False
+        assert events[-1] == "manager.disconnect"
     finally:
         uninstall_registry(application.state.wizard_diagnostic_registry)
 

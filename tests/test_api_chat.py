@@ -321,6 +321,78 @@ def _wait_for_task(client: TestClient, task_id: str) -> dict[str, object]:
     raise AssertionError("background task did not finish")
 
 
+def test_hidden_post_generation_acceptance_is_read_only_and_correlated() -> None:
+    services, *_ = _services()
+    app = create_app(services)
+    with TestClient(app) as client:
+        session_id = client.post(
+            "/api/chat/sessions", json={"user_id": USER_ID}
+        ).json()["session_id"]
+        response = client.post(
+            "/api/chat/query",
+            json={
+                "user_id": USER_ID,
+                "session_id": session_id,
+                "question": "acceptance correlation",
+            },
+        )
+        events = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        conversation_id = events[-1]["conversation_id"]
+        proof = client.get(
+            "/api/tasks/_acceptance/post-generation",
+            params={
+                "user_id": USER_ID,
+                "session_id": session_id,
+                "conversation_id": conversation_id,
+            },
+        )
+        assert proof.status_code == 200
+        payload = proof.json()
+        for item in payload["tasks"]:
+            _wait_for_task(client, item["task_id"])
+        before = {
+            key: record.snapshot()
+            for key, record in services.task_queue._records.items()
+        }
+        proof = client.get(
+            "/api/tasks/_acceptance/post-generation",
+            params={
+                "user_id": USER_ID,
+                "session_id": session_id,
+                "conversation_id": conversation_id,
+            },
+        )
+        payload = proof.json()
+        assert [item["operation"] for item in payload["tasks"]] == [
+            "embed_conversation", "generate_session_title"
+        ]
+        assert payload["evaluation_evidence_enabled"] is False
+        assert set(payload) == {
+            "schema_version", "runtime_worker_id",
+            "evaluation_evidence_enabled", "tasks",
+        }
+        after = {
+            key: record.snapshot()
+            for key, record in services.task_queue._records.items()
+        }
+        assert before == after
+        assert "GET /api/tasks/_acceptance/post-generation" not in json.dumps(
+            client.get("/openapi.json").json()
+        )
+        assert client.get(
+            "/api/tasks/_acceptance/post-generation",
+            params={
+                "user_id": "another_user",
+                "session_id": session_id,
+                "conversation_id": conversation_id,
+            },
+        ).status_code == 404
+
+
 def test_chat_query_streams_json_sse_and_persists_only_complete_answer() -> None:
     services, manager, embeddings, writer, events, bundle = _services()
     app = create_app(services)

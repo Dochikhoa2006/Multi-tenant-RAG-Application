@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 import hashlib
 import json
@@ -13,8 +14,9 @@ from pathlib import Path
 import random
 import statistics
 import sys
+import time
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +31,7 @@ BEHAVIORAL_BASELINE_COMMIT = "fba3c3481d5dc438b6081ab85afcbaa99dbc2987"
 APPROVED_INTEGRATION_COMMIT = "d37c82710a8bd166af4c68f5f57d1068a7cdc880"
 APPROVED_EVIDENCE_HOOK_FILES = frozenset(
     {
+        "backend/api/tasks.py",
         "backend/api/wizard_diagnostics.py",
         "backend/config.py",
         "backend/providers/sglang_query_rewriter.py",
@@ -154,8 +157,14 @@ def validate_protected_contracts(
         FIXED_CONVERSATION_CANDIDATE_COUNT,
         FIXED_KNOWLEDGE_CANDIDATE_COUNT,
         FIXED_POLICY_CANDIDATE_COUNT,
+        GRANITE_QUERY_REWRITE,
+        QWEN_SGLANG,
+        SGLANG_QUERY_REWRITE,
         TOKEN_BUDGETS,
     )
+    from backend.providers.sglang_query_rewriter import SGLangGraniteQueryRewriter
+    from backend.providers.sglang_qwen_llm import SGLangQwenLLMClient
+    from deployment.ragctl import CHAT_TIMING_KEYS, iter_sse, validate_chat_result
 
     expected_keys = tuple(contracts.get("timing_keys", ()))
     if TELEMETRY_SCHEMA_VERSION != contracts.get("telemetry_schema_version"):
@@ -180,6 +189,62 @@ def validate_protected_contracts(
         "total": TOKEN_BUDGETS.total_context_tokens,
     }:
         raise GateError("context budgets drifted")
+    qwen = object.__new__(SGLangQwenLLMClient)
+    qwen.config = QWEN_SGLANG
+    qwen_payload = qwen._payload(
+        "protected-contract",
+        model=QWEN_SGLANG.served_model,
+        reasoning="low",
+        max_output_tokens=QWEN_SGLANG.answer_max_output_tokens,
+        stream=True,
+    )
+    if contracts.get("qwen") != {
+        "temperature": qwen_payload["temperature"],
+        "top_p": qwen_payload["top_p"],
+        "top_k": qwen_payload["top_k"],
+        "min_p": qwen_payload["min_p"],
+        "presence_penalty": qwen_payload["presence_penalty"],
+        "thinking": qwen_payload["chat_template_kwargs"]["enable_thinking"],
+    }:
+        raise GateError("Qwen generation settings drifted")
+    granite = object.__new__(SGLangGraniteQueryRewriter)
+    granite.granite_config = GRANITE_QUERY_REWRITE
+    granite.sglang_config = SGLANG_QUERY_REWRITE
+    granite_body = granite._request_body([{"role": "user", "content": "probe"}])
+    if contracts.get("granite") != {
+        key: granite_body[key]
+        for key in ("temperature", "n", "stream", "continue_final_message")
+    }:
+        raise GateError("Granite request settings drifted")
+    request_id = "00000000-0000-4000-8000-000000000001"
+    conversation_id = "00000000-0000-4000-8000-000000000002"
+    telemetry = {
+        "schema_version": TELEMETRY_SCHEMA_VERSION,
+        "request_id": request_id,
+        "timings_ms": {name: 0.0 for name in CHAT_TIMING_KEYS},
+    }
+    lines = [
+        "event: token", json.dumps({"request_id": request_id, "text": "x"}), "",
+        "event: telemetry", json.dumps(telemetry), "",
+        "event: done", json.dumps(
+            {"request_id": request_id, "conversation_id": conversation_id}
+        ), "",
+    ]
+    frames = list(iter_sse(
+        line if not line.startswith("{") else "data: " + line for line in lines
+    ))
+    events = [name for name, _ in frames]
+    validate_chat_result(
+        events,
+        [str(frames[0][1]["text"])],
+        frames[1][1],
+        frames[2][1],
+        verify_atlas_grounding=False,
+    )
+    if events != ["token", "telemetry", "done"] or contracts.get(
+        "sse_success_order"
+    ) != "token* -> telemetry -> done":
+        raise GateError("SSE success ordering drifted")
     return {
         "status": "passed",
         "manifest_schema_version": "1.0",
@@ -220,6 +285,9 @@ def validate_live_prerequisites(
         active = validate_reusable_corpus_state(state, diagnostic_user)
     except Exception as exc:
         raise GateError("live configuration, query, or corpus prerequisite failed") from exc
+    rag_user = config.get("RAG_USER_ID", "").strip()
+    if not rag_user or rag_user != diagnostic_user or state is None or state.diagnostic_user_id != rag_user:
+        raise GateError("RAG, diagnostic, and settled corpus users must match")
     fixture_counts: dict[str, int] = {}
     for collection in ("knowledge", "policy"):
         folder = fixtures_path / collection
@@ -517,6 +585,11 @@ def paired_latency_gate(
         raise GateError("unpaired latency observations cannot be discarded")
     if len(complete) < minimum_pairs:
         raise GateError("insufficient complete paired latency observations")
+    for pair in complete:
+        if _pair_identity(pair[baseline_mode]) != _pair_identity(
+            pair[comparison_mode]
+        ):
+            raise GateError("paired latency observations identify different queries")
     rng = random.Random(seed)
     decisions: dict[str, object] = {}
     for metric in LATENCY_METRICS:
@@ -563,13 +636,46 @@ def cast_mapping(value: object) -> Mapping[str, object]:
     return value
 
 
+def _pair_identity(sample: Mapping[str, object]) -> tuple[object, ...]:
+    question = sample.get("question")
+    query_identity = sample.get("query_identity")
+    values = tuple(
+        sample.get(name)
+        for name in ("query_source_index", "query_schedule_index", "query_repetition")
+    )
+    if (
+        not isinstance(question, str)
+        or not question.strip()
+        or not isinstance(query_identity, str)
+        or len(query_identity) != 64
+        or any(type(value) is not int or value < 0 for value in values)
+    ):
+        raise GateError("paired query identity is incomplete")
+    return (question, query_identity, *values)
+
+
 def validate_contention_sample(sample: Mapping[str, object]) -> None:
     """Require the RAG request to start during an actual judge request."""
 
-    judge_started = _finite_positive(sample.get("judge_started_monotonic"), "judge start")
+    activity = cast_mapping(sample.get("judge_activity"))
+    donor = cast_mapping(sample.get("overlapping_evaluation_request"))
+    evaluation = cast_mapping(donor.get("evaluation"))
+    for key in ("evaluation_job_id", "request_id", "record_sha256"):
+        expected = evaluation.get(key) if key != "request_id" else donor.get(key)
+        if activity.get(key) != expected:
+            raise GateError("judge activity does not belong to the donor evaluation")
+    if (
+        activity.get("success") is not True
+        or type(activity.get("sequence")) is not int
+        or activity["sequence"] < 1
+        or not isinstance(activity.get("judge_id"), str)
+        or not activity["judge_id"]
+    ):
+        raise GateError("judge activity evidence is incomplete")
+    judge_started = _finite_positive(activity.get("started_monotonic"), "judge start")
     request_started = _finite_positive(sample.get("request_started_monotonic"), "request start")
     request_done = _finite_positive(sample.get("request_done_monotonic"), "request done")
-    judge_finished = _finite_positive(sample.get("judge_finished_monotonic"), "judge finish")
+    judge_finished = _finite_positive(activity.get("finished_monotonic"), "judge finish")
     if not judge_started < request_started < min(request_done, judge_finished):
         raise GateError("local judge did not overlap the RAG request")
 
@@ -652,6 +758,14 @@ def validate_latency_schedule(
             raise GateError("live request is duplicated")
         seen_requests.add(sample.get("request_id"))
         mode = sample.get("mode")
+        observed = sample.get("evaluation_evidence_enabled")
+        expected_enabled = mode != "off"
+        if type(observed) is not bool or observed is not expected_enabled:
+            raise GateError("authoritative runtime evidence-toggle state is wrong")
+        if not isinstance(sample.get("runtime_instance_id"), str) or not sample.get("runtime_instance_id"):
+            raise GateError("runtime instance identity is missing")
+        if not isinstance(sample.get("runtime_worker_id"), str) or not sample.get("runtime_worker_id"):
+            raise GateError("runtime worker identity is missing")
         if contention:
             if mode not in {"uncontended", "contended"}:
                 raise GateError("contention mode is invalid")
@@ -675,6 +789,17 @@ def validate_latency_schedule(
     if len(identities) != 1:
         raise GateError("live runtime/configuration drifted between samples")
     if contention:
+        pairs: dict[str, dict[str, Mapping[str, object]]] = {}
+        for sample in samples:
+            key, mode = sample.get("pair_key"), str(sample.get("mode"))
+            if not isinstance(key, str) or mode in pairs.setdefault(key, {}):
+                raise GateError("contention pair is missing or duplicated")
+            pairs[key][mode] = sample
+        for pair in pairs.values():
+            if set(pair) != {"uncontended", "contended"} or _pair_identity(
+                pair["uncontended"]
+            ) != _pair_identity(pair["contended"]):
+                raise GateError("contention pair identifies different queries")
         return list(samples)
     if set(blocks) != set(range(4)):
         raise GateError("all four fresh-runtime blocks are required")
@@ -706,6 +831,13 @@ def validate_latency_schedule(
         if key in paired_questions and paired_questions[key] != question:
             raise GateError("paired query text differs")
         paired_questions[key] = question
+    measured_schedules = []
+    for block in range(4):
+        measured_schedules.append(
+            [_pair_identity(item) for item in blocks[block] if item.get("warmup") is False]
+        )
+    if any(schedule != measured_schedules[0] for schedule in measured_schedules[1:]):
+        raise GateError("fresh-runtime blocks used different ordered query schedules")
     return selected
 
 
@@ -792,6 +924,305 @@ def _write_private(path: Path, value: Mapping[str, object]) -> None:
         os.fsync(target.fileno())
 
 
+def _canonical_digest(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    ).hexdigest()
+
+
+def _live_inputs(args: argparse.Namespace) -> dict[str, object]:
+    validate_live_prerequisites(
+        env_path=args.env, fixtures_path=args.fixtures,
+        queries_path=args.queries, corpus_state_path=args.corpus_state,
+    )
+    from deployment.e2e_diagnostic import load_query_selection
+    from deployment.ragctl import load_dotenv
+    from deployment.wizard_diagnostic import load_corpus_state
+
+    config = load_dotenv(args.env)
+    user = config["RAG_USER_ID"].strip()
+    selection = load_query_selection(args.queries, ROOT)
+    state = load_corpus_state(args.corpus_state, user)
+    stable = {key: value for key, value in config.items() if key != "RAG_EVALUATION_EVIDENCE_ENABLED"}
+    contracts = _load_object(MANIFEST_PATH, "protected-contract manifest")["contracts"]
+    return {
+        "config": config, "user": user, "selection": selection,
+        "configuration_sha256": _canonical_digest(stable),
+        "corpus_sha256": _digest(args.corpus_state),
+        "models_sha256": _canonical_digest(
+            {"qwen": contracts["qwen"], "granite": contracts["granite"]}
+        ),
+        "state": state,
+    }
+
+
+def _runtime_instance(runner: object) -> str:
+    from deployment.ragctl import RUNTIME_APP, target_containers
+    matches = [
+        item for item in target_containers(runner)
+        if item.get("app_name") == RUNTIME_APP and item.get("start_time") != "Pending"
+    ]
+    if len(matches) != 1 or not isinstance(matches[0].get("container_id"), str):
+        raise GateError("one authoritative runtime container is required")
+    return str(matches[0]["container_id"])
+
+
+def _post_generation(config: Mapping[str, str], row: Mapping[str, object]) -> dict[str, object]:
+    import httpx
+    from deployment.e2e_diagnostic_api import poll_task
+    from deployment.ragctl import _runtime_headers, read_runtime_url
+
+    runtime = read_runtime_url(config)
+    params = {key: row[key] for key in ("user_id", "session_id", "conversation_id")}
+    deadline = time.monotonic() + 900
+    with httpx.Client(headers=_runtime_headers(config), timeout=120) as client:
+        while True:
+            response = client.get(
+                f"{runtime}/api/tasks/_acceptance/post-generation", params=params
+            )
+            if response.status_code in {401, 403}:
+                raise GateError("task-proof authentication failed")
+            if response.status_code == 200:
+                payload = response.json()
+                tasks = payload.get("tasks") if isinstance(payload, Mapping) else None
+                if isinstance(tasks, list) and len(tasks) == 2 and all(
+                    isinstance(item, Mapping) and item.get("status") in {"succeeded", "failed"}
+                    for item in tasks
+                ):
+                    break
+            if time.monotonic() >= deadline:
+                raise GateError("post-generation task proof timed out")
+            time.sleep(1)
+        by_operation = {str(item["operation"]): dict(item) for item in tasks}
+        deleted = client.delete(
+            f"{runtime}/api/chat/sessions/{row['session_id']}",
+            params={"user_id": row["user_id"]},
+        )
+        if deleted.status_code != 202:
+            raise GateError("known-session cleanup was not accepted")
+        deletion = poll_task(
+            client, runtime, str(row["user_id"]),
+            str(deleted.json()["task_id"]), "delete_session",
+        )
+        if deletion.status != "succeeded":
+            raise GateError("known-session cleanup failed")
+    return {
+        "post_generation": {
+            "conversation_persistence": by_operation["embed_conversation"],
+            "session_title": by_operation["generate_session_title"],
+        },
+        "runtime_worker_id": payload["runtime_worker_id"],
+        "evaluation_evidence_enabled": payload["evaluation_evidence_enabled"],
+        "session_cleanup": deletion.artifact(),
+    }
+
+
+def _ask_process(config: Mapping[str, str], question: str, activity: str | None) -> Mapping[str, object]:
+    from deployment.ragctl import ask
+    return ask(
+        config, question,
+        acceptance_activity_path=None if activity is None else Path(activity),
+    )
+
+
+def _ask_sample(
+    config: Mapping[str, str], user: str, question: str,
+    *, activity: Path | None = None,
+) -> dict[str, object]:
+    row = dict(_ask_process(config, question, None if activity is None else str(activity)))
+    row["user_id"] = user
+    row.update(_post_generation(config, row))
+    return row
+
+
+def _activity_intervals(path: Path) -> list[dict[str, object]]:
+    events = _load_jsonl(path)
+    starts: dict[tuple[object, object], Mapping[str, object]] = {}
+    intervals = []
+    for event in events:
+        key = (event.get("evaluation_job_id"), event.get("sequence"))
+        if event.get("event") == "start":
+            starts[key] = event
+        elif event.get("event") == "end" and key in starts:
+            start = starts.pop(key)
+            intervals.append({
+                "evaluation_job_id": key[0], "sequence": key[1],
+                "request_id": event.get("request_id"),
+                "record_sha256": event.get("record_sha256"),
+                "judge_id": event.get("judge_id"),
+                "started_monotonic": start.get("monotonic"),
+                "finished_monotonic": event.get("monotonic"),
+                "success": event.get("success"),
+            })
+    return intervals
+
+
+def _identity_fields(inputs: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "protected_contract_sha256": _digest(MANIFEST_PATH),
+        "configuration_sha256": inputs["configuration_sha256"],
+        "corpus_sha256": inputs["corpus_sha256"],
+        "models_sha256": inputs["models_sha256"],
+    }
+
+
+def _query_fields(selection: object, index: int) -> dict[str, object]:
+    selected = selection.selected[index % len(selection.selected)]
+    identity = _canonical_digest(
+        {"source": selection.source_sha256, "index": selected.source_index, "text": selected.text}
+    )
+    return {
+        "question": selected.text, "query_identity": identity,
+        "query_source_index": selected.source_index,
+        "query_schedule_index": index,
+        "query_repetition": index // len(selection.selected),
+    }
+
+
+def _collect_functional(args: argparse.Namespace) -> dict[str, object]:
+    from deployment import ragctl
+
+    inputs = _live_inputs(args)
+    config, user, selection = inputs["config"], inputs["user"], inputs["selection"]
+    output = args.output.resolve()
+    output.mkdir(parents=True, mode=0o700)
+    runner = ragctl.CommandRunner(config)
+    try:
+        ragctl.down(config, runner)
+        ragctl.up(config, runner)
+        ask_row = _ask_sample(config, user, selection.selected[0].text)
+        ask_row.update(_identity_fields(inputs))
+        ask_row["runtime_instance_id"] = _runtime_instance(runner)
+        _validate_live_sample(ask_row, evaluation=True)
+    finally:
+        ragctl.down(config, runner)
+    before = set(ragctl.E2E_DIAGNOSTICS_PATH.iterdir()) if ragctl.E2E_DIAGNOSTICS_PATH.exists() else set()
+    ragctl.diagnose_e2e(config, runner, args.queries, start=0, limit=args.e2e_limit)
+    created = set(ragctl.E2E_DIAGNOSTICS_PATH.iterdir()) - before
+    if len(created) != 1:
+        raise GateError("E2E diagnostic artifact correlation failed")
+    e2e_path = created.pop()
+    rows = _load_jsonl(e2e_path / "requests.jsonl")
+    for row in rows:
+        if row.get("status") != "succeeded":
+            raise GateError("functional E2E request failed")
+        validate_evaluation_success(cast_mapping(row.get("evaluation")), expected_request=row, expected_source="e2e")
+    result = {
+        "schema_version": "1.0", "status": "passed", "ask": ask_row,
+        "e2e_directory": str(e2e_path), "e2e_request_count": len(rows),
+    }
+    _write_private(output / "functional.json", result)
+    return result
+
+
+def _collect_performance(args: argparse.Namespace) -> dict[str, object]:
+    from deployment import ragctl
+
+    inputs = _live_inputs(args)
+    config, user, selection = inputs["config"], inputs["user"], inputs["selection"]
+    output = args.output.resolve()
+    output.mkdir(parents=True, mode=0o700)
+    runner = ragctl.CommandRunner(config)
+    rows: list[dict[str, object]] = []
+    for block, mode in enumerate(("off", "on", "on", "off")):
+        try:
+            ragctl.down(config, runner)
+            ragctl.up(config, runner, evaluation_evidence_enabled=mode == "on")
+            runtime_id = _runtime_instance(runner)
+            for ordinal in range(args.pairs + 3):
+                schedule = max(0, ordinal - 3)
+                fields = _query_fields(selection, schedule)
+                row = _ask_sample(config, user, str(fields["question"]))
+                row.update(fields | _identity_fields(inputs))
+                row.update({
+                    "mode": mode, "block_sequence": block,
+                    "block_request_index": ordinal, "warmup": ordinal < 3,
+                    "pair_key": f"crossover-{0 if block < 2 else 1}-{schedule}",
+                    "runtime_instance_id": runtime_id,
+                })
+                rows.append(row)
+        finally:
+            ragctl.down(config, runner)
+    measured = validate_latency_schedule(rows)
+    off_on = paired_latency_gate(measured)
+
+    activity = output / "judge-activity.jsonl"
+    descriptor = os.open(activity, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(descriptor)
+    contention: list[dict[str, object]] = []
+    try:
+        ragctl.up(config, runner, evaluation_evidence_enabled=True)
+        runtime_id = _runtime_instance(runner)
+        for index in range(args.pairs):
+            fields = _query_fields(selection, index)
+            base = _ask_sample(config, user, str(fields["question"]))
+            base.update(fields | _identity_fields(inputs) | {
+                "mode": "uncontended", "pair_key": f"contention-{index}",
+                "runtime_instance_id": runtime_id,
+            })
+            contention.append(base)
+            donor_fields = _query_fields(selection, index + 1)
+            prior = len(_load_jsonl(activity))
+            with ProcessPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    _ask_process, config, str(donor_fields["question"]), str(activity)
+                )
+                deadline = time.monotonic() + 1800
+                active_key: tuple[object, object] | None = None
+                while True:
+                    events = _load_jsonl(activity)
+                    recent = events[prior:]
+                    starts = {
+                        (item.get("evaluation_job_id"), item.get("sequence"))
+                        for item in recent if item.get("event") == "start"
+                    }
+                    ends = {
+                        (item.get("evaluation_job_id"), item.get("sequence"))
+                        for item in recent if item.get("event") == "end"
+                    }
+                    if starts - ends:
+                        active_key = next(iter(starts - ends))
+                        break
+                    if future.done() or time.monotonic() >= deadline:
+                        raise GateError("correlated donor judge activity did not start")
+                    time.sleep(0.05)
+                compared = _ask_sample(config, user, str(fields["question"]), activity=activity)
+                donor = dict(future.result())
+            donor["user_id"] = user
+            donor.update(_post_generation(config, donor))
+            intervals = _activity_intervals(activity)
+            job_id = cast_mapping(donor.get("evaluation")).get("evaluation_job_id")
+            matches = [
+                item for item in intervals
+                if item.get("evaluation_job_id") == job_id
+                and active_key == (item.get("evaluation_job_id"), item.get("sequence"))
+            ]
+            if not matches:
+                raise GateError("donor evaluation has no correlated judge interval")
+            compared.update(fields | _identity_fields(inputs) | {
+                "mode": "contended", "pair_key": f"contention-{index}",
+                "runtime_instance_id": runtime_id,
+                "judge_activity_source": "ollama_http",
+                "judge_activity": matches[0],
+                "overlapping_evaluation_request": donor,
+                "request_done_monotonic": compared["done_received_monotonic"],
+            })
+            contention.append(compared)
+    finally:
+        ragctl.down(config, runner)
+    overlap = paired_latency_gate(
+        validate_latency_schedule(contention, contention=True),
+        baseline_mode="uncontended", comparison_mode="contended",
+    )
+    result = {"schema_version": "1.0", "status": "passed" if off_on["status"] == overlap["status"] == "passed" else "failed", "off_on": off_on, "contention": overlap}
+    _write_private(output / "performance.json", result)
+    with (output / "latency-samples.jsonl").open("x", encoding="utf-8") as target:
+        for row in rows + contention:
+            target.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
+    os.chmod(output / "latency-samples.jsonl", 0o600)
+    return result
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -813,6 +1244,21 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--latency-samples", type=Path, required=True)
     verify.add_argument("--contention-samples", type=Path, required=True)
     verify.add_argument("--output", type=Path, required=True)
+    for name in ("collect-functional", "collect-performance"):
+        collect = commands.add_parser(name, help=f"run authorized real {name[8:]} collection")
+        collect.add_argument("--authorize-live", action="store_true")
+        collect.add_argument("--env", type=Path, default=ROOT / ".env")
+        collect.add_argument("--fixtures", type=Path, default=DEFAULT_FIXTURES)
+        collect.add_argument("--queries", type=Path, default=DEFAULT_QUERIES)
+        collect.add_argument(
+            "--corpus-state", type=Path,
+            default=ROOT / ".local" / "diagnostics" / "wizard" / "corpus-state.json",
+        )
+        collect.add_argument("--output", type=Path, required=True)
+        if name == "collect-functional":
+            collect.add_argument("--e2e-limit", type=int)
+        else:
+            collect.add_argument("--pairs", type=int, default=30)
     return parser
 
 
@@ -828,7 +1274,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 queries_path=args.queries,
                 corpus_state_path=args.corpus_state,
             )
-        else:
+        elif args.command == "verify":
             # This must be the first gate step.  Real-run artifacts are not
             # accepted when protected production contracts have drifted.
             validate_protected_contracts()
@@ -842,6 +1288,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             if output.exists() or output.is_symlink():
                 raise GateError("gate output already exists")
             _write_private(output, result)
+        else:
+            if not args.authorize_live:
+                raise GateError("live collection requires --authorize-live")
+            if args.output.exists() or args.output.is_symlink():
+                raise GateError("live collection output already exists")
+            if args.command == "collect-performance" and args.pairs < 30:
+                raise GateError("performance collection requires at least 30 pairs")
+            result = (
+                _collect_functional(args)
+                if args.command == "collect-functional"
+                else _collect_performance(args)
+            )
         print(json.dumps(result, sort_keys=True))
         return 0 if result["status"] == "passed" else 1
     except (GateError, OSError, UnicodeError) as exc:

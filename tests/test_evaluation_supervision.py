@@ -169,7 +169,7 @@ def test_success_file_cannot_hide_nonzero_evaluator_exit(tmp_path: Path) -> None
 def test_ordinary_ask_submission_accepts_omitted_corpus_restriction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from uuid import uuid4
+    from uuid import UUID, uuid4
 
     received = []
 
@@ -195,6 +195,8 @@ def test_ordinary_ask_submission_accepts_omitted_corpus_restriction(
     assert bridge.finish_evaluation_job(job).error_code == "EVALUATION_START_FAILED"
     assert len(received) == 1
     assert received[0]["allowed_document_ids"] is None
+    assert received[0]["evaluation_job_id"] == job.evaluation_job_id
+    assert str(UUID(job.evaluation_job_id)) == job.evaluation_job_id
 
 
 def test_terminal_timings_include_cleanup_and_freeze_before_join(

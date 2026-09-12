@@ -103,9 +103,10 @@ class EvaluationObservation:
     record_sha256: str | None
     queue_wait_ms: float = 0.0
     execution_ms: float = 0.0
+    evaluation_job_id: str | None = None
 
     def artifact(self) -> dict[str, object]:
-        return {
+        artifact = {
             "status": self.status,
             "error_code": self.error_code,
             "evaluation_ms": round(self.duration_ms, 3),
@@ -115,6 +116,9 @@ class EvaluationObservation:
             "result_path": self.result_path,
             "record_sha256": self.record_sha256,
         }
+        if self.evaluation_job_id is not None:
+            artifact["evaluation_job_id"] = self.evaluation_job_id
+        return artifact
 
 
 @dataclass
@@ -143,6 +147,7 @@ class EvaluationJob:
     future: Future[EvaluationObservation]
     cancel_event: Event
     state: _EvaluationJobState
+    evaluation_job_id: str = ""
 
 
 _LOCAL_EVALUATION_EXECUTOR = ThreadPoolExecutor(
@@ -531,6 +536,7 @@ def start_local_evaluation(
     *,
     exact_names: bool = False,
     execution_lock_fd: int | None = None,
+    activity_context: Mapping[str, str] | None = None,
 ) -> EvaluationLaunch:
     started = perf_counter()
     record_path = directory / (
@@ -549,6 +555,15 @@ def start_local_evaluation(
                 "dedicated evaluator environment is unavailable"
             )
         environment = _sanitized_child_environment(evaluator=True)
+        if activity_context is not None:
+            environment.update(
+                {
+                    "RAG_EVAL_ACTIVITY_PATH": activity_context["path"],
+                    "RAG_EVAL_JOB_ID": activity_context["job_id"],
+                    "RAG_EVAL_REQUEST_ID": request_id,
+                    "RAG_EVAL_RECORD_SHA256": record_sha256,
+                }
+            )
         process = subprocess.Popen(
             [str(EVALUATOR), "run", str(record_path), "--output", str(result_path)],
             cwd=PROJECT_ROOT,
@@ -722,7 +737,9 @@ def _terminal_job(
     *,
     duration_ms: float = 0.0,
     queue_wait_ms: float = 0.0,
+    evaluation_job_id: str | None = None,
 ) -> EvaluationJob:
+    job_id = evaluation_job_id or str(uuid4())
     future: Future[EvaluationObservation] = Future()
     future.set_result(
         EvaluationObservation(
@@ -734,9 +751,10 @@ def _terminal_job(
             None,
             queue_wait_ms,
             0.0,
+            job_id,
         )
     )
-    return EvaluationJob(future, Event(), _EvaluationJobState())
+    return EvaluationJob(future, Event(), _EvaluationJobState(), job_id)
 
 
 def _evidence_mapping(evidence: RequestEvidence) -> dict[str, object]:
@@ -847,6 +865,16 @@ def run_admitted_evaluation_payload(
             str(payload.get("stem", "")),
             exact_names=payload.get("exact_names") is True,
             execution_lock_fd=execution_lock_fd,
+            activity_context=(
+                None
+                if payload.get("acceptance_activity_path") is None
+                else {
+                    "path": str(payload["acceptance_activity_path"]),
+                    "job_id": _canonical_uuid(
+                        payload.get("evaluation_job_id"), "evaluation job ID"
+                    ),
+                }
+            ),
         )
         observation = finish_local_evaluation(launch, timeout_seconds=remaining)
         return {
@@ -917,6 +945,8 @@ def _worker_payload(
     directory: Path,
     stem: str,
     exact_names: bool,
+    evaluation_job_id: str,
+    acceptance_activity_path: Path | None,
 ) -> bytes:
     hydration_config = {
         name: config[name]
@@ -945,6 +975,10 @@ def _worker_payload(
         "directory": str(directory),
         "stem": stem,
         "exact_names": exact_names,
+        "evaluation_job_id": evaluation_job_id,
+        "acceptance_activity_path": (
+            None if acceptance_activity_path is None else str(acceptance_activity_path)
+        ),
     }
     return _canonical_bytes(payload)
 
@@ -1024,6 +1058,8 @@ def _execute_evaluation_job(
     directory: Path,
     stem: str,
     exact_names: bool,
+    evaluation_job_id: str,
+    acceptance_activity_path: Path | None,
 ) -> EvaluationObservation:
     descriptor: int | None = None
     queue_wait_ms = 0.0
@@ -1061,6 +1097,8 @@ def _execute_evaluation_job(
             directory=directory,
             stem=stem,
             exact_names=exact_names,
+            evaluation_job_id=evaluation_job_id,
+            acceptance_activity_path=acceptance_activity_path,
         )
         if cancel_event.is_set():
             return EvaluationObservation(
@@ -1178,6 +1216,9 @@ def _run_evaluation_job(*, submitted_at: float, **kwargs: Any) -> EvaluationObse
         duration_ms=total_ms,
         queue_wait_ms=observation.queue_wait_ms if admitted else total_ms,
         execution_ms=max(0.0, total_ms - observation.queue_wait_ms) if admitted else 0.0,
+        evaluation_job_id=str(
+            kwargs.get("evaluation_job_id") or observation.evaluation_job_id or ""
+        ) or None,
     )
 
 
@@ -1198,9 +1239,11 @@ def submit_local_evaluation(
     stem: str,
     exact_names: bool = False,
     execution_lock_path: Path = LOCAL_EVALUATION_LOCK_PATH,
+    acceptance_activity_path: Path | None = None,
 ) -> EvaluationJob:
     """Submit one bounded local evidence-hydration and evaluator job."""
 
+    evaluation_job_id = str(uuid4())
     try:
         telemetry_copy = json.loads(
             json.dumps(telemetry, ensure_ascii=False, allow_nan=False)
@@ -1217,12 +1260,18 @@ def submit_local_evaluation(
             }
         )
     except (TypeError, ValueError):
-        return _terminal_job("failed", "EVALUATION_EVIDENCE_INVALID")
+        return _terminal_job(
+            "failed", "EVALUATION_EVIDENCE_INVALID",
+            evaluation_job_id=evaluation_job_id,
+        )
 
     global _LOCAL_JOB_PENDING
     with _LOCAL_JOB_LOCK:
         if _LOCAL_JOB_PENDING:
-            return _terminal_job("failed", "EVALUATION_LOCAL_JOB_BUSY")
+            return _terminal_job(
+                "failed", "EVALUATION_LOCAL_JOB_BUSY",
+                evaluation_job_id=evaluation_job_id,
+            )
         _LOCAL_JOB_PENDING = True
     submitted_at = perf_counter()
     cancel_event = Event()
@@ -1248,12 +1297,17 @@ def submit_local_evaluation(
             directory=directory,
             stem=stem,
             exact_names=exact_names,
+            evaluation_job_id=evaluation_job_id,
+            acceptance_activity_path=acceptance_activity_path,
         )
     except Exception:
         with _LOCAL_JOB_LOCK:
             _LOCAL_JOB_PENDING = False
-        return _terminal_job("failed", "EVALUATION_START_FAILED")
-    return EvaluationJob(future, cancel_event, state)
+        return _terminal_job(
+            "failed", "EVALUATION_START_FAILED",
+            evaluation_job_id=evaluation_job_id,
+        )
+    return EvaluationJob(future, cancel_event, state, evaluation_job_id)
 
 
 def finish_evaluation_job(job: EvaluationJob) -> EvaluationObservation:

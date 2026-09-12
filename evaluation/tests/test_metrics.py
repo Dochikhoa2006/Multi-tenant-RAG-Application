@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
@@ -14,6 +17,7 @@ from rag_evaluation.metrics import (
     RagasMetricBackend,
     assert_collections_api_compatible,
     metric_skip_code,
+    _judge_activity_hooks,
 )
 from rag_evaluation.models import EvaluationRecord
 
@@ -31,6 +35,31 @@ class RecordingMetric:
 class DummyClient:
     async def close(self) -> None:
         return None
+
+
+def test_acceptance_judge_activity_is_correlated_and_content_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "activity.jsonl"
+    path.touch(mode=0o600)
+    job_id, request_id = str(uuid4()), str(uuid4())
+    monkeypatch.setenv("RAG_EVAL_ACTIVITY_PATH", str(path))
+    monkeypatch.setenv("RAG_EVAL_JOB_ID", job_id)
+    monkeypatch.setenv("RAG_EVAL_REQUEST_ID", request_id)
+    monkeypatch.setenv("RAG_EVAL_RECORD_SHA256", "a" * 64)
+    hooks, descriptor = _judge_activity_hooks(
+        {"model": "local-judge", "model_digest": "digest"}
+    )
+    request = SimpleNamespace(extensions={})
+    response = SimpleNamespace(request=request, status_code=200)
+    asyncio.run(hooks["request"][0](request))
+    asyncio.run(hooks["response"][0](response))
+    os.close(descriptor)
+    events = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [event["event"] for event in events] == ["start", "end"]
+    assert all(event["evaluation_job_id"] == job_id for event in events)
+    assert all(event["request_id"] == request_id for event in events)
+    assert not any("prompt" in json.dumps(event).lower() for event in events)
 
 
 def _backend() -> tuple[RagasMetricBackend, dict[str, RecordingMetric]]:
