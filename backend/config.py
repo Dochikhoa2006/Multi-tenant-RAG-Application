@@ -118,6 +118,8 @@ RAG_EVALUATION_EVIDENCE_ENABLED = _boolean(
     "RAG_EVALUATION_EVIDENCE_ENABLED", False
 )
 RAG_EVALUATION_USER_ID = _raw_string("RAG_EVALUATION_USER_ID", "")
+RAG_ACCEPTANCE_OBSERVER_ENABLED = _boolean("RAG_ACCEPTANCE_OBSERVER_ENABLED", False)
+RAG_ACCEPTANCE_EXPERIMENT_SHA256 = _raw_string("RAG_ACCEPTANCE_EXPERIMENT_SHA256", "")
 
 try:
     _USER_ID_PATTERN = re.compile(USER_ID_PATTERN)
@@ -156,6 +158,9 @@ if RAG_EVALUATION_EVIDENCE_ENABLED:
         raise ValueError(
             "RAG_EVALUATION_USER_ID does not match configured USER_ID_PATTERN"
         )
+
+if RAG_ACCEPTANCE_OBSERVER_ENABLED and re.fullmatch(r"[0-9a-f]{64}", RAG_ACCEPTANCE_EXPERIMENT_SHA256) is None:
+    raise ValueError("RAG_ACCEPTANCE_EXPERIMENT_SHA256 must be a lowercase SHA-256 digest")
 
 
 def get_collection_name(user_id: str, collection_type: str) -> str:

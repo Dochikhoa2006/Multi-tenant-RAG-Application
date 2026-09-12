@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 import hashlib
 import json
 import math
@@ -849,6 +849,8 @@ def deploy_runtime(
     *,
     wizard_diagnostic_user_id: str | None = None,
     evaluation_evidence_enabled: bool = True,
+    acceptance_observer_enabled: bool = False,
+    acceptance_experiment_sha256: str | None = None,
 ) -> str:
     evaluation_user_id = (
         config.get("RAG_USER_ID", DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
@@ -858,14 +860,29 @@ def deploy_runtime(
         "RAG_EVALUATION_EVIDENCE_ENABLED": (
             "true" if evaluation_evidence_enabled else "false"
         ),
+        "RAG_ACCEPTANCE_OBSERVER_ENABLED": (
+            "true" if acceptance_observer_enabled else "false"
+        ),
     }
     if evaluation_evidence_enabled:
         overrides["RAG_EVALUATION_USER_ID"] = evaluation_user_id
+    if acceptance_observer_enabled:
+        if (
+            acceptance_experiment_sha256 is None
+            or len(acceptance_experiment_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in acceptance_experiment_sha256
+            )
+        ):
+            raise RagCtlError("acceptance experiment identity must be a SHA-256 digest")
+        overrides["RAG_ACCEPTANCE_EXPERIMENT_SHA256"] = acceptance_experiment_sha256
     if wizard_diagnostic_user_id is not None:
         overrides = {
             "WIZARD_DIAGNOSTICS_ENABLED": "true",
             "RAG_DIAGNOSTIC_USER_ID": wizard_diagnostic_user_id,
             "RAG_EVALUATION_EVIDENCE_ENABLED": "false",
+            "RAG_ACCEPTANCE_OBSERVER_ENABLED": "false",
         }
     runner.run(
         [MODAL, "deploy", PROJECT_ROOT / "deployment" / "modal_runtime.py"],
@@ -1017,6 +1034,8 @@ def up(
     *,
     wizard_diagnostic_user_id: str | None = None,
     evaluation_evidence_enabled: bool = True,
+    acceptance_observer_enabled: bool = False,
+    acceptance_experiment_sha256: str | None = None,
 ) -> None:
     validate_config(config)
     try:
@@ -1049,10 +1068,19 @@ def up(
         runtime_gpu = gpu_request(config, "MODAL_RAG_GPU")
         if wizard_diagnostic_user_id is None:
             runtime_url = (
-                deploy_runtime(config, runner)
+                deploy_runtime(
+                    config,
+                    runner,
+                    acceptance_observer_enabled=acceptance_observer_enabled,
+                    acceptance_experiment_sha256=acceptance_experiment_sha256,
+                )
                 if evaluation_evidence_enabled
                 else deploy_runtime(
-                    config, runner, evaluation_evidence_enabled=False
+                    config,
+                    runner,
+                    evaluation_evidence_enabled=False,
+                    acceptance_observer_enabled=acceptance_observer_enabled,
+                    acceptance_experiment_sha256=acceptance_experiment_sha256,
                 )
             )
         else:
@@ -1684,6 +1712,7 @@ def ask(
     *,
     verify_atlas_grounding: bool = False,
     acceptance_activity_path: Path | None = None,
+    _acceptance_done_validated_hook: Callable[[], None] | None = None,
 ) -> Mapping[str, object]:
     from deployment.e2e_diagnostic import utc_timestamp
     from deployment.e2e_diagnostic_api import _DeepTraceSession
@@ -1803,6 +1832,8 @@ def ask(
                 verify_atlas_grounding=verify_atlas_grounding,
             )
             done_validated_monotonic = time.monotonic()
+            if _acceptance_done_validated_hook is not None:
+                _acceptance_done_validated_hook()
             if trace is not None:
                 try:
                     _, trace_operation, _ = trace.wait_operation(trace_operation_id)

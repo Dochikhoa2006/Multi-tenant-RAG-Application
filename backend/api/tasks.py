@@ -8,7 +8,10 @@ from fastapi import APIRouter, Depends, Request
 from backend.api.dependencies import get_services
 from backend.api.errors import not_found, request_id, validation_error
 from backend.api.models import TaskResource
-from backend.config import RAG_EVALUATION_EVIDENCE_ENABLED
+from backend.config import (
+    RAG_ACCEPTANCE_EXPERIMENT_SHA256, RAG_ACCEPTANCE_OBSERVER_ENABLED,
+    RAG_EVALUATION_EVIDENCE_ENABLED,
+)
 from backend.services import AppServices
 
 
@@ -27,6 +30,8 @@ async def get_post_generation_acceptance(
     """Return bounded, read-only task/runtime evidence for an acceptance run."""
 
     correlation_id = request_id(request)
+    if not RAG_ACCEPTANCE_OBSERVER_ENABLED:
+        raise not_found("post-generation tasks", correlation_id)
     try:
         session = services.chat_registry.get_session(user_id, session_id)
     except (KeyError, TypeError, ValueError) as exc:
@@ -59,6 +64,7 @@ async def get_post_generation_acceptance(
         "schema_version": "1.0",
         "runtime_worker_id": f"pid:{os.getpid()}",
         "evaluation_evidence_enabled": RAG_EVALUATION_EVIDENCE_ENABLED,
+        "acceptance_experiment_sha256": RAG_ACCEPTANCE_EXPERIMENT_SHA256,
         "tasks": [
             {
                 key: getattr(snapshot, key)

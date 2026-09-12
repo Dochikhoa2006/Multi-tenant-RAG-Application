@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
+import fcntl
 import hashlib
 import json
 import math
@@ -724,6 +725,10 @@ def _validate_live_sample(sample: Mapping[str, object], *, evaluation: bool) -> 
         or telemetry.get("timings_ms") != sample.get("timings_ms")
     ):
         raise GateError("live timing sample differs from authoritative telemetry")
+    if sample.get("acceptance_experiment_sha256") != sample.get(
+        "configuration_sha256"
+    ):
+        raise GateError("runtime acceptance experiment identity is wrong")
     _validate_post_generation(sample)
     if evaluation:
         validate_evaluation_success(
@@ -777,6 +782,16 @@ def validate_latency_schedule(
                 if other.get("request_id") == sample.get("request_id"):
                     raise GateError("contention must involve another request")
                 _validate_live_sample(other, evaluation=True)
+            else:
+                idle_order = tuple(_finite_positive(sample.get(key), key) for key in (
+                    "idle_reservation_acquired_monotonic",
+                    "request_started_monotonic", "done_validated_monotonic",
+                    "idle_reservation_released_monotonic",
+                ))
+                if sample.get("evaluator_idle_reserved") is not True or list(
+                    idle_order
+                ) != sorted(idle_order):
+                    raise GateError("uncontended request lacked an idle evaluator reservation")
             _validate_live_sample(sample, evaluation=True)
         else:
             block = sample.get("block_sequence")
@@ -994,6 +1009,12 @@ def _post_generation(config: Mapping[str, str], row: Mapping[str, object]) -> di
                 raise GateError("post-generation task proof timed out")
             time.sleep(1)
         by_operation = {str(item["operation"]): dict(item) for item in tasks}
+        if (
+            payload.get("schema_version") != "1.0"
+            or not isinstance(payload.get("acceptance_experiment_sha256"), str)
+            or len(payload["acceptance_experiment_sha256"]) != 64
+        ):
+            raise GateError("post-generation runtime provenance is malformed")
         deleted = client.delete(
             f"{runtime}/api/chat/sessions/{row['session_id']}",
             params={"user_id": row["user_id"]},
@@ -1013,23 +1034,56 @@ def _post_generation(config: Mapping[str, str], row: Mapping[str, object]) -> di
         },
         "runtime_worker_id": payload["runtime_worker_id"],
         "evaluation_evidence_enabled": payload["evaluation_evidence_enabled"],
+        "acceptance_experiment_sha256": payload["acceptance_experiment_sha256"],
         "session_cleanup": deletion.artifact(),
     }
 
 
-def _ask_process(config: Mapping[str, str], question: str, activity: str | None) -> Mapping[str, object]:
+def _ask_process(
+    config: Mapping[str, str],
+    question: str,
+    activity: str | None,
+    done_validated_hook: Callable[[], None] | None = None,
+) -> Mapping[str, object]:
     from deployment.ragctl import ask
     return ask(
         config, question,
         acceptance_activity_path=None if activity is None else Path(activity),
+        _acceptance_done_validated_hook=done_validated_hook,
     )
 
 
 def _ask_sample(
     config: Mapping[str, str], user: str, question: str,
-    *, activity: Path | None = None,
+    *, activity: Path | None = None, reserve_evaluator_idle: bool = False,
 ) -> dict[str, object]:
-    row = dict(_ask_process(config, question, None if activity is None else str(activity)))
+    descriptor: int | None = None
+    acquired: float | None = None
+    released: list[float] = []
+    hook: Callable[[], None] | None = None
+    if reserve_evaluator_idle:
+        from deployment.evaluation_bridge import LOCAL_EVALUATION_LOCK_PATH
+        LOCAL_EVALUATION_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        descriptor = os.open(LOCAL_EVALUATION_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        acquired = time.monotonic()
+        def release() -> None:
+            if not released:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                released.append(time.monotonic())
+        hook = release
+    try:
+        row = dict(_ask_process(config, question, None if activity is None else str(activity), hook))
+    finally:
+        if descriptor is not None:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+    if reserve_evaluator_idle:
+        if acquired is None or not released:
+            raise GateError("idle evaluator reservation was not released after SSE done")
+        row.update({"evaluator_idle_reserved": True,
+                    "idle_reservation_acquired_monotonic": acquired,
+                    "idle_reservation_released_monotonic": released[0]})
     row["user_id"] = user
     row.update(_post_generation(config, row))
     return row
@@ -1066,6 +1120,12 @@ def _identity_fields(inputs: Mapping[str, object]) -> dict[str, object]:
     }
 
 
+def _validate_functional_dependency(path: Path, inputs: Mapping[str, object]) -> None:
+    evidence = _load_object(path, "functional acceptance evidence")
+    if evidence.get("status") != "passed" or evidence.get("identities") != _identity_fields(inputs):
+        raise GateError("Phase 1 functional acceptance evidence is missing or mismatched")
+
+
 def _query_fields(selection: object, index: int) -> dict[str, object]:
     selected = selection.selected[index % len(selection.selected)]
     identity = _canonical_digest(
@@ -1089,7 +1149,8 @@ def _collect_functional(args: argparse.Namespace) -> dict[str, object]:
     runner = ragctl.CommandRunner(config)
     try:
         ragctl.down(config, runner)
-        ragctl.up(config, runner)
+        ragctl.up(config, runner, acceptance_observer_enabled=True,
+                  acceptance_experiment_sha256=str(inputs["configuration_sha256"]))
         ask_row = _ask_sample(config, user, selection.selected[0].text)
         ask_row.update(_identity_fields(inputs))
         ask_row["runtime_instance_id"] = _runtime_instance(runner)
@@ -1110,6 +1171,7 @@ def _collect_functional(args: argparse.Namespace) -> dict[str, object]:
     result = {
         "schema_version": "1.0", "status": "passed", "ask": ask_row,
         "e2e_directory": str(e2e_path), "e2e_request_count": len(rows),
+        "identities": _identity_fields(inputs),
     }
     _write_private(output / "functional.json", result)
     return result
@@ -1119,17 +1181,21 @@ def _collect_performance(args: argparse.Namespace) -> dict[str, object]:
     from deployment import ragctl
 
     inputs = _live_inputs(args)
+    _validate_functional_dependency(args.functional_evidence, inputs)
     config, user, selection = inputs["config"], inputs["user"], inputs["selection"]
     output = args.output.resolve()
     output.mkdir(parents=True, mode=0o700)
     runner = ragctl.CommandRunner(config)
     rows: list[dict[str, object]] = []
+    pairs_per_crossover = args.pairs // 2
     for block, mode in enumerate(("off", "on", "on", "off")):
         try:
             ragctl.down(config, runner)
-            ragctl.up(config, runner, evaluation_evidence_enabled=mode == "on")
+            ragctl.up(config, runner, evaluation_evidence_enabled=mode == "on",
+                      acceptance_observer_enabled=True,
+                      acceptance_experiment_sha256=str(inputs["configuration_sha256"]))
             runtime_id = _runtime_instance(runner)
-            for ordinal in range(args.pairs + 3):
+            for ordinal in range(pairs_per_crossover + 3):
                 schedule = max(0, ordinal - 3)
                 fields = _query_fields(selection, schedule)
                 row = _ask_sample(config, user, str(fields["question"]))
@@ -1151,11 +1217,14 @@ def _collect_performance(args: argparse.Namespace) -> dict[str, object]:
     os.close(descriptor)
     contention: list[dict[str, object]] = []
     try:
-        ragctl.up(config, runner, evaluation_evidence_enabled=True)
+        ragctl.up(config, runner, evaluation_evidence_enabled=True,
+                  acceptance_observer_enabled=True,
+                  acceptance_experiment_sha256=str(inputs["configuration_sha256"]))
         runtime_id = _runtime_instance(runner)
         for index in range(args.pairs):
             fields = _query_fields(selection, index)
-            base = _ask_sample(config, user, str(fields["question"]))
+            base = _ask_sample(config, user, str(fields["question"]),
+                               reserve_evaluator_idle=True)
             base.update(fields | _identity_fields(inputs) | {
                 "mode": "uncontended", "pair_key": f"contention-{index}",
                 "runtime_instance_id": runtime_id,
@@ -1187,9 +1256,9 @@ def _collect_performance(args: argparse.Namespace) -> dict[str, object]:
                         raise GateError("correlated donor judge activity did not start")
                     time.sleep(0.05)
                 compared = _ask_sample(config, user, str(fields["question"]), activity=activity)
-                donor = dict(future.result())
+            donor = dict(future.result())
             donor["user_id"] = user
-            donor.update(_post_generation(config, donor))
+            donor.update(_post_generation(config, donor) | _identity_fields(inputs))
             intervals = _activity_intervals(activity)
             job_id = cast_mapping(donor.get("evaluation")).get("evaluation_job_id")
             matches = [
@@ -1259,6 +1328,7 @@ def build_parser() -> argparse.ArgumentParser:
             collect.add_argument("--e2e-limit", type=int)
         else:
             collect.add_argument("--pairs", type=int, default=30)
+            collect.add_argument("--functional-evidence", type=Path, required=True)
     return parser
 
 
@@ -1293,8 +1363,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise GateError("live collection requires --authorize-live")
             if args.output.exists() or args.output.is_symlink():
                 raise GateError("live collection output already exists")
-            if args.command == "collect-performance" and args.pairs < 30:
-                raise GateError("performance collection requires at least 30 pairs")
+            if args.command == "collect-performance" and (
+                args.pairs < 30 or args.pairs % 2
+            ):
+                raise GateError("performance collection requires an even total of at least 30 pairs")
             result = (
                 _collect_functional(args)
                 if args.command == "collect-functional"

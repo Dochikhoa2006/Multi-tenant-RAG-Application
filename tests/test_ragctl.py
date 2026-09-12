@@ -271,7 +271,7 @@ def test_up_preserves_dependency_order(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         ragctl,
         "deploy_runtime",
-        lambda *_: events.append("deploy-runtime") or "https://runtime",
+        lambda *_, **__: events.append("deploy-runtime") or "https://runtime",
     )
     monkeypatch.setattr(ragctl, "validate_runtime", lambda *_: events.append("runtime"))
     monkeypatch.setattr(ragctl, "write_state", lambda *_: events.append("state"))
@@ -367,6 +367,7 @@ def test_only_runtime_deployment_receives_default_off_diagnostic_override(
         "WIZARD_DIAGNOSTICS_ENABLED": "false",
         "RAG_EVALUATION_EVIDENCE_ENABLED": "true",
         "RAG_EVALUATION_USER_ID": ragctl.DEFAULT_USER_ID,
+        "RAG_ACCEPTANCE_OBSERVER_ENABLED": "false",
     }
     assert ragctl.gpu_request(config, "MODAL_SGLANG_GPU") == "H100"
     assert ragctl.gpu_request(config, "QWEN_MODAL_SGLANG_GPU") == "H100"
@@ -392,9 +393,31 @@ def test_diagnostic_runtime_override_is_scoped_to_modal_runtime_deploy(
                 "WIZARD_DIAGNOSTICS_ENABLED": "true",
                 "RAG_DIAGNOSTIC_USER_ID": "wizard_diagnostic",
                 "RAG_EVALUATION_EVIDENCE_ENABLED": "false",
+                "RAG_ACCEPTANCE_OBSERVER_ENABLED": "false",
             }
         }
     ]
+
+
+def test_acceptance_observer_override_is_explicit_and_runtime_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config()
+    runner = FakeRunner(config)
+    monkeypatch.setattr(ragctl, "resolve_server_url", lambda *_: "https://worker")
+
+    ragctl.deploy_runtime(
+        config, runner, acceptance_observer_enabled=True,
+        acceptance_experiment_sha256="a" * 64,
+    )
+
+    assert runner.options[0]["overrides"] == {
+        "WIZARD_DIAGNOSTICS_ENABLED": "false",
+        "RAG_EVALUATION_EVIDENCE_ENABLED": "true",
+        "RAG_EVALUATION_USER_ID": ragctl.DEFAULT_USER_ID,
+        "RAG_ACCEPTANCE_OBSERVER_ENABLED": "true",
+        "RAG_ACCEPTANCE_EXPERIMENT_SHA256": "a" * 64,
+    }
 
 
 def _diagnostic_fixture_tree(root: Path) -> Path:
@@ -931,9 +954,14 @@ def test_ask_evaluation_failure_is_informational_and_query_is_sent_once(
     monkeypatch.setattr(ragctl, "read_runtime_url", lambda _config: "https://runtime")
     monkeypatch.setattr(ragctl, "ASK_DIAGNOSTICS_PATH", tmp_path / "ask")
 
-    ragctl.ask(_config(), "question")
+    done_validated: list[bool] = []
+    ragctl.ask(
+        _config(), "question",
+        _acceptance_done_validated_hook=lambda: done_validated.append(True),
+    )
 
     assert Client.query_posts == 1
+    assert done_validated == [True]
     output = capsys.readouterr().out
     assert "Answer: answer" in output
     assert "SSE verified: 1 token event(s) -> telemetry -> done" in output

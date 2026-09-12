@@ -515,28 +515,33 @@ def test_latency_gate_and_contention_overlap_contract() -> None:
     for index in range(30):
         samples.extend(
             [
-                {"pair_key": str(index), "mode": "off", "timings_ms": {name: 100.0 for name in gate.LATENCY_METRICS}},
-                {"pair_key": str(index), "mode": "on", "timings_ms": {name: 101.0 for name in gate.LATENCY_METRICS}},
+                {"pair_key": str(index), "mode": "off", "question": f"q-{index}",
+                 "query_identity": "a" * 64, "query_source_index": index,
+                 "query_schedule_index": index, "query_repetition": 0,
+                 "timings_ms": {name: 100.0 for name in gate.LATENCY_METRICS}},
+                {"pair_key": str(index), "mode": "on", "question": f"q-{index}",
+                 "query_identity": "a" * 64, "query_source_index": index,
+                 "query_schedule_index": index, "query_repetition": 0,
+                 "timings_ms": {name: 101.0 for name in gate.LATENCY_METRICS}},
             ]
         )
     assert gate.paired_latency_gate(samples)["status"] == "passed"
-    gate.validate_contention_sample(
-        {
-            "judge_started_monotonic": 1.0,
-            "request_started_monotonic": 2.0,
-            "request_done_monotonic": 3.0,
-            "judge_finished_monotonic": 4.0,
-        }
-    )
+    donor_id, job_id = str(uuid4()), str(uuid4())
+    contention = {
+        "judge_activity": {"evaluation_job_id": job_id, "request_id": donor_id,
+                           "record_sha256": "d" * 64, "sequence": 1,
+                           "judge_id": "local", "started_monotonic": 1.0,
+                           "finished_monotonic": 4.0, "success": True},
+        "overlapping_evaluation_request": {
+            "request_id": donor_id,
+            "evaluation": {"evaluation_job_id": job_id, "record_sha256": "d" * 64},
+        },
+        "request_started_monotonic": 2.0, "request_done_monotonic": 3.0,
+    }
+    gate.validate_contention_sample(contention)
     with pytest.raises(gate.GateError, match="did not overlap"):
-        gate.validate_contention_sample(
-            {
-                "judge_started_monotonic": 1.0,
-                "request_started_monotonic": 2.0,
-                "request_done_monotonic": 5.0,
-                "judge_finished_monotonic": 1.5,
-            }
-        )
+        contention["judge_activity"]["finished_monotonic"] = 1.5
+        gate.validate_contention_sample(contention)
 
 
 def test_latency_rejects_unpaired_data_instead_of_silently_dropping_it() -> None:
@@ -557,11 +562,17 @@ def test_live_timing_triples_cannot_pass_without_runtime_provenance() -> None:
 
 
 def test_contention_requires_actual_overlap_but_not_full_request_containment() -> None:
+    donor_id, job_id = str(uuid4()), str(uuid4())
     gate.validate_contention_sample({
-        "judge_started_monotonic": 1.0,
-        "request_started_monotonic": 2.0,
-        "request_done_monotonic": 4.0,
-        "judge_finished_monotonic": 3.0,
+        "judge_activity": {"evaluation_job_id": job_id, "request_id": donor_id,
+                           "record_sha256": "d" * 64, "sequence": 1,
+                           "judge_id": "local", "started_monotonic": 1.0,
+                           "finished_monotonic": 3.0, "success": True},
+        "overlapping_evaluation_request": {
+            "request_id": donor_id,
+            "evaluation": {"evaluation_job_id": job_id, "record_sha256": "d" * 64},
+        },
+        "request_started_monotonic": 2.0, "request_done_monotonic": 4.0,
     })
 
 

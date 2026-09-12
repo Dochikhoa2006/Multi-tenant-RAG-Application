@@ -320,6 +320,29 @@ def test_deep_diagnostics_and_evaluation_evidence_are_mutually_exclusive() -> No
     assert "cannot be enabled together" in result.stderr
 
 
+def test_acceptance_observer_is_default_off_and_requires_experiment_digest() -> None:
+    default = _run_python(
+        "from backend.config import RAG_ACCEPTANCE_OBSERVER_ENABLED; "
+        "assert RAG_ACCEPTANCE_OBSERVER_ENABLED is False",
+        overrides={"RAG_ACCEPTANCE_OBSERVER_ENABLED": "false"},
+    )
+    assert default.returncode == 0, default.stderr
+    valid = _run_python(
+        "from backend.config import RAG_ACCEPTANCE_EXPERIMENT_SHA256; "
+        "assert RAG_ACCEPTANCE_EXPERIMENT_SHA256 == 'a' * 64",
+        overrides={"RAG_ACCEPTANCE_OBSERVER_ENABLED": "true",
+                   "RAG_ACCEPTANCE_EXPERIMENT_SHA256": "a" * 64},
+    )
+    assert valid.returncode == 0, valid.stderr
+    for digest in ("", "A" * 64, "a" * 63):
+        invalid = _run_python(
+            "import backend.config",
+            overrides={"RAG_ACCEPTANCE_OBSERVER_ENABLED": "true",
+                       "RAG_ACCEPTANCE_EXPERIMENT_SHA256": digest},
+        )
+        assert invalid.returncode != 0
+
+
 @pytest.mark.parametrize(
     "overrides",
     [

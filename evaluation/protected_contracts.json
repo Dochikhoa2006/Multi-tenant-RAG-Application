@@ -30,12 +30,12 @@
     "deployment/ragctl.py": "979286038e58d84acd19b4411f5aa7e832a5a03edf1c73ecf8035f8d1f16786f"
   },
   "files": {
-    "backend/api/tasks.py": "0f3f10da9fe35d45360b1831b9008a56a57db2d3e3e843fac66072c27f3d8db1",
+    "backend/api/tasks.py": "78b7e78d7d8bce718a5b96a706ef5a881d3ad53c957def393d1012cc5df9078f",
     "backend/api/wizard_diagnostics.py": "062d447e1b4df74ee02c29bcf708c6845791007f589166d395a4a3e2e8729221",
     "backend/api/chat.py": "daac2821e9e4f43a85d346df6e43aea960d4826cca535e470388386e4ef6a3d4",
     "backend/api/models.py": "23a22c5668fbd6abf0c6f5527b118c8abecaa3f2f56c3a78660175c1685e326a",
     "backend/api/telemetry.py": "89d29fa1d32a1fc005a978450457460d2333d4c276f2cad93d5614c5b883bdf3",
-    "backend/config.py": "412b8222244b193fd319e153387a17db6b32c24923803c9dfc72122b74ac29f9",
+    "backend/config.py": "9365f2321ffa5d2a9133fcc209cbcee4d1287857f228fb5849f786b031ef3f9f",
     "backend/model_config.py": "51afea3ec0a04bc7c39d2fab45536c2ece6c448ac28ee5a8a4e1a52e1e9b15f1",
     "backend/providers/sglang_query_rewriter.py": "9c261291dcf40b1d58774a475dfc9f3a9e0a1b0485b40132b525deea67926d54",
     "backend/providers/sglang_qwen_llm.py": "2939407d50117ee6bbe0be767a6750a1478c06823800f712b8742c00c191e596",
@@ -46,7 +46,7 @@
     "backend/rag/retrieval.py": "d35205c5534fe32a850ab00e22ebb3262d9153b4ac1ca3b3c3d9a0b653f0d8b6",
     "backend/rag/session_title.py": "998f660fe323601efe1f6ea0a8a3ed31e4465e149d3295807d7179afa374177d",
     "backend/requirements.txt": "dc99e3f8f06d4b76f59039ff3af44c4ecbb30c38ac4c63d30dc9ae940e243546",
-    "backend/runtime_app.py": "a54690d002b786faf886865f2222f3d70df21a0ad5c899040ba1adb662d505d7",
+    "backend/runtime_app.py": "ea500aacdbae30a67eb4457a781a85a38c327915bd09cedcbfbef59ccc5ea229",
     "backend/task_queue.py": "dc8ca93135e1f7110e8de707ecd172efbd98f778129ae23c0df9bccdd7c38377",
     "backend/wizard/diagnostics.py": "1f99d7b02343ef1deb4c32972daa49fe925e30ae2e9200a933fc14bab387fb49",
     "backend/weaviate_client/_base.py": "a6c5383e8c37878307e0278a8812ac71f326adc11a6f1682d46511018246deeb",
@@ -59,8 +59,8 @@
     "deployment/e2e_diagnostic_api.py": "ab93a0240d14c0c6a67d1b7fbf684f14a0453186a3b09a12bfa3e895749af4e2",
     "deployment/evaluation_bridge.py": "b21b9f3bfb702b7b1f984896e5c587e0713d06ef6aab755ea9df631ad323aba0",
     "deployment/evaluation_bridge_worker.py": "fdbdda154394697ede0a80160ab727c41de89864be04dea6d29172f1008bcff7",
-    "deployment/modal_runtime.py": "c72c56380840855391f9667f7c548873df08e132fff51a6d2653efe182637a4e",
-    "deployment/ragctl.py": "d70151c6ce80df85d79c0f432f7de4b31f66784723aaec70fd8350bd5c0dcc89"
+    "deployment/modal_runtime.py": "780704f3e25d62e9fef7ebf079a7d31226c51d3193892c145a804e2090658a99",
+    "deployment/ragctl.py": "6e68f3a7a1344ceb21a6837e294ba6f04f3670706599531fc37fdf211dfa41e6"
   },
   "contracts": {
     "telemetry_schema_version": "1.0",

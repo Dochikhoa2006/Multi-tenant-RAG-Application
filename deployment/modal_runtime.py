@@ -58,6 +58,19 @@ if (
     and RAG_EVALUATION_EVIDENCE_ENABLED == "true"
 ):
     raise ValueError("deep diagnostics and evaluation evidence are mutually exclusive")
+RAG_ACCEPTANCE_OBSERVER_ENABLED = os.getenv(
+    "RAG_ACCEPTANCE_OBSERVER_ENABLED", "false"
+).strip().lower()
+if RAG_ACCEPTANCE_OBSERVER_ENABLED not in {"true", "false"}:
+    raise ValueError("RAG_ACCEPTANCE_OBSERVER_ENABLED must be true or false")
+RAG_ACCEPTANCE_EXPERIMENT_SHA256 = os.getenv(
+    "RAG_ACCEPTANCE_EXPERIMENT_SHA256", ""
+)
+if RAG_ACCEPTANCE_OBSERVER_ENABLED == "true" and (
+    len(RAG_ACCEPTANCE_EXPERIMENT_SHA256) != 64
+    or any(character not in "0123456789abcdef" for character in RAG_ACCEPTANCE_EXPERIMENT_SHA256)
+):
+    raise ValueError("RAG_ACCEPTANCE_EXPERIMENT_SHA256 must be a lowercase SHA-256 digest")
 
 RUNTIME_MODEL_ROOT = Path("/opt/runtime-models")
 GRANITE_MODEL_ROOT = Path("/opt/granite-models")
@@ -121,11 +134,16 @@ runtime_environment = {
     "UPLOAD_READ_CHUNK_BYTES": os.getenv("UPLOAD_READ_CHUNK_BYTES", "65536"),
     "WIZARD_DIAGNOSTICS_ENABLED": WIZARD_DIAGNOSTICS_ENABLED,
     "RAG_EVALUATION_EVIDENCE_ENABLED": RAG_EVALUATION_EVIDENCE_ENABLED,
+    "RAG_ACCEPTANCE_OBSERVER_ENABLED": RAG_ACCEPTANCE_OBSERVER_ENABLED,
 }
 if WIZARD_DIAGNOSTICS_ENABLED == "true":
     runtime_environment["RAG_DIAGNOSTIC_USER_ID"] = RAG_DIAGNOSTIC_USER_ID
 if RAG_EVALUATION_EVIDENCE_ENABLED == "true":
     runtime_environment["RAG_EVALUATION_USER_ID"] = RAG_EVALUATION_USER_ID
+if RAG_ACCEPTANCE_OBSERVER_ENABLED == "true":
+    runtime_environment["RAG_ACCEPTANCE_EXPERIMENT_SHA256"] = (
+        RAG_ACCEPTANCE_EXPERIMENT_SHA256
+    )
 
 image = (
     modal.Image.debian_slim(python_version="3.12")

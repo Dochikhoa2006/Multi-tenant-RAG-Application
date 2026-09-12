@@ -79,6 +79,8 @@ def test_modal_runtime_forwards_common_effective_ingestion_environment() -> None
     assert 'runtime_environment["RAG_DIAGNOSTIC_USER_ID"]' in source
     assert '"RAG_EVALUATION_EVIDENCE_ENABLED", "false"' in source
     assert 'runtime_environment["RAG_EVALUATION_USER_ID"]' in source
+    assert '"RAG_ACCEPTANCE_OBSERVER_ENABLED", "false"' in source
+    assert 'runtime_environment["RAG_ACCEPTANCE_EXPERIMENT_SHA256"]' in source
     assert "reseed" not in source.lower()
 
 

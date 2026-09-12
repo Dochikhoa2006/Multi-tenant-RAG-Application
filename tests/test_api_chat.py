@@ -12,6 +12,7 @@ from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 
 from backend.api.models import QueryRequest
+from backend.api import tasks as tasks_api
 from backend.api.telemetry import TELEMETRY_SCHEMA_VERSION, TIMING_KEYS
 from backend.api.chat import delete_session as delete_session_endpoint
 from backend.api.chat import query as query_endpoint
@@ -321,7 +322,11 @@ def _wait_for_task(client: TestClient, task_id: str) -> dict[str, object]:
     raise AssertionError("background task did not finish")
 
 
-def test_hidden_post_generation_acceptance_is_read_only_and_correlated() -> None:
+def test_hidden_post_generation_acceptance_is_read_only_and_correlated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tasks_api, "RAG_ACCEPTANCE_OBSERVER_ENABLED", True)
+    monkeypatch.setattr(tasks_api, "RAG_ACCEPTANCE_EXPERIMENT_SHA256", "a" * 64)
     services, *_ = _services()
     app = create_app(services)
     with TestClient(app) as client:
@@ -371,9 +376,10 @@ def test_hidden_post_generation_acceptance_is_read_only_and_correlated() -> None
             "embed_conversation", "generate_session_title"
         ]
         assert payload["evaluation_evidence_enabled"] is False
+        assert payload["acceptance_experiment_sha256"] == "a" * 64
         assert set(payload) == {
             "schema_version", "runtime_worker_id",
-            "evaluation_evidence_enabled", "tasks",
+            "evaluation_evidence_enabled", "acceptance_experiment_sha256", "tasks",
         }
         after = {
             key: record.snapshot()
@@ -390,6 +396,16 @@ def test_hidden_post_generation_acceptance_is_read_only_and_correlated() -> None
                 "session_id": session_id,
                 "conversation_id": conversation_id,
             },
+        ).status_code == 404
+
+
+def test_hidden_post_generation_acceptance_is_disabled_by_default() -> None:
+    services, *_ = _services()
+    with TestClient(create_app(services)) as client:
+        assert client.get(
+            "/api/tasks/_acceptance/post-generation",
+            params={"user_id": USER_ID, "session_id": str(uuid4()),
+                    "conversation_id": str(uuid4())},
         ).status_code == 404
 
 
