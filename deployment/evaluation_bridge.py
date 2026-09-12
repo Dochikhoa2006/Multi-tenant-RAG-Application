@@ -814,6 +814,30 @@ def _evidence_from_mapping(value: object) -> RequestEvidence:
     )
 
 
+def _pre_record_failure_code(stage: str, exc: Exception) -> str:
+    if stage != "HYDRATION":
+        return f"EVALUATION_{stage}_INVALID"
+    if not isinstance(exc, EvaluationBridgeError):
+        return "EVALUATION_HYDRATION_UNAVAILABLE"
+    message = str(exc)
+    predicates = (
+        ("empty ", "EMPTY_CONTEXT_MISMATCH"),
+        ("collection does not exist", "COLLECTION_MISSING"),
+        ("response is malformed", "RESPONSE_INVALID"),
+        ("properties are malformed", "PROPERTIES_INVALID"),
+        ("object ID", "OBJECT_ID_INVALID"),
+        ("chunk ID", "CHUNK_ID_INVALID"),
+        ("document ID", "DOCUMENT_ID_INVALID"),
+        ("storage identity", "STORAGE_IDENTITY_INVALID"),
+        ("outside the active corpus", "CORPUS_MEMBERSHIP_INVALID"),
+        ("exact context ID", "CONTEXT_SET_MISMATCH"),
+        ("fingerprint does not match", "FINGERPRINT_MISMATCH"),
+        ("ordered context digest", "ORDERED_DIGEST_MISMATCH"),
+    )
+    suffix = next((code for text, code in predicates if text in message), "INVALID")
+    return f"EVALUATION_HYDRATION_{suffix}"
+
+
 def run_admitted_evaluation_payload(
     payload: Mapping[str, object],
     *,
@@ -824,6 +848,7 @@ def run_admitted_evaluation_payload(
 
     started = perf_counter()
     launch: EvaluationLaunch | None = None
+    failure_stage = "WORKER_PAYLOAD"
     try:
         config_value = _mapping(payload.get("config"), "worker configuration")
         config = {str(name): str(value) for name, value in config_value.items()}
@@ -839,12 +864,14 @@ def run_admitted_evaluation_payload(
             }
             if len(allowed) != len(allowed_mapping):
                 raise EvaluationBridgeError("allowed document IDs are malformed")
+        failure_stage = "HYDRATION"
         contexts = resolve_exact_contexts(
             config,
             user_id=str(payload.get("user_id", "")),
             evidence=evidence,
             allowed_document_ids=allowed,
         )
+        failure_stage = "RECORD"
         record = build_evaluation_record(
             source=str(payload.get("source", "")),
             request_id=str(payload.get("request_id", "")),
@@ -894,12 +921,13 @@ def run_admitted_evaluation_payload(
             "result_path": None,
             "record_sha256": None,
         }
-    except Exception:
+    except Exception as exc:
         if launch is not None:
             cancel_local_evaluation(launch)
+        error_code = _pre_record_failure_code(failure_stage, exc)
         return {
             "status": "failed",
-            "error_code": "EVALUATION_EVIDENCE_INVALID",
+            "error_code": error_code,
             "record_path": (
                 None
                 if launch is None or launch.record_path is None

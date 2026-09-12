@@ -236,7 +236,7 @@ def test_supervised_worker_uses_private_ipc_and_returns_safe_failure(tmp_path: P
         os.close(descriptor)
     assert result == {
         "status": "failed",
-        "error_code": "EVALUATION_EVIDENCE_INVALID",
+        "error_code": "EVALUATION_WORKER_PAYLOAD_INVALID",
         "record_path": None,
         "result_path": None,
         "record_sha256": None,

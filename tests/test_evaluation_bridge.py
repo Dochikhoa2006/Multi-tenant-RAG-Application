@@ -575,6 +575,119 @@ def _submit_test_job(
     )
 
 
+@pytest.mark.parametrize(
+    ("stage", "error", "expected"),
+    [
+        ("WORKER_PAYLOAD", bridge.EvaluationBridgeError("bad"), "EVALUATION_WORKER_PAYLOAD_INVALID"),
+        ("HYDRATION", RuntimeError("private failure"), "EVALUATION_HYDRATION_UNAVAILABLE"),
+        ("HYDRATION", bridge.EvaluationBridgeError("empty knowledge evidence does not match"), "EVALUATION_HYDRATION_EMPTY_CONTEXT_MISMATCH"),
+        ("HYDRATION", bridge.EvaluationBridgeError("knowledge collection does not exist"), "EVALUATION_HYDRATION_COLLECTION_MISSING"),
+        ("HYDRATION", bridge.EvaluationBridgeError("context hydration response is malformed"), "EVALUATION_HYDRATION_RESPONSE_INVALID"),
+        ("HYDRATION", bridge.EvaluationBridgeError("context properties are malformed"), "EVALUATION_HYDRATION_PROPERTIES_INVALID"),
+        ("HYDRATION", bridge.EvaluationBridgeError("object ID is malformed"), "EVALUATION_HYDRATION_OBJECT_ID_INVALID"),
+        ("HYDRATION", bridge.EvaluationBridgeError("chunk ID is malformed"), "EVALUATION_HYDRATION_CHUNK_ID_INVALID"),
+        ("HYDRATION", bridge.EvaluationBridgeError("document ID is malformed"), "EVALUATION_HYDRATION_DOCUMENT_ID_INVALID"),
+        ("HYDRATION", bridge.EvaluationBridgeError("hydrated context violates storage identity"), "EVALUATION_HYDRATION_STORAGE_IDENTITY_INVALID"),
+        ("HYDRATION", bridge.EvaluationBridgeError("hydrated context is outside the active corpus"), "EVALUATION_HYDRATION_CORPUS_MEMBERSHIP_INVALID"),
+        ("HYDRATION", bridge.EvaluationBridgeError("not every exact context ID was hydrated once"), "EVALUATION_HYDRATION_CONTEXT_SET_MISMATCH"),
+        ("HYDRATION", bridge.EvaluationBridgeError("hydrated context fingerprint does not match"), "EVALUATION_HYDRATION_FINGERPRINT_MISMATCH"),
+        ("HYDRATION", bridge.EvaluationBridgeError("hydrated ordered context digest does not match"), "EVALUATION_HYDRATION_ORDERED_DIGEST_MISMATCH"),
+        ("RECORD", bridge.EvaluationBridgeError("bad"), "EVALUATION_RECORD_INVALID"),
+    ],
+)
+def test_pre_record_failures_map_to_sanitized_codes(
+    stage: str, error: Exception, expected: str
+) -> None:
+    assert bridge._pre_record_failure_code(stage, error) == expected
+
+
+def test_admitted_worker_preserves_failure_stage_and_success_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = bridge.parse_request_evidence(
+        _evidence_operation(),
+        user_id=USER,
+        trace_session_id=SESSION,
+        operation_id=OPERATION,
+        chat_session_id=CHAT_SESSION,
+        request_id=REQUEST,
+    )
+    payload = json.loads(
+        bridge._worker_payload(
+            config={},
+            user_id=USER,
+            evidence=evidence,
+            allowed_document_ids=None,
+            source="e2e",
+            request_id=REQUEST,
+            conversation_id="50000000-0000-4000-8000-000000000013",
+            original_query="Question?",
+            response="Answer.",
+            telemetry={"schema_version": "1.0", "timings_ms": {}},
+            captured_at="2026-09-11T00:00:00Z",
+            directory=tmp_path,
+            stem="request",
+            exact_names=False,
+            evaluation_job_id=str(uuid4()),
+            acceptance_activity_path=None,
+        )
+    )
+    malformed = bridge.run_admitted_evaluation_payload(
+        {}, execution_lock_fd=0, timeout_seconds=5.0
+    )
+    assert malformed["error_code"] == "EVALUATION_WORKER_PAYLOAD_INVALID"
+
+    monkeypatch.setattr(
+        bridge, "resolve_exact_contexts", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("private"))
+    )
+    unavailable = bridge.run_admitted_evaluation_payload(
+        payload, execution_lock_fd=0, timeout_seconds=5.0
+    )
+    assert unavailable["error_code"] == "EVALUATION_HYDRATION_UNAVAILABLE"
+
+    monkeypatch.setattr(
+        bridge,
+        "resolve_exact_contexts",
+        lambda *_a, **_k: bridge.ResolvedContexts(("Knowledge",), ("Policy",)),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "build_evaluation_record",
+        lambda **_k: (_ for _ in ()).throw(bridge.EvaluationBridgeError("bad")),
+    )
+    invalid_record = bridge.run_admitted_evaluation_payload(
+        payload, execution_lock_fd=0, timeout_seconds=5.0
+    )
+    assert invalid_record["error_code"] == "EVALUATION_RECORD_INVALID"
+
+    monkeypatch.setattr(bridge, "build_evaluation_record", lambda **_k: {})
+    monkeypatch.setattr(
+        bridge,
+        "start_local_evaluation",
+        lambda *_a, **_k: bridge.EvaluationLaunch(
+            bridge.perf_counter(), None, None, None, "a" * 64, "e2e", REQUEST,
+            "50000000-0000-4000-8000-000000000013",
+        ),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "finish_local_evaluation",
+        lambda *_a, **_k: bridge.EvaluationObservation(
+            "succeeded", None, 1.0, "record", "result", "a" * 64
+        ),
+    )
+    succeeded = bridge.run_admitted_evaluation_payload(
+        payload, execution_lock_fd=0, timeout_seconds=5.0
+    )
+    assert succeeded == {
+        "status": "succeeded",
+        "error_code": None,
+        "record_path": "record",
+        "result_path": "result",
+        "record_sha256": "a" * 64,
+    }
+
+
 def test_local_job_waits_cross_process_before_hydration_and_passes_lock_fd(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

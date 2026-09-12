@@ -1307,7 +1307,16 @@ def test_concurrent_asks_overlap_inference_and_each_attempts_bounded_evaluation(
             self.started = True
 
         def wait_operation(self, _operation_id: str) -> tuple[object, object, object]:
-            return {}, {}, {}
+            return {}, {
+                "outcome": "succeeded",
+                "finished_at": "2026-09-12T00:00:00Z",
+                "counts": {"qwen_knowledge_used_count": 1},
+                "flags": {"qwen_knowledge_used_proof_truncated": False},
+                "digests": {"qwen_knowledge_context_sha256": "a" * 64},
+                "samples": {"qwen_knowledge_used_ids": {"items": ["safe-id"]}},
+                "texts": {"raw_text": "RAW_CONTEXT_MUST_NOT_PERSIST"},
+                "credential": "CREDENTIAL_MUST_NOT_PERSIST",
+            }, {}
 
         def delete(self) -> None:
             self.started = False
@@ -1355,6 +1364,14 @@ def test_concurrent_asks_overlap_inference_and_each_attempts_bounded_evaluation(
     assert evaluation_submissions == request_count
     assert maximum_active_evaluations == 1
     assert len(list((tmp_path / "ask").glob("*/status.json"))) == request_count
+    evidence_files = list((tmp_path / "ask").glob("*/evidence.json"))
+    assert len(evidence_files) == request_count
+    for path in evidence_files:
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        rendered = path.read_text(encoding="utf-8")
+        assert "safe-id" in rendered
+        assert "RAW_CONTEXT_MUST_NOT_PERSIST" not in rendered
+        assert "CREDENTIAL_MUST_NOT_PERSIST" not in rendered
 
 
 def test_launcher_uses_the_public_telemetry_key_owner() -> None:

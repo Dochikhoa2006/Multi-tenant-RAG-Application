@@ -1864,6 +1864,34 @@ def ask(
             if trace is not None:
                 try:
                     _, trace_operation, _ = trace.wait_operation(trace_operation_id)
+                    trace_counts = trace_operation.get("counts", {})
+                    trace_flags = trace_operation.get("flags", {})
+                    trace_digests = trace_operation.get("digests", {})
+                    trace_samples = trace_operation.get("samples", {})
+                    evidence_groups = (
+                        ("counts", trace_counts, ("granite_rewritten_query_utf8_bytes", "qwen_knowledge_used_count", "qwen_knowledge_context_utf8_bytes", "qwen_policy_used_count", "qwen_policy_context_utf8_bytes")),
+                        ("flags", trace_flags, ("granite_rewritten_query_truncated", "qwen_knowledge_used_proof_truncated", "qwen_policy_used_proof_truncated")),
+                        ("digests", trace_digests, ("granite_rewritten_query_sha256", "qwen_knowledge_context_sha256", "qwen_policy_context_sha256")),
+                        ("samples", trace_samples, ("qwen_knowledge_used_ids", "qwen_knowledge_used_item_fingerprints", "qwen_policy_used_ids", "qwen_policy_used_item_fingerprints")),
+                    )
+                    write_private_json(
+                        ASK_DIAGNOSTICS_PATH / run_id / "evidence.json",
+                        {
+                            "schema_version": "1.0",
+                            "user_id": user_id,
+                            "request_id": done_payload.get("request_id"),
+                            "conversation_id": done_payload.get("conversation_id"),
+                            "chat_session_id": session_id,
+                            "trace_session_id": trace.session_id,
+                            "operation_id": trace_operation_id,
+                            "outcome": trace_operation.get("outcome"),
+                            "finished_at": trace_operation.get("finished_at"),
+                            **{
+                                group: {key: source.get(key) for key in keys}
+                                for group, source, keys in evidence_groups
+                            },
+                        },
+                    )
                 except Exception:
                     trace_error_code = "EVALUATION_EVIDENCE_INVALID"
                 finally:
