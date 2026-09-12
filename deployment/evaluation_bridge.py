@@ -338,8 +338,8 @@ def _fetch_contexts(
         if not isinstance(properties, Mapping):
             raise EvaluationBridgeError("context properties are malformed")
         object_id = _canonical_uuid(str(getattr(item, "uuid", None)), "object ID")
-        chunk_id = _canonical_uuid(properties.get("chunk_id"), "chunk ID")
-        document_id = _canonical_uuid(properties.get("document_id"), "document ID")
+        chunk_id = _canonical_uuid(str(properties.get("chunk_id")), "chunk ID")
+        document_id = _canonical_uuid(str(properties.get("document_id")), "document ID")
         paragraph_id = properties.get("paragraph_id")
         raw_text = properties.get("raw_text")
         if (

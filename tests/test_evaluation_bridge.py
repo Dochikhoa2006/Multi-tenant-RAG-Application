@@ -7,9 +7,10 @@ import stat
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from threading import Event
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -232,14 +233,16 @@ class _Storage:
         return None
 
 
-def _stored(chunk_id: str, document_id: str, text: str) -> object:
+def _stored(
+    chunk_id: str, document_id: str, text: str, *, uuid_properties: bool = False
+) -> object:
     return SimpleNamespace(
         uuid=chunk_id,
         properties={
             "user_id": USER,
-            "document_id": document_id,
+            "document_id": UUID(document_id) if uuid_properties else document_id,
             "paragraph_id": 1,
-            "chunk_id": chunk_id,
+            "chunk_id": UUID(chunk_id) if uuid_properties else chunk_id,
             "raw_text": text,
         },
     )
@@ -261,11 +264,26 @@ def test_exact_context_resolution_is_ordered_vector_free_and_document_scoped(
     collections = _Collections(
         {
             get_collection_name(USER, "knowledge_facts"): [
-                _stored(KNOWLEDGE_ID_2, KNOWLEDGE_DOCUMENT, "Knowledge second"),
-                _stored(KNOWLEDGE_ID, KNOWLEDGE_DOCUMENT, "Knowledge ünicode")
+                _stored(
+                    KNOWLEDGE_ID_2,
+                    KNOWLEDGE_DOCUMENT,
+                    "Knowledge second",
+                    uuid_properties=True,
+                ),
+                _stored(
+                    KNOWLEDGE_ID,
+                    KNOWLEDGE_DOCUMENT,
+                    "Knowledge ünicode",
+                    uuid_properties=True,
+                ),
             ],
             get_collection_name(USER, "policy"): [
-                _stored(POLICY_ID, POLICY_DOCUMENT, "Policy exact text")
+                _stored(
+                    POLICY_ID,
+                    POLICY_DOCUMENT,
+                    "Policy exact text",
+                    uuid_properties=True,
+                )
             ],
         }
     )
@@ -289,6 +307,75 @@ def test_exact_context_resolution_is_ordered_vector_free_and_document_scoped(
         assert args and len(args[0]) in {1, 2}
         assert kwargs["include_vector"] is False
         assert kwargs["return_properties"] == list(bridge._PROPERTIES)
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        ("chunk", "chunk ID is malformed"),
+        ("document", "document ID is malformed"),
+        ("identity", "storage identity"),
+        ("fingerprint", "fingerprint does not match"),
+        ("digest", "ordered context digest does not match"),
+    ],
+)
+def test_uuid_property_normalization_preserves_hydration_validation(
+    monkeypatch: pytest.MonkeyPatch, failure: str, message: str
+) -> None:
+    evidence = bridge.parse_request_evidence(
+        _evidence_operation(),
+        user_id=USER,
+        trace_session_id=SESSION,
+        operation_id=OPERATION,
+        chat_session_id=CHAT_SESSION,
+        request_id=REQUEST,
+    )
+    knowledge = _stored(
+        KNOWLEDGE_ID,
+        KNOWLEDGE_DOCUMENT,
+        "Knowledge ünicode",
+        uuid_properties=True,
+    )
+    if failure == "chunk":
+        knowledge.properties["chunk_id"] = "not-a-uuid"
+    elif failure == "document":
+        knowledge.properties["document_id"] = "not-a-uuid"
+    elif failure == "identity":
+        knowledge.properties["chunk_id"] = UUID(KNOWLEDGE_ID_2)
+    elif failure == "fingerprint":
+        knowledge.properties["raw_text"] = "Changed knowledge"
+    else:
+        evidence = replace(
+            evidence,
+            knowledge=replace(evidence.knowledge, digest="0" * 64),
+        )
+    from backend.config import get_collection_name
+
+    _Storage.collections = _Collections(
+        {
+            get_collection_name(USER, "knowledge_facts"): [
+                knowledge,
+                _stored(
+                    KNOWLEDGE_ID_2,
+                    KNOWLEDGE_DOCUMENT,
+                    "Knowledge second",
+                    uuid_properties=True,
+                ),
+            ],
+            get_collection_name(USER, "policy"): [
+                _stored(
+                    POLICY_ID,
+                    POLICY_DOCUMENT,
+                    "Policy exact text",
+                    uuid_properties=True,
+                )
+            ],
+        }
+    )
+    monkeypatch.setattr(bridge, "CorpusStorage", _Storage)
+
+    with pytest.raises(bridge.EvaluationBridgeError, match=message):
+        bridge.resolve_exact_contexts({}, user_id=USER, evidence=evidence)
 
 
 def test_context_resolution_fails_closed_on_wrong_owner(
