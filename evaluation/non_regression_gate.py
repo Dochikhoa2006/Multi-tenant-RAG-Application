@@ -274,21 +274,19 @@ def validate_live_prerequisites(
     from deployment.ragctl import load_dotenv, validate_config
     from deployment.wizard_diagnostic import (
         load_corpus_state,
-        validate_diagnostic_user,
     )
 
     try:
         config = load_dotenv(env_path)
         validate_config(config)
-        diagnostic_user, _ = validate_diagnostic_user(config)
+        rag_user = config["RAG_USER_ID"]
         selection = load_query_selection(queries_path, ROOT, start=0, limit=None)
-        state = load_corpus_state(corpus_state_path, diagnostic_user)
-        active = validate_reusable_corpus_state(state, diagnostic_user)
+        state = load_corpus_state(corpus_state_path, rag_user)
+        active = validate_reusable_corpus_state(state, rag_user)
     except Exception as exc:
         raise GateError("live configuration, query, or corpus prerequisite failed") from exc
-    rag_user = config.get("RAG_USER_ID", "").strip()
-    if not rag_user or rag_user != diagnostic_user or state is None or state.diagnostic_user_id != rag_user:
-        raise GateError("RAG, diagnostic, and settled corpus users must match")
+    if state is None or state.diagnostic_user_id != rag_user:
+        raise GateError("settled corpus owner must match RAG_USER_ID")
     fixture_counts: dict[str, int] = {}
     for collection in ("knowledge", "policy"):
         folder = fixtures_path / collection
@@ -308,7 +306,7 @@ def validate_live_prerequisites(
     return {
         "status": "passed",
         "protected_contracts": protected,
-        "diagnostic_user_configured": True,
+        "corpus_owner_is_rag_user": True,
         "query_count": len(selection.selected),
         "fixture_counts": fixture_counts,
         "active_generation": active.generation_id,
@@ -1158,7 +1156,11 @@ def _collect_functional(args: argparse.Namespace) -> dict[str, object]:
     finally:
         ragctl.down(config, runner)
     before = set(ragctl.E2E_DIAGNOSTICS_PATH.iterdir()) if ragctl.E2E_DIAGNOSTICS_PATH.exists() else set()
-    ragctl.diagnose_e2e(config, runner, args.queries, start=0, limit=args.e2e_limit)
+    acceptance_e2e_config = dict(config)
+    acceptance_e2e_config["RAG_DIAGNOSTIC_USER_ID"] = user
+    ragctl.diagnose_e2e(
+        acceptance_e2e_config, runner, args.queries, start=0, limit=args.e2e_limit
+    )
     created = set(ragctl.E2E_DIAGNOSTICS_PATH.iterdir()) - before
     if len(created) != 1:
         raise GateError("E2E diagnostic artifact correlation failed")

@@ -96,6 +96,14 @@ def test_config_requires_complete_modal_target() -> None:
         ragctl.validate_config(config)
 
 
+def test_config_requires_explicit_rag_user() -> None:
+    config = _config()
+    del config["RAG_USER_ID"]
+
+    with pytest.raises(ragctl.RagCtlError, match="RAG_USER_ID"):
+        ragctl.validate_config(config)
+
+
 def test_config_rejects_modal_token_environment_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -348,6 +356,7 @@ def test_only_runtime_deployment_receives_default_off_diagnostic_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _config()
+    config["RAG_USER_ID"] = "primary_rag_user"
     config.update(
         {
             "MODAL_SGLANG_GPU": "H100",
@@ -366,7 +375,7 @@ def test_only_runtime_deployment_receives_default_off_diagnostic_override(
     assert runner.options[2]["overrides"] == {
         "WIZARD_DIAGNOSTICS_ENABLED": "false",
         "RAG_EVALUATION_EVIDENCE_ENABLED": "true",
-        "RAG_EVALUATION_USER_ID": ragctl.DEFAULT_USER_ID,
+        "RAG_EVALUATION_USER_ID": "primary_rag_user",
         "RAG_ACCEPTANCE_OBSERVER_ENABLED": "false",
     }
     assert ragctl.gpu_request(config, "MODAL_SGLANG_GPU") == "H100"
@@ -403,6 +412,7 @@ def test_acceptance_observer_override_is_explicit_and_runtime_scoped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _config()
+    config["RAG_USER_ID"] = "primary_rag_user"
     runner = FakeRunner(config)
     monkeypatch.setattr(ragctl, "resolve_server_url", lambda *_: "https://worker")
 
@@ -414,7 +424,7 @@ def test_acceptance_observer_override_is_explicit_and_runtime_scoped(
     assert runner.options[0]["overrides"] == {
         "WIZARD_DIAGNOSTICS_ENABLED": "false",
         "RAG_EVALUATION_EVIDENCE_ENABLED": "true",
-        "RAG_EVALUATION_USER_ID": ragctl.DEFAULT_USER_ID,
+        "RAG_EVALUATION_USER_ID": "primary_rag_user",
         "RAG_ACCEPTANCE_OBSERVER_ENABLED": "true",
         "RAG_ACCEPTANCE_EXPERIMENT_SHA256": "a" * 64,
     }
@@ -697,6 +707,104 @@ def test_e2e_lifecycle_is_down_up_diagnostic_down_and_traced_runtime(
     assert events == ["down", "up", "diagnostic", "down"]
 
 
+def test_live_acceptance_preflight_loads_corpus_for_primary_rag_user(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from deployment import e2e_diagnostic, wizard_diagnostic
+    from evaluation import non_regression_gate as gate
+
+    config = _config()
+    config["RAG_USER_ID"] = "primary_rag_user"
+    config["RAG_DIAGNOSTIC_USER_ID"] = "standalone_diagnostic_user"
+    fixtures = _diagnostic_fixture_tree(tmp_path)
+    loaded_users: list[str] = []
+    state = SimpleNamespace(diagnostic_user_id="primary_rag_user")
+    monkeypatch.setattr(gate, "validate_protected_contracts", lambda: {"status": "passed"})
+    monkeypatch.setattr(ragctl, "load_dotenv", lambda _path: config)
+    monkeypatch.setattr(
+        e2e_diagnostic,
+        "load_query_selection",
+        lambda *_args, **_kwargs: SimpleNamespace(selected=(object(),)),
+    )
+    monkeypatch.setattr(
+        wizard_diagnostic,
+        "load_corpus_state",
+        lambda _path, user: (loaded_users.append(user), state)[1],
+    )
+    monkeypatch.setattr(
+        e2e_diagnostic,
+        "validate_reusable_corpus_state",
+        lambda _state, user: SimpleNamespace(generation_id=f"generation-{user}"),
+    )
+
+    result = gate.validate_live_prerequisites(
+        env_path=tmp_path / ".env",
+        fixtures_path=fixtures,
+        queries_path=tmp_path / "queries.py",
+        corpus_state_path=tmp_path / "corpus-state.json",
+    )
+
+    assert loaded_users == ["primary_rag_user"]
+    assert result["corpus_owner_is_rag_user"] is True
+
+
+def test_functional_acceptance_routes_ask_and_e2e_to_primary_rag_user(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from evaluation import non_regression_gate as gate
+
+    config = _config()
+    config["RAG_USER_ID"] = "primary_rag_user"
+    config["RAG_DIAGNOSTIC_USER_ID"] = "standalone_diagnostic_user"
+    selection = SimpleNamespace(selected=(SimpleNamespace(text="question"),))
+    inputs = {
+        "config": config,
+        "user": "primary_rag_user",
+        "selection": selection,
+        "configuration_sha256": "a" * 64,
+        "corpus_sha256": "b" * 64,
+        "models_sha256": "c" * 64,
+    }
+    e2e_root = tmp_path / "e2e"
+    e2e_root.mkdir()
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(gate, "_live_inputs", lambda _args: inputs)
+    monkeypatch.setattr(ragctl, "CommandRunner", lambda _config: object())
+    monkeypatch.setattr(ragctl, "down", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ragctl, "up", lambda *_args, **_kwargs: None)
+    def ask_sample(_config: object, user: str, _question: str) -> dict[str, object]:
+        observed["ask_user"] = user
+        return {}
+
+    monkeypatch.setattr(gate, "_ask_sample", ask_sample)
+    monkeypatch.setattr(gate, "_runtime_instance", lambda _runner: "runtime")
+    monkeypatch.setattr(gate, "_validate_live_sample", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(gate, "validate_evaluation_success", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(ragctl, "E2E_DIAGNOSTICS_PATH", e2e_root)
+
+    def diagnose(config_value: dict[str, str], *_args: object, **_kwargs: object) -> None:
+        observed["e2e_config"] = config_value
+        run = e2e_root / "run"
+        run.mkdir()
+        (run / "requests.jsonl").write_text(
+            json.dumps({"status": "succeeded", "evaluation": {}}) + "\n",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(ragctl, "diagnose_e2e", diagnose)
+    args = SimpleNamespace(
+        output=tmp_path / "output", queries=tmp_path / "queries.py", e2e_limit=1
+    )
+
+    gate._collect_functional(args)
+
+    acceptance_config = observed["e2e_config"]
+    assert observed["ask_user"] == "primary_rag_user"
+    assert acceptance_config["RAG_USER_ID"] == "primary_rag_user"  # type: ignore[index]
+    assert acceptance_config["RAG_DIAGNOSTIC_USER_ID"] == "primary_rag_user"  # type: ignore[index]
+    assert config["RAG_DIAGNOSTIC_USER_ID"] == "standalone_diagnostic_user"
+
+
 def test_e2e_preflight_failure_happens_before_lifecycle(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -865,6 +973,7 @@ def test_ask_evaluation_failure_is_informational_and_query_is_sent_once(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    primary_user = "primary_rag_user"
     request_id = "70000000-0000-4000-8000-000000000001"
     session_id = "70000000-0000-4000-8000-000000000002"
     conversation_id = "70000000-0000-4000-8000-000000000003"
@@ -914,12 +1023,18 @@ def test_ask_evaluation_failure_is_informational_and_query_is_sent_once(
 
         def post(self, url: str, **_kwargs: object) -> Response:
             if url.endswith("/api/chat/sessions"):
+                assert _kwargs["json"] == {"user_id": primary_user}
                 return Response(201, {"session_id": session_id})
             assert url.endswith("/api/_diagnostics/wizard/trace")
             return Response(404)
 
         def stream(self, _method: str, url: str, **_kwargs: object) -> Response:
             assert url.endswith("/api/chat/query")
+            assert _kwargs["json"] == {
+                "user_id": primary_user,
+                "session_id": session_id,
+                "question": "question",
+            }
             type(self).query_posts += 1
             return Response(
                 200,
@@ -955,8 +1070,10 @@ def test_ask_evaluation_failure_is_informational_and_query_is_sent_once(
     monkeypatch.setattr(ragctl, "ASK_DIAGNOSTICS_PATH", tmp_path / "ask")
 
     done_validated: list[bool] = []
+    config = _config()
+    config["RAG_USER_ID"] = primary_user
     ragctl.ask(
-        _config(), "question",
+        config, "question",
         _acceptance_done_validated_hook=lambda: done_validated.append(True),
     )
 

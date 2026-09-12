@@ -93,6 +93,7 @@ MODAL_TARGET_KEYS = (
 )
 
 REQUIRED_ENV_KEYS = (
+    "RAG_USER_ID",
     "WEAVIATE_URL",
     "WEAVIATE_API_KEY",
     "WEAVIATE_CONNECTION_MODE",
@@ -564,7 +565,7 @@ def verify_weaviate(config: Mapping[str, str]) -> None:
             if not client.is_ready():
                 raise RagCtlError("Pinned Weaviate client did not report ready")
             names = set(client.collections.list_all(simple=True))
-            expected = user_collection_names(config.get("RAG_USER_ID", DEFAULT_USER_ID))
+            expected = user_collection_names(config["RAG_USER_ID"])
             if not expected.issubset(names):
                 raise RagCtlError("The persisted user does not have all three collections")
         except RagCtlError:
@@ -852,9 +853,7 @@ def deploy_runtime(
     acceptance_observer_enabled: bool = False,
     acceptance_experiment_sha256: str | None = None,
 ) -> str:
-    evaluation_user_id = (
-        config.get("RAG_USER_ID", DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
-    )
+    evaluation_user_id = config["RAG_USER_ID"]
     overrides = {
         "WIZARD_DIAGNOSTICS_ENABLED": "false",
         "RAG_EVALUATION_EVIDENCE_ENABLED": (
@@ -1730,7 +1729,7 @@ def ask(
     question_text = (question if question is not None else input("Question: ")).strip()
     if not question_text:
         raise RagCtlError("Question must not be empty")
-    user_id = config.get("RAG_USER_ID", DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
+    user_id = config["RAG_USER_ID"]
     headers = _runtime_headers(config)
     timeout = httpx.Timeout(connect=30, read=900, write=120, pool=30)
     run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid4().hex[:12]
@@ -2124,7 +2123,6 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parser().parse_args(argv)
     config = load_dotenv(ENV_PATH)
-    config.setdefault("RAG_USER_ID", DEFAULT_USER_ID)
     runner = CommandRunner(config)
     try:
         if args.command == "up":
