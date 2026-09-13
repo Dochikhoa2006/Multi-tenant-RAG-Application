@@ -428,6 +428,7 @@ class RagasMetricBackend:
                 client=client,
                 temperature=0.0,
                 max_tokens=4096,
+                reasoning_effort="none",
             )
             embeddings = await asyncio.to_thread(
                 HuggingFaceEmbeddings,

@@ -144,6 +144,7 @@ def test_backend_uses_bounded_judge_output_without_changing_client_safety() -> N
     assert ast.unparse(llm["client"]) == "client"
     assert ast.literal_eval(llm["temperature"]) == 0.0
     assert ast.literal_eval(llm["max_tokens"]) == 4096
+    assert ast.literal_eval(llm["reasoning_effort"]) == "none"
 
     client = keywords(named_call("AsyncOpenAI"))
     assert ast.unparse(client["base_url"]) == "settings.openai_base_url"
