@@ -25,6 +25,9 @@ import warnings
 
 import httpx
 
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from backend.api.telemetry import TIMING_KEYS
 
 
@@ -1210,11 +1213,17 @@ def diagnose_wizard(
         create_diagnostic_run,
         load_corpus_state,
         preflight_wizard_fixtures,
-        update_run_summary,
+        update_run_summary as _update_run_summary,
         validate_corpus_preflight,
         validate_diagnostic_user,
+        write_ingestion_report,
     )
     from deployment.wizard_diagnostic_api import run_wizard_phase_1c
+
+    def update_run_summary(run: object, **kwargs: Any) -> None:
+        _update_run_summary(run, **kwargs)
+        if bootstrap_primary_user_collections and kwargs.get("finished"):
+            write_ingestion_report(run, fixtures, WIZARD_CORPUS_STATE_PATH)
 
     diagnostic_user_id, other_user_id = validate_diagnostic_user(config)
     if bootstrap_primary_user_collections:
@@ -1222,7 +1231,12 @@ def diagnose_wizard(
             raise RagCtlError("Primary collection bootstrap cannot reseed corpus data")
         if diagnostic_user_id != config["RAG_USER_ID"]:
             raise RagCtlError("Primary collection bootstrap requires RAG_USER_ID")
-    fixtures = preflight_wizard_fixtures(fixtures_path, PROJECT_ROOT, config)
+    fixtures = preflight_wizard_fixtures(
+        fixtures_path,
+        PROJECT_ROOT,
+        config,
+        strict_private=bootstrap_primary_user_collections,
+    )
     with corpus_state_lock(WIZARD_CORPUS_LOCK_PATH):
         corpus_state = load_corpus_state(
             WIZARD_CORPUS_STATE_PATH, diagnostic_user_id
@@ -1430,17 +1444,18 @@ def diagnose_e2e(
     start: int = 0,
     limit: int | None = None,
     continuous: bool = False,
+    dataset_evaluation: bool = False,
 ) -> None:
     """Run Phase 2D queries against the retained, verified Phase 1 corpus."""
 
     validate_config(config)
-    from backend.wizard.diagnostics import TRACE_SESSION_MAX_OPERATIONS
     from deployment.e2e_diagnostic import (
         RequestRecorder,
         create_e2e_run,
         load_query_selection,
         update_e2e_summary,
         validate_reusable_corpus_state,
+        dataset_identities,
     )
     from deployment.e2e_diagnostic_api import run_e2e_phase_2d
     from deployment.wizard_diagnostic import (
@@ -1449,14 +1464,19 @@ def diagnose_e2e(
         validate_diagnostic_user,
     )
 
-    diagnostic_user_id, _ = validate_diagnostic_user(config)
+    if dataset_evaluation:
+        diagnostic_user_id = config["RAG_USER_ID"]
+        if start != 0 or limit is not None:
+            raise RagCtlError("Dataset evaluation must execute the complete query file")
+    else:
+        diagnostic_user_id, _ = validate_diagnostic_user(config)
     selection = load_query_selection(
         queries_path,
         PROJECT_ROOT,
         start=start,
         limit=limit,
     )
-    if len(selection.selected) > TRACE_SESSION_MAX_OPERATIONS:
+    if not dataset_evaluation and len(selection.selected) > 256:
         raise RagCtlError(
             "E2E selection exceeds the bounded diagnostic trace capacity"
         )
@@ -1468,6 +1488,7 @@ def diagnose_e2e(
         active = validate_reusable_corpus_state(corpus_state, diagnostic_user_id)
         if corpus_state is None:  # pragma: no cover - validator owns this invariant.
             raise RagCtlError("Phase 1 corpus state is unavailable")
+        identities = dataset_identities(config, corpus_state) if dataset_evaluation else None
         run = create_e2e_run(
             E2E_DIAGNOSTICS_PATH,
             diagnostic_user_id,
@@ -1476,6 +1497,8 @@ def diagnose_e2e(
             continuous=continuous,
         )
         recorder = RequestRecorder(run.requests_path)
+        if dataset_evaluation:
+            recorder.dataset = (selection, active, identities)
         progress: dict[str, object] = {
             "physical_corpus_status": "pending",
             "trace_status": "not_started",
@@ -1589,6 +1612,7 @@ def diagnose_e2e(
                 progress,
                 continuous=continuous,
                 run_id=run.run_id,
+                **({"dataset_evaluation": True} if dataset_evaluation else {}),
             )
         except BaseException as exc:
             phase_error = exc
@@ -2153,6 +2177,11 @@ def parser() -> argparse.ArgumentParser:
         help="fixture root containing knowledge/ and policy/",
     )
     wizard_parser.add_argument(
+        "--bootstrap-primary-user-collections",
+        action="store_true",
+        help="explicitly bootstrap a fresh corpus for RAG_USER_ID",
+    )
+    wizard_parser.add_argument(
         "--reseed-corpus",
         action="store_true",
         help="replace the recorded corpus before retiring its old documents",
@@ -2164,7 +2193,12 @@ def parser() -> argparse.ArgumentParser:
         "--queries",
         type=Path,
         required=True,
-        help="Python file containing one literal QUERIES list",
+        help="external JSONL dataset or Python file with a literal QUERIES list",
+    )
+    e2e_parser.add_argument(
+        "--dataset-evaluation",
+        action="store_true",
+        help="evaluate every external dataset record as RAG_USER_ID",
     )
     e2e_parser.add_argument(
         "--start",
@@ -2191,6 +2225,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = load_dotenv(ENV_PATH)
     runner = CommandRunner(config)
     try:
+        if getattr(args, "dataset_evaluation", False) and any(
+            token.split("=", 1)[0] in {"--start", "--limit"}
+            for token in (sys.argv[1:] if argv is None else argv)
+        ):
+            raise RagCtlError("Dataset evaluation does not accept --start or --limit")
         if args.command == "up":
             up(config, runner)
         elif args.command == "ask":
@@ -2205,11 +2244,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "down":
             down(config, runner)
         elif args.command == "diagnose" and args.diagnostic == "wizard":
+            wizard_config = config
+            if args.bootstrap_primary_user_collections:
+                wizard_config = dict(config)
+                wizard_config["RAG_DIAGNOSTIC_USER_ID"] = config["RAG_USER_ID"]
             diagnose_wizard(
-                config,
-                runner,
+                wizard_config,
+                CommandRunner(wizard_config),
                 args.fixtures,
                 reseed_corpus=args.reseed_corpus,
+                bootstrap_primary_user_collections=args.bootstrap_primary_user_collections,
             )
         elif args.command == "diagnose" and args.diagnostic == "e2e":
             diagnose_e2e(
@@ -2219,6 +2263,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 start=args.start,
                 limit=args.limit,
                 continuous=args.continuous,
+                dataset_evaluation=args.dataset_evaluation,
             )
         else:  # pragma: no cover - argparse owns this invariant
             raise RagCtlError(f"Unknown command: {args.command}")

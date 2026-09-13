@@ -426,9 +426,17 @@ def build_evaluation_record(
     evidence: RequestEvidence,
     contexts: ResolvedContexts,
     captured_at: str,
+    reference: str | None = None,
+    reference_context_ids: tuple[str, ...] = (),
 ) -> dict[str, object]:
     if source not in {"e2e", "rag_ask"}:
         raise EvaluationBridgeError("evaluation source is invalid")
+    if reference is not None and (not isinstance(reference, str) or not reference.strip()):
+        raise EvaluationBridgeError("evaluation reference is invalid")
+    if not isinstance(reference_context_ids, (tuple, list)) or len(set(reference_context_ids)) != len(reference_context_ids):
+        raise EvaluationBridgeError("reference context IDs are invalid")
+    for identifier in reference_context_ids:
+        _canonical_uuid(identifier, "reference context ID")
     if _canonical_uuid(request_id, "request ID") != evidence.request_id:
         raise EvaluationBridgeError("evaluation request correlation is invalid")
     _canonical_uuid(conversation_id, "conversation ID")
@@ -457,8 +465,8 @@ def build_evaluation_record(
         "context_roles": ["knowledge"] * len(contexts.knowledge)
         + ["policy"] * len(contexts.policy),
         "telemetry": dict(telemetry),
-        "reference": None,
-        "reference_context_ids": [],
+        "reference": reference,
+        "reference_context_ids": list(reference_context_ids),
         "captured_at": parsed.astimezone(timezone.utc)
         .isoformat()
         .replace("+00:00", "Z"),
@@ -882,6 +890,8 @@ def run_admitted_evaluation_payload(
             evidence=evidence,
             contexts=contexts,
             captured_at=str(payload.get("captured_at", "")),
+            reference=payload.get("reference"),
+            reference_context_ids=payload.get("reference_context_ids", []),
         )
         remaining = timeout_seconds - (perf_counter() - started)
         if remaining <= 0:
@@ -975,6 +985,8 @@ def _worker_payload(
     exact_names: bool,
     evaluation_job_id: str,
     acceptance_activity_path: Path | None,
+    reference: str | None = None,
+    reference_context_ids: tuple[str, ...] = (),
 ) -> bytes:
     hydration_config = {
         name: config[name]
@@ -1007,6 +1019,8 @@ def _worker_payload(
         "acceptance_activity_path": (
             None if acceptance_activity_path is None else str(acceptance_activity_path)
         ),
+        "reference": reference,
+        "reference_context_ids": list(reference_context_ids),
     }
     return _canonical_bytes(payload)
 
@@ -1088,6 +1102,8 @@ def _execute_evaluation_job(
     exact_names: bool,
     evaluation_job_id: str,
     acceptance_activity_path: Path | None,
+    reference: str | None = None,
+    reference_context_ids: tuple[str, ...] = (),
 ) -> EvaluationObservation:
     descriptor: int | None = None
     queue_wait_ms = 0.0
@@ -1127,6 +1143,8 @@ def _execute_evaluation_job(
             exact_names=exact_names,
             evaluation_job_id=evaluation_job_id,
             acceptance_activity_path=acceptance_activity_path,
+            reference=reference,
+            reference_context_ids=tuple(reference_context_ids),
         )
         if cancel_event.is_set():
             return EvaluationObservation(
@@ -1268,6 +1286,8 @@ def submit_local_evaluation(
     exact_names: bool = False,
     execution_lock_path: Path = LOCAL_EVALUATION_LOCK_PATH,
     acceptance_activity_path: Path | None = None,
+    reference: str | None = None,
+    reference_context_ids: tuple[str, ...] = (),
 ) -> EvaluationJob:
     """Submit one bounded local evidence-hydration and evaluator job."""
 
@@ -1327,6 +1347,8 @@ def submit_local_evaluation(
             exact_names=exact_names,
             evaluation_job_id=evaluation_job_id,
             acceptance_activity_path=acceptance_activity_path,
+            reference=reference,
+            reference_context_ids=reference_context_ids,
         )
     except Exception:
         with _LOCAL_JOB_LOCK:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 import hashlib
 import json
@@ -68,6 +68,7 @@ TRACE_FINALIZATION_TIMEOUT_SECONDS = 30.0
 TRACE_POLL_SECONDS = 0.1
 TASK_TIMEOUT_SECONDS = 900.0
 TASK_POLL_SECONDS = 1.0
+DATASET_TRACE_ROTATION_SIZE = 64
 
 
 @dataclass(frozen=True)
@@ -1082,15 +1083,20 @@ class _DeepTraceSession:
             raise DeepTraceContractError("Deep trace operation correlation is invalid")
         return payload, operation
 
-    def delete(self) -> None:
+    def delete(self, *, confirm_absent: bool = False) -> None:
         if not self.started:
             return
         response = self.client.delete(
             f"{self.runtime_url}{TRACE_PATH}",
             params={"user_id": self.user_id, "session_id": self.session_id},
         )
-        if response.status_code != 204:
+        if response.status_code != 204 and not (confirm_absent and response.status_code == 404):
             raise DeepTraceContractError("Deep trace session could not be deleted")
+        if confirm_absent and self.client.get(
+            f"{self.runtime_url}{TRACE_PATH}",
+            params={"user_id": self.user_id, "session_id": self.session_id},
+        ).status_code != 404:
+            raise DeepTraceContractError("Deep trace deletion was not confirmed")
         self.started = False
 
 
@@ -1460,6 +1466,7 @@ def verify_session_postcondition(
 def _record_attempt(recorder: RequestRecorder, result: QueryAttemptResult) -> None:
     recorder.record(
         source_index=result.query.source_index,
+        query_id=result.query.query_id,
         status=result.status,
         question=result.question,
         answer=result.answer,
@@ -1583,6 +1590,117 @@ def format_query_terminal(result: QueryAttemptResult) -> str:
     )
 
 
+def format_query_terminal_private(result: QueryAttemptResult) -> str:
+    """Render dataset progress without disclosing question, rewrite, or answer."""
+
+    evaluation = result.evaluation if isinstance(result.evaluation, Mapping) else {}
+    return (
+        f"Query [{result.query.source_index}] id={json.dumps(result.query.query_id)} "
+        f"status={result.status} failure={result.failure_code or 'none'} "
+        f"tokens={result.token_event_count} duration_ms={round(result.duration_ms, 3)} "
+        f"evaluation={evaluation.get('status', 'skipped')}"
+    )
+
+
+def _validate_dataset_evaluation(
+    evaluation: Mapping[str, object], query: SelectedQuery,
+    expected_request: Mapping[str, object], directory: Path,
+) -> dict[str, object]:
+    from deployment.e2e_diagnostic import _safe_result
+    from deployment.evaluation_bridge import _canonical_bytes
+
+    artifact = dict(evaluation)
+    try:
+        value = _safe_result(artifact.get("result_path"), directory)
+        record = _safe_result(artifact.get("record_path"), directory)
+        if value is None or record is None:
+            raise ValueError("Evaluation artifacts are unavailable")
+        if (
+            artifact.get("status") != "succeeded"
+            or value.get("status") != "succeeded"
+            or record.get("schema_version") != "1.0" or value.get("schema_version") != "1.0"
+            or hashlib.sha256(_canonical_bytes(record)).hexdigest() != artifact.get("record_sha256")
+            or value.get("record_sha256") != artifact.get("record_sha256")
+            or value.get("ragas_version") != "0.4.3"
+        ):
+            raise ValueError("Evaluation result contract mismatch")
+        for key in ("request_id", "conversation_id"):
+            if value.get(key) != expected_request.get(key) or record.get(key) != value.get(key):
+                raise ValueError("Evaluation correlation mismatch")
+        if (
+            value.get("source") != "e2e" or record.get("source") != "e2e"
+            or record.get("original_query") != query.question
+            or record.get("response") != expected_request.get("answer")
+            or record.get("telemetry") != expected_request.get("telemetry")
+        ):
+            raise ValueError("Evaluation public stream mismatch")
+        trace = expected_request["deep_trace"]
+        operation = trace["operation"]
+        evidence = parse_request_evidence(
+            operation, user_id=operation["user_id"], trace_session_id=trace["session_id"],
+            operation_id=operation["operation_id"], chat_session_id=expected_request["session_id"],
+            request_id=expected_request["request_id"],
+        )
+        if record.get("rewritten_query") != evidence.rewritten_query:
+            raise ValueError("Evaluation rewrite mismatch")
+        for name, identity in (("knowledge", evidence.knowledge), ("policy", evidence.policy)):
+            texts = record[f"{name}_contexts"]
+            if record[f"{name}_context_ids"] != list(identity.ids) or len(texts) != len(identity.ids):
+                raise ValueError("Evaluation final context identity mismatch")
+            parts = [part for identifier, text in zip(identity.ids, texts, strict=True)
+                     for part in (identifier.encode("utf-8"), text.encode("utf-8"))]
+            if framed_content_digest(f"chat-qwen-{name}-context-v1", parts) != identity.digest:
+                raise ValueError("Evaluation context bytes mismatch")
+        if record["retrieved_contexts"] != record["knowledge_contexts"] + record["policy_contexts"] or record["context_roles"] != ["knowledge"] * len(evidence.knowledge.ids) + ["policy"] * len(evidence.policy.ids):
+            raise ValueError("Evaluation context prompt order mismatch")
+        if record.get("reference") != query.reference or record.get(
+            "reference_context_ids"
+        ) != list(query.reference_context_ids):
+            raise ValueError("Reference provenance mismatch")
+        if value["judge"].get("model") != "qwen3.5:4b" or value[
+            "embeddings"
+        ].get("dimension") != 384:
+            raise ValueError("Evaluator model identity mismatch")
+        required = {"faithfulness", "response_relevancy", "context_utilization"}
+        if query.reference is not None:
+            required |= {"context_recall", "context_precision_with_reference", "factual_correctness"}
+        outcomes = {item["name"]: item for item in value["metrics"]}
+        if len(outcomes) != len(value["metrics"]):
+            raise ValueError("Duplicated evaluation metric")
+        for name in required:
+            outcome = outcomes.get(name, {})
+            score = outcome.get("score")
+            if (
+                outcome.get("status") != "succeeded"
+                or isinstance(score, bool) or not isinstance(score, (int, float))
+                or not math.isfinite(score) or not 0 <= score <= 1
+            ):
+                raise ValueError("Required metric did not succeed")
+    except Exception:
+        artifact.update(status="failed", error_code="MANDATORY_EVALUATION_FAILED")
+    return artifact
+def _delete_chat_session(
+    client: httpx.Client, runtime_url: str, user_id: str, session_id: str
+) -> dict[str, object]:
+    response = client.delete(
+        f"{runtime_url}/api/chat/sessions/{session_id}", params={"user_id": user_id}
+    )
+    if response.status_code != 202:
+        raise PostGenerationContractError("Chat session cleanup was not accepted")
+    try:
+        task_id = _uuid(response.json().get("task_id"), "session deletion task ID")
+    except (AttributeError, ValueError, json.JSONDecodeError) as exc:
+        raise PostGenerationContractError("Chat session cleanup response is invalid") from exc
+    observation = poll_task(client, runtime_url, user_id, task_id, "delete_session")
+    if observation.status != "succeeded":
+        raise PostGenerationContractError("Chat session cleanup did not succeed")
+    if client.get(
+        f"{runtime_url}/api/chat/sessions/{session_id}", params={"user_id": user_id}
+    ).status_code != 404:
+        raise PostGenerationContractError("Chat session cleanup was not verified")
+    return observation.artifact()
+
+
 def _execute_query(
     client: httpx.Client,
     runtime_url: str,
@@ -1596,13 +1714,15 @@ def _execute_query(
     *,
     started_at: str,
     started_clock: float,
+    dataset_evaluation: bool = False,
+    operation_id: str | None = None,
 ) -> QueryAttemptResult:
     from deployment.ragctl import iter_sse
 
     events: list[tuple[str, object]] = []
     response_status: int | None = None
     response_request_id: str | None = None
-    operation_id = str(uuid4())
+    operation_id = operation_id or str(uuid4())
     result: ValidatedStream | None = None
     deep_trace: Mapping[str, object] | None = None
     trace_polling: Mapping[str, object] | None = None
@@ -1715,6 +1835,8 @@ def _execute_query(
                     captured_at=utc_timestamp(),
                     directory=evaluation_directory,
                     stem=f"{query.source_index:06d}-{result.request_id}",
+                    reference=query.reference,
+                    reference_context_ids=query.reference_context_ids,
                 )
                 evaluation = {
                     "status": "running",
@@ -1861,6 +1983,13 @@ def _execute_query(
                 "execution_ms": 0.0,
                 "evaluation_ms": 0.0,
             }
+    if dataset_evaluation and result is not None and isinstance(evaluation, Mapping):
+        evaluation = _validate_dataset_evaluation(evaluation, query, {
+            "question": query.question, "answer": result.answer,
+            "request_id": result.request_id, "conversation_id": result.conversation_id,
+            "session_id": session_id, "telemetry": result.telemetry,
+            "deep_trace": deep_trace,
+        }, evaluation_directory)
     return QueryAttemptResult(
         query=query,
         status=status,
@@ -1956,6 +2085,7 @@ def run_e2e_phase_2d(
     *,
     continuous: bool,
     run_id: str,
+    dataset_evaluation: bool = False,
 ) -> dict[str, int]:
     """Verify the retained corpus and trace real public chat requests serially."""
 
@@ -1976,20 +2106,52 @@ def run_e2e_phase_2d(
     evaluation_directory = recorder.path.parent / "evaluation"
     timeout = httpx.Timeout(connect=30, read=900, write=120, pool=30)
     shared_session_id: str | None = None
+    pending_sessions: set[str] = set()
     with httpx.Client(headers=dict(runtime_headers), timeout=timeout) as client:
         health = client.get(f"{runtime_url}/health")
         if health.status_code != 200:
             raise E2EDiagnosticError("RAG runtime is not ready")
-        trace = _DeepTraceSession(
-            client,
-            runtime_url,
-            state.diagnostic_user_id,
-            run_id,
-        )
+        trace: _DeepTraceSession | None = None
         phase_error: BaseException | None = None
-        try:
+        def close_trace() -> None:
+            if trace is None:
+                return
+            if dataset_evaluation:
+                trace.delete(confirm_absent=True)
+                recorder.trace_sessions[-1]["status"] = "deleted"
+            else:
+                trace.delete()
+
+        def start_trace(offset: int) -> None:
+            nonlocal trace
+            close_trace()
+            trace = _DeepTraceSession(client, runtime_url, state.diagnostic_user_id, run_id)
+            if dataset_evaluation:
+                recorder.trace_sessions.append({
+                    "session_id": trace.session_id,
+                    "sequence": len(recorder.trace_sessions) + 1,
+                    "first_query_index": offset, "status": "start_attempted",
+                })
+                # A failed POST may still have allocated this exact session.
+                trace.started = True
             trace.start()
             progress["trace_status"] = "active"
+            if dataset_evaluation:
+                recorder.trace_sessions[-1]["status"] = "active"
+
+        def cleanup_session(identifier: str) -> None:
+            pending_sessions.discard(identifier)
+            try:
+                recorder.cleanups[identifier] = _delete_chat_session(
+                    client, runtime_url, state.diagnostic_user_id, identifier
+                )
+            except Exception:
+                recorder.cleanups[identifier] = {
+                    "status": "failed", "error_code": "SESSION_CLEANUP_FAILED"
+                }
+
+        try:
+            start_trace(0)
             if continuous:
                 try:
                     shared_session_id = _created_session(
@@ -1999,11 +2161,18 @@ def run_e2e_phase_2d(
                         ),
                         state.diagnostic_user_id,
                     )
+                    if dataset_evaluation:
+                        pending_sessions.add(shared_session_id)
                 except (httpx.HTTPError, StreamContractError) as exc:
                     raise E2EDiagnosticError(
                         "Continuous chat session could not be created"
                     ) from exc
-            for query in selection.selected:
+            for query_offset, query in enumerate(selection.selected):
+                if (
+                    dataset_evaluation and query_offset > 0
+                    and query_offset % DATASET_TRACE_ROTATION_SIZE == 0
+                ):
+                    start_trace(query_offset)
                 started_at = utc_timestamp()
                 started_clock = perf_counter()
                 session_id = shared_session_id
@@ -2018,6 +2187,8 @@ def run_e2e_phase_2d(
                         session_id = _created_session(
                             response, state.diagnostic_user_id
                         )
+                        if dataset_evaluation:
+                            pending_sessions.add(session_id)
                     except KeyboardInterrupt:
                         attempt = _session_failure_result(
                             query,
@@ -2028,7 +2199,7 @@ def run_e2e_phase_2d(
                             scope="systemic",
                         )
                         _record_attempt(recorder, attempt)
-                        print(format_query_terminal(attempt), flush=True)
+                        print((format_query_terminal_private if dataset_evaluation else format_query_terminal)(attempt), flush=True)
                         raise
                     except httpx.HTTPError:
                         attempt = _session_failure_result(
@@ -2040,7 +2211,7 @@ def run_e2e_phase_2d(
                             scope="individual",
                         )
                         _record_attempt(recorder, attempt)
-                        print(format_query_terminal(attempt), flush=True)
+                        print((format_query_terminal_private if dataset_evaluation else format_query_terminal)(attempt), flush=True)
                         continue
                     except StreamContractError as exc:
                         scope = (
@@ -2057,12 +2228,13 @@ def run_e2e_phase_2d(
                             scope=scope,
                         )
                         _record_attempt(recorder, attempt)
-                        print(format_query_terminal(attempt), flush=True)
+                        print((format_query_terminal_private if dataset_evaluation else format_query_terminal)(attempt), flush=True)
                         if scope == "systemic":
                             raise E2EDiagnosticError(
                                 "E2E authentication failed during session creation"
                             )
                         continue
+                diagnostic_operation_id = str(uuid4()) if dataset_evaluation else None
                 try:
                     attempt = _execute_query(
                         client,
@@ -2076,6 +2248,7 @@ def run_e2e_phase_2d(
                         allowed_document_ids,
                         started_at=started_at,
                         started_clock=started_clock,
+                        **({"dataset_evaluation": True, "operation_id": diagnostic_operation_id} if dataset_evaluation else {}),
                     )
                 except KeyboardInterrupt:
                     attempt = QueryAttemptResult(
@@ -2090,7 +2263,7 @@ def run_e2e_phase_2d(
                         session_id=session_id,
                         request_id=None,
                         conversation_id=None,
-                        diagnostic_operation_id=None,
+                        diagnostic_operation_id=diagnostic_operation_id,
                         http_status=None,
                         query_http_attempted=True,
                         token_event_count=0,
@@ -2112,10 +2285,27 @@ def run_e2e_phase_2d(
                         started_at=started_at,
                     )
                     _record_attempt(recorder, attempt)
-                    print(format_query_terminal(attempt), flush=True)
+                    print((format_query_terminal_private if dataset_evaluation else format_query_terminal)(attempt), flush=True)
                     raise
+                except Exception:
+                    if not dataset_evaluation:
+                        raise
+                    attempt = replace(
+                        _session_failure_result(query, started_at=started_at,
+                                                started_clock=started_clock,
+                                                code="QUERY_EXECUTION_INVALID", http_status=None, scope="systemic"),
+                        session_id=session_id, diagnostic_operation_id=diagnostic_operation_id,
+                        query_http_attempted=True,
+                    )
+                if dataset_evaluation and not continuous and session_id is not None:
+                    cleanup_session(session_id)
                 _record_attempt(recorder, attempt)
-                print(format_query_terminal(attempt), flush=True)
+                print(
+                    format_query_terminal_private(attempt)
+                    if dataset_evaluation
+                    else format_query_terminal(attempt),
+                    flush=True,
+                )
                 if attempt.failure_scope == "systemic":
                     raise E2EDiagnosticError(
                         f"Systemic E2E failure: {attempt.failure_code}"
@@ -2123,10 +2313,15 @@ def run_e2e_phase_2d(
         except BaseException as exc:
             phase_error = exc
             progress["trace_status"] = "failed"
+            if dataset_evaluation:
+                for remaining in selection.selected[
+                    recorder.attempted + recorder.not_attempted :
+                ]:
+                    recorder.record_not_attempted(remaining, "SYSTEMIC_BATCH_ABORT")
         finally:
-            session_was_started = trace.started
+            session_was_started = trace is not None and trace.started
             try:
-                trace.delete()
+                close_trace()
             except BaseException as cleanup_error:
                 progress["trace_deleted"] = False
                 if phase_error is not None:
@@ -2139,9 +2334,15 @@ def run_e2e_phase_2d(
                 progress["trace_deleted"] = session_was_started
                 if progress.get("trace_status") != "failed":
                     progress["trace_status"] = "succeeded"
+            finally:
+                for identifier in sorted(pending_sessions):
+                    cleanup_session(identifier)
         if phase_error is not None:
             raise phase_error
-    if recorder.failed:
+    if recorder.failed or (dataset_evaluation and (
+        recorder.evaluation_failed or recorder.evaluation_partial
+        or any(item.get("status") != "succeeded" for item in recorder.cleanups.values())
+    )):
         raise E2EBatchFailed(
             f"{recorder.failed} of {recorder.attempted} E2E request(s) failed"
         )
@@ -2157,6 +2358,7 @@ __all__ = [
     "TaskObservation",
     "ValidatedStream",
     "format_query_terminal",
+    "format_query_terminal_private",
     "poll_task",
     "run_e2e_phase_2d",
     "validate_chat_trace_evidence",

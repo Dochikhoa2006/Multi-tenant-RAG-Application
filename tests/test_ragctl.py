@@ -514,6 +514,9 @@ def test_primary_bootstrap_is_allowed_only_for_absent_corpus_state(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     from deployment import wizard_diagnostic, wizard_diagnostic_api
+    # This lifecycle test mocks ingestion; consolidated evidence is covered by
+    # the private-harness report tests with actual synthetic operation records.
+    monkeypatch.setattr(wizard_diagnostic, "write_ingestion_report", lambda *_: None)
 
     config, runner, events, fixtures = _prepare_diagnostic_test(monkeypatch, tmp_path)
     config["RAG_USER_ID"] = config["RAG_DIAGNOSTIC_USER_ID"]
@@ -850,7 +853,7 @@ def test_functional_acceptance_routes_ask_and_e2e_to_primary_rag_user(
     config = _config()
     config["RAG_USER_ID"] = "primary_rag_user"
     config["RAG_DIAGNOSTIC_USER_ID"] = "standalone_diagnostic_user"
-    selection = SimpleNamespace(selected=(SimpleNamespace(text="question"),))
+    selection = SimpleNamespace(selected=(SimpleNamespace(question="question"),))
     inputs = {
         "config": config,
         "user": "primary_rag_user",

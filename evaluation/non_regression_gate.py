@@ -1127,10 +1127,10 @@ def _validate_functional_dependency(path: Path, inputs: Mapping[str, object]) ->
 def _query_fields(selection: object, index: int) -> dict[str, object]:
     selected = selection.selected[index % len(selection.selected)]
     identity = _canonical_digest(
-        {"source": selection.source_sha256, "index": selected.source_index, "text": selected.text}
+        {"source": selection.source_sha256, "index": selected.source_index, "text": selected.question}
     )
     return {
-        "question": selected.text, "query_identity": identity,
+        "question": selected.question, "query_identity": identity,
         "query_source_index": selected.source_index,
         "query_schedule_index": index,
         "query_repetition": index // len(selection.selected),
@@ -1149,7 +1149,7 @@ def _collect_functional(args: argparse.Namespace) -> dict[str, object]:
         ragctl.down(config, runner)
         ragctl.up(config, runner, acceptance_observer_enabled=True,
                   acceptance_experiment_sha256=str(inputs["configuration_sha256"]))
-        ask_row = _ask_sample(config, user, selection.selected[0].text)
+        ask_row = _ask_sample(config, user, selection.selected[0].question)
         ask_row.update(_identity_fields(inputs))
         ask_row["runtime_instance_id"] = _runtime_instance(runner)
         _validate_live_sample(ask_row, evaluation=True)

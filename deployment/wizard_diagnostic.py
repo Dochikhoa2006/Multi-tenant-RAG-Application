@@ -284,6 +284,10 @@ class DiagnosticRun:
     operations_path: Path
     summary_path: Path
 
+    @property
+    def ingestion_report_path(self) -> Path:
+        return self.directory / "ingestion-report.json"
+
 
 def _valid_sha256(value: object) -> bool:
     return (
@@ -596,7 +600,9 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _fixture_files(directory: Path, rules: FixtureRules) -> tuple[FixtureFile, ...]:
+def _fixture_files(
+    directory: Path, rules: FixtureRules, *, strict_private: bool = False
+) -> tuple[FixtureFile, ...]:
     if directory.is_symlink():
         raise WizardDiagnosticError(
             f"Fixture collection must not be a symlink: {directory}"
@@ -611,6 +617,10 @@ def _fixture_files(directory: Path, rules: FixtureRules) -> tuple[FixtureFile, .
     paths: list[Path] = []
     for entry in sorted(directory.iterdir(), key=lambda value: value.name):
         if entry.name.startswith("."):
+            if entry.name == ".gitkeep" and entry.is_file() and not entry.is_symlink():
+                continue
+            if strict_private:
+                raise WizardDiagnosticError(f"Hidden fixture entries are not allowed: {entry}")
             continue
         if entry.is_symlink():
             raise WizardDiagnosticError(f"Fixture must not be a symlink: {entry}")
@@ -618,8 +628,9 @@ def _fixture_files(directory: Path, rules: FixtureRules) -> tuple[FixtureFile, .
             raise WizardDiagnosticError(
                 f"Fixture collections may contain only top-level files: {entry}"
             )
-        if entry.suffix.lower() not in rules.supported_extensions:
-            allowed = ", ".join(rules.supported_extensions)
+        allowed_extensions = (".txt",) if strict_private else rules.supported_extensions
+        if entry.suffix.lower() not in allowed_extensions:
+            allowed = ", ".join(allowed_extensions)
             raise WizardDiagnosticError(
                 f"Unsupported file extension {entry.suffix or '<none>'!r}; "
                 f"expected one of: {allowed}"
@@ -638,6 +649,8 @@ def _fixture_files(directory: Path, rules: FixtureRules) -> tuple[FixtureFile, .
             checksum = _file_sha256(path)
             content = path.read_text(encoding=rules.text_encoding)
         except (OSError, UnicodeError, LookupError) as exc:
+            if strict_private:
+                raise WizardDiagnosticError(f"Invalid private fixture: {path} ({type(exc).__name__})") from None
             raise WizardDiagnosticError(f"Invalid fixture {path}: {exc}") from exc
         if size_bytes > rules.upload_max_file_bytes:
             raise WizardDiagnosticError(
@@ -647,6 +660,8 @@ def _fixture_files(directory: Path, rules: FixtureRules) -> tuple[FixtureFile, .
             raise WizardDiagnosticError(
                 f"Fixture cannot fit within UPLOAD_MAX_TOTAL_BYTES: {path}"
             )
+        if strict_private and not content.strip():
+            raise WizardDiagnosticError(f"Private corpus fixture is empty: {path}")
         contents.append(content)
         fixtures.append(FixtureFile(path, size_bytes, checksum))
     if not any(content != "" for content in contents):
@@ -660,26 +675,49 @@ def preflight_wizard_fixtures(
     fixtures: Path,
     project_root: Path,
     config: Mapping[str, str] | None = None,
+    *,
+    strict_private: bool = False,
 ) -> WizardFixtures:
     rules = FixtureRules.from_config(config or {})
     root = _resolve_fixture_root(fixtures, project_root)
+    if strict_private:
+        for entry in root.iterdir():
+            if entry.name in WIZARD_FIXTURE_COLLECTIONS:
+                continue
+            if entry.name == ".gitkeep" and entry.is_file() and not entry.is_symlink():
+                continue
+            raise WizardDiagnosticError("Private corpus root contains an unexpected entry")
     collections = {
-        collection: _fixture_files(root / collection, rules)
+        collection: _fixture_files(
+            root / collection, rules, strict_private=strict_private
+        )
         for collection in WIZARD_FIXTURE_COLLECTIONS
     }
+    if strict_private:
+        digests = [
+            item.sha256
+            for collection in WIZARD_FIXTURE_COLLECTIONS
+            for item in collections[collection]
+        ]
+        if len(digests) != len(set(digests)):
+            raise WizardDiagnosticError(
+                "Private corpus contains duplicate file content"
+            )
     return WizardFixtures(
         root, collections["knowledge"], collections["policy"], rules
     )
 
 
 def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary = path.parent / f".{path.name}.{uuid4().hex}.tmp"
     try:
-        with temporary.open("w", encoding="utf-8") as target:
-            target.write(json.dumps(dict(payload), indent=2, sort_keys=True) + "\n")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as target:
+            target.write(json.dumps(dict(payload), indent=2, sort_keys=True, allow_nan=False) + "\n")
             target.flush()
             os.fsync(target.fileno())
         os.replace(temporary, path)
+        os.chmod(path, 0o600)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -688,9 +726,11 @@ def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
 def corpus_state_lock(lock_path: Path) -> Iterator[None]:
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(lock_path.parent, 0o700)
         if lock_path.is_symlink():
             raise WizardDiagnosticError("Diagnostic corpus lock must not be a symlink")
         with lock_path.open("a+", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o600)
             try:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
@@ -1117,9 +1157,15 @@ def create_diagnostic_run(
     try:
         if output_root.is_symlink():
             raise WizardDiagnosticError("Diagnostic output root must not be a symlink")
-        directory.mkdir(parents=True, exist_ok=False)
+        output_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(output_root, 0o700)
+        directory.mkdir(parents=True, exist_ok=False, mode=0o700)
+        os.chmod(directory, 0o700)
         operations_path = directory / "operations.jsonl"
-        operations_path.touch(exist_ok=False)
+        descriptor = os.open(
+            operations_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+        )
+        os.close(descriptor)
         summary_path = directory / "summary.json"
         _write_json_atomic(
             summary_path,
@@ -1228,6 +1274,149 @@ def update_run_summary(
         ) from exc
 
 
+def write_ingestion_report(
+    run: DiagnosticRun,
+    fixtures: WizardFixtures,
+    state_path: Path,
+) -> None:
+    """Consolidate already-recorded corpus proof without reading document text."""
+
+    try:
+        summary = json.loads(run.summary_path.read_text(encoding="utf-8"))
+        operations = [
+            json.loads(line)
+            for line in run.operations_path.read_text(encoding="utf-8").splitlines()
+        ]
+        state = (
+            json.loads(state_path.read_text(encoding="utf-8"))
+            if state_path.exists()
+            else None
+        )
+        if not isinstance(summary, Mapping) or (
+            state is not None and not isinstance(state, Mapping)
+        ):
+            raise ValueError
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise WizardDiagnosticError("Could not consolidate ingestion evidence") from exc
+    safe_operations = []
+    for item in operations:
+        if not isinstance(item, Mapping):
+            raise WizardDiagnosticError("Ingestion operation evidence is malformed")
+        safe_operations.append({
+            key: item.get(key)
+            for key in (
+                "sequence", "timestamp", "name", "outcome", "duration_ms",
+                "collection", "batch_index", "batch_count", "file_count",
+                "size_bytes", "chunk_count", "lateon_dimension", "gte_dimension",
+                "selected_ids", "poll_count", "trace", "status", "verification_latency_ms",
+            )
+            if key in item
+        })
+        trace = safe_operations[-1].get("trace")
+        if isinstance(trace, Mapping):
+            safe_operations[-1]["trace"] = {
+                key: trace.get(key)
+                for key in ("schema_version", "operation_id", "outcome", "stages", "counts", "flags", "digests", "samples")
+                if key in trace
+            }
+    inventory = fixtures.inventory()
+    active = state.get("active") if isinstance(state, Mapping) else None
+    if state is not None and state.get("diagnostic_user_id") != summary.get("diagnostic_user_id"):
+        raise WizardDiagnosticError("Ingestion report corpus owner mismatch")
+    if not isinstance(active, Mapping) or active.get("fixture_digest") != fixtures.digest:
+        active = state.get("pending_replacement") if isinstance(state, Mapping) else None
+    documents = active.get("documents") if isinstance(active, Mapping) else []
+    generation_operations = operations
+    if isinstance(active, Mapping) and active.get("generation_id") != run.run_id:
+        generation_id = active.get("generation_id")
+        if not isinstance(generation_id, str) or Path(generation_id).name != generation_id:
+            raise WizardDiagnosticError("Ingestion evidence generation ID is invalid")
+        prior_path = run.directory.parent / generation_id / "operations.jsonl"
+        if prior_path.is_file() and not prior_path.is_symlink():
+            generation_operations = [json.loads(line) for line in prior_path.read_text().splitlines()]
+    collection_reports = {}
+    for collection in WIZARD_FIXTURE_COLLECTIONS:
+        document = next((item for item in documents or [] if item.get("collection") == collection), {})
+        postcondition = next((item for item in generation_operations
+                              if item.get("name") == f"corpus.{collection}.save.postcondition"
+                              and (item.get("selected_ids") or {}).get("wizard_id") == document.get("wizard_id")
+                              and item.get("outcome") == "passed"), {})
+        trace = postcondition.get("trace") or {}
+        counts = trace.get("counts") or {}
+        verified = any(item.get("name") in {"corpus.verify.final", "corpus.verify.active"}
+                       and item.get("collection") == collection and item.get("outcome") == "passed"
+                       for item in operations)
+        collection_reports[collection] = {
+            "document_id": document.get("wizard_id"), "task_id": document.get("task_id"),
+            "document_count": int(bool(document)), "chunk_ids": document.get("chunk_ids", []),
+            "chunk_count": len(document.get("chunk_ids", [])),
+            "paragraph_count": counts.get("final_paragraph_count"),
+            "storage_fingerprint": document.get("storage_fingerprint"),
+            "vector_dimensions": {"lateon": postcondition.get("lateon_dimension"), "gte": postcondition.get("gte_dimension")},
+            "vector_presence_ownership_membership_verified": verified,
+            "timings": trace.get("stages", {}), "counts": counts,
+            "digests": trace.get("digests", {}),
+            "source_files": [{**item, "status": "verified" if verified else "failed" if document else "not_attempted"}
+                             for item in inventory[collection]],
+        }
+    verified_files = sum(len(item["source_files"]) for item in collection_reports.values()
+                         if item["vector_presence_ownership_membership_verified"])
+    payload = {
+        "schema_version": "1.0",
+        "report": "ingestion-corpus",
+        "run_id": run.run_id,
+        "status": summary.get("status"),
+        "failure_stage": summary.get("failure_stage"),
+        "user_id": summary.get("diagnostic_user_id"),
+        "source": {
+            "root": os.fspath(fixtures.root),
+            "fixture_digest": fixtures.digest,
+            "inventory": inventory,
+            "intended_files": sum(len(value) for value in inventory.values()),
+            "discovered_files": sum(len(value) for value in inventory.values()),
+            "verified_files": verified_files,
+            "failed_files": sum(f["status"] == "failed" for c in collection_reports.values() for f in c["source_files"]),
+            "not_attempted_files": sum(f["status"] == "not_attempted" for c in collection_reports.values() for f in c["source_files"]),
+            "silently_skipped_files": 0,
+        },
+        "corpus": {
+            "generation_id": active.get("generation_id") if isinstance(active, Mapping) else None,
+            "fixture_digest": active.get("fixture_digest") if isinstance(active, Mapping) else None,
+            "documents": documents if isinstance(documents, list) else [],
+            "verified_at": active.get("verified_at") if isinstance(active, Mapping) else None,
+            "completed_at": active.get("completed_at") if isinstance(active, Mapping) else None,
+        },
+        "operation_totals": summary.get("operation_totals"),
+        "collections": collection_reports,
+        "operations": safe_operations,
+        "lifecycle": summary.get("lifecycle"),
+        "validation": {
+            "scratch": summary.get("scratch_status"),
+            "corpus_action": summary.get("corpus_action"),
+            "telemetry": summary.get("telemetry_status"),
+            "security": summary.get("security_status"),
+            "trace_deleted": summary.get("trace_deleted"),
+        },
+        "privacy": {"raw_document_text": False},
+    }
+    if payload["status"] == "succeeded" and (
+        verified_files != payload["source"]["intended_files"]
+        or not isinstance(state.get("active"), Mapping)
+        or state.get("pending_replacement") is not None or state.get("pending_cleanup")
+        or not active.get("completed_at") or not active.get("verified_at")
+        or active.get("fixture_digest") != fixtures.digest
+        or any(not isinstance(c["paragraph_count"], int) or c["paragraph_count"] < 1
+               or c["vector_dimensions"] != {"lateon": 128, "gte": 768}
+               for c in collection_reports.values())
+    ):
+        payload.update(status="failed", failure_stage="ingestion_report_evidence_incomplete")
+    if any(_file_sha256(item.path) != item.sha256 for collection in WIZARD_FIXTURE_COLLECTIONS for item in fixtures.files(collection)):
+        payload.update(status="failed", failure_stage="source_fixture_changed")
+    _write_json_atomic(run.ingestion_report_path, payload)
+    if summary.get("status") == "succeeded" and payload["status"] != "succeeded":
+        raise WizardDiagnosticError("Consolidated ingestion evidence is incomplete")
+
+
 __all__ = [
     "CorpusDocument",
     "CorpusGeneration",
@@ -1254,6 +1443,7 @@ __all__ = [
     "remove_pending_cleanup",
     "require_empty_first_seed",
     "update_run_summary",
+    "write_ingestion_report",
     "validate_corpus_preflight",
     "validate_diagnostic_user",
     "validate_physical_membership",
