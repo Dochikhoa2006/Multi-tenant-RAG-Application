@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import ast
+import inspect
 import json
 import os
 from pathlib import Path
+import textwrap
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -120,6 +123,38 @@ def test_settings_reject_production_inference_model_identifiers(
             judge_model=model,
             embedding_model_path=tmp_path,
         ).validate()
+
+
+def test_backend_uses_bounded_judge_output_without_changing_client_safety() -> None:
+    tree = ast.parse(textwrap.dedent(inspect.getsource(RagasMetricBackend.create)))
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+
+    def named_call(name: str) -> ast.Call:
+        return next(
+            call
+            for call in calls
+            if isinstance(call.func, ast.Name) and call.func.id == name
+        )
+
+    def keywords(call: ast.Call) -> dict[str, ast.expr]:
+        return {item.arg: item.value for item in call.keywords if item.arg is not None}
+
+    llm = keywords(named_call("llm_factory"))
+    assert ast.literal_eval(llm["provider"]) == "openai"
+    assert ast.unparse(llm["client"]) == "client"
+    assert ast.literal_eval(llm["temperature"]) == 0.0
+    assert ast.literal_eval(llm["max_tokens"]) == 4096
+
+    client = keywords(named_call("AsyncOpenAI"))
+    assert ast.unparse(client["base_url"]) == "settings.openai_base_url"
+    assert ast.literal_eval(client["max_retries"]) == 0
+    assert ast.unparse(client["timeout"]) == "settings.request_timeout_seconds"
+    http_client = next(
+        call
+        for call in calls
+        if isinstance(call.func, ast.Attribute) and call.func.attr == "AsyncClient"
+    )
+    assert ast.literal_eval(keywords(http_client)["trust_env"]) is False
 
 
 def test_locked_collections_api_is_compatible() -> None:
