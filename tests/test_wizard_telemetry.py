@@ -32,6 +32,8 @@ from backend.wizard.diagnostics import (
 from deployment.wizard_diagnostic import OperationRecorder, WizardDiagnosticError
 from deployment.wizard_diagnostic_api import (
     WizardApi,
+    _checkpoint_paragraph_mapping,
+    _verify_mapping_and_storage,
     validate_trace_evidence,
     validate_upload_zero_side_effects,
     verify_partial_resave_mappings,
@@ -304,6 +306,67 @@ def test_mapping_checkpoint_is_bounded_and_has_ordered_and_membership_digests() 
     )
     assert checkpoint["probe"]["owned_count"] == 1
     assert checkpoint["probe"]["owners"][chunks[0]]["paragraph_id"] == 1
+
+
+def test_large_mapping_keeps_bounded_evidence_and_full_physical_verification() -> None:
+    user_id = "wizard_diagnostic"
+    collection = "knowledge_facts"
+    wizard_id = str(uuid4())
+    before = {
+        paragraph_id: [str(uuid4())]
+        for paragraph_id in range(1, TRACE_SAMPLE_LIMIT + 9)
+    }
+    documents = DocumentMap(user_id, collection)
+    paragraphs = ParagraphMap(user_id, collection)
+    documents.create_document(wizard_id)
+    documents.update_paragraphs(
+        wizard_id,
+        {
+            paragraph_id: f"paragraph {paragraph_id}\n\n"
+            for paragraph_id in before
+        },
+    )
+    paragraphs.replace_document(wizard_id, before)
+    runtime = SimpleNamespace(
+        document_map=lambda *_: documents,
+        paragraph_map=lambda *_: paragraphs,
+    )
+
+    checkpoint = mapping_checkpoint(runtime, user_id, collection, wizard_id)
+    proof = checkpoint["paragraph_map"]
+    sampled_items = sum(1 + len(item["chunk_ids"]) for item in proof["sample"])
+    assert proof["truncated"] is True
+    assert sampled_items <= TRACE_SAMPLE_LIMIT
+    assert proof["paragraph_count"] == len(before)
+    assert proof["chunk_count"] == sum(map(len, before.values()))
+    assert proof["mapping_sha256"] == mapping_digest(before)
+    assert proof["membership_sha256"] == mapping_membership_digest(before)
+    _verify_mapping_and_storage(checkpoint, before)
+
+    with pytest.raises(WizardDiagnosticError, match="bounded proof sample"):
+        _checkpoint_paragraph_mapping(checkpoint, require_complete=True)
+
+    changed_paragraph_id = len(before)
+    after = {paragraph_id: list(ids) for paragraph_id, ids in before.items()}
+    after[changed_paragraph_id] = [str(uuid4())]
+    assert verify_partial_resave_mappings(
+        before,
+        after,
+        changed_paragraph_id,
+        probed_old_owner_count=0,
+        physical_chunk_ids=tuple(
+            chunk_id for chunk_ids in after.values() for chunk_id in chunk_ids
+        ),
+    ) == {
+        "unchanged_paragraph_count": len(before) - 1,
+        "old_changed_chunk_count": 1,
+        "new_changed_chunk_count": 1,
+    }
+
+    corrupted = {paragraph_id: list(ids) for paragraph_id, ids in before.items()}
+    corrupted[1], corrupted[2] = corrupted[2], corrupted[1]
+    with pytest.raises(WizardDiagnosticError, match="physical document membership"):
+        _verify_mapping_and_storage(checkpoint, corrupted)
 
 
 def test_trace_validator_rejects_missing_and_proof_truncated_evidence() -> None:

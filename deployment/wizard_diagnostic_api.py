@@ -1941,8 +1941,8 @@ def run_scratch_diagnostic(
             "scratch.knowledge.save",
             initial_text,
         )
-        initial_chunk_mapping = _checkpoint_paragraph_mapping(
-            initial_checkpoint, require_complete=True
+        initial_chunk_mapping = storage.document_membership(
+            diagnostic_user_id, "knowledge", knowledge_id
         )
         _check(
             recorder,
@@ -2000,8 +2000,8 @@ def run_scratch_diagnostic(
             edited_text,
             proof_samples=("modified_paragraph_ids", "targeted_old_chunk_ids"),
         )
-        final_chunk_mapping = _checkpoint_paragraph_mapping(
-            destructive_checkpoint, require_complete=True
+        final_chunk_mapping = storage.document_membership(
+            diagnostic_user_id, "knowledge", knowledge_id
         )
         trace_samples = _mapping(
             destructive_trace.get("samples"), "destructive trace samples"

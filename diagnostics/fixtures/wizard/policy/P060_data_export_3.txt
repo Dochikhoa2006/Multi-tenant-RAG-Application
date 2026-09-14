@@ -1,0 +1,84 @@
+ATLAS POLICY — P020-3
+Subject: Data portability, export availability, and post-termination access
+Current edition: 2026.09
+Status: Current
+Applies to: Atlas hosted service unless a signed agreement states otherwise.
+
+This fictional policy corpus is designed for RAG evaluation. The rules are intentionally specific and include exceptions, precedence, timing, and plan distinctions so an answer must retrieve the correct controlling material rather than rely on surface similarity.
+
+1. Controlling rules
+
+Exports include data that remains within retention and is visible to the requesting role at export time.
+
+Deleted or expired content cannot be restored solely because an export was requested after deletion completed.
+
+After termination, export access may remain available for a limited contract-defined period, but this does not extend ordinary content retention unless the agreement says so.
+
+2. Precedence and interpretation
+
+Policy precedence:
+1. A signed Enterprise order form controls an explicitly negotiated commercial term.
+2. A Data Processing Addendum controls conflicting privacy or data-processing obligations.
+3. A Security Addendum controls conflicting security commitments.
+4. The current policy edition controls over superseded policy editions.
+5. Operational help-center guidance explains implementation but does not override a controlling policy or signed agreement.
+
+An override is narrow. Changing one contracted limit does not silently replace unrelated retention, security, or acceptable-use rules.
+
+3. Plan and region context
+
+For the Business plan, the default retention period is 365 days, the API allowance is 1,200 requests per minute, and the attachment limit is 100 MB. These product defaults are not themselves refund rights or SLA commitments.
+
+For the Starter plan, the corresponding defaults are 30 days, 300 requests per minute, and 10 MB. Support staff must not mix entitlements between the two plans.
+
+For a workspace whose content region is European Union, customer content is pinned to the EU data plane when the workspace region is European Union. The location of limited billing or security metadata does not change the workspace's selected customer-content region.
+
+4. Exceptions and non-exceptions
+
+An exception must come from a controlling source. A support ticket, sales chat, old screenshot, or outdated help article does not by itself amend the current policy. A signed order form can alter an explicitly negotiated term, but silence is not an override.
+
+Mandatory law can create rights beyond this policy. When that occurs, support should escalate rather than inventing a universal rule for every customer. Operational inconvenience is not automatically an exception.
+
+5. Enforcement and evidence
+
+When a policy action depends on timing, use the authoritative service timestamp rather than a user's local clock screenshot. When it depends on usage, use the service's metered usage record. When it depends on an account role, use effective role membership at the time of the action.
+
+The service should retain safe identifiers, timestamps, decision codes, and audit evidence necessary to explain a decision without copying unrelated private content into diagnostics.
+
+6. Historical clarification
+
+Before the 2026.09 edition, some documentation used shorter descriptions that omitted edge cases. The current edition does not automatically change a signed agreement, but it supersedes prior general-policy wording for customers governed by the standard terms. Historical examples are included for interpretation only.
+
+7. Casebook
+
+Case 1: A Business customer in European Union reports an outage affecting one channel. The reviewer must separate product behavior from policy entitlement, identify the controlling document, and verify the relevant timestamp or usage evidence. The Business defaults are retention 365 days and API allowance 1,200 requests per minute; those values matter only when the case actually concerns retention or API use. If a signed override exists, apply it narrowly. If the documentation is silent on the requested exception, do not create one.
+
+Case 2: A Enterprise customer in Canada rotates a compromised API key. The reviewer must separate product behavior from policy entitlement, identify the controlling document, and verify the relevant timestamp or usage evidence. The Enterprise defaults are retention 30 to 2,555 days, configurable by an organization owner and API allowance 3,000 requests per minute by default, with contracted overrides possible; those values matter only when the case actually concerns retention or API use. If a signed override exists, apply it narrowly. If the documentation is silent on the requested exception, do not create one.
+
+Case 3: A Starter customer in European Union requests a region migration. The reviewer must separate product behavior from policy entitlement, identify the controlling document, and verify the relevant timestamp or usage evidence. The Starter defaults are retention 30 days and API allowance 300 requests per minute; those values matter only when the case actually concerns retention or API use. If a signed override exists, apply it narrowly. If the documentation is silent on the requested exception, do not create one.
+
+Case 4: A Growth customer in Canada disputes a renewal charge. The reviewer must separate product behavior from policy entitlement, identify the controlling document, and verify the relevant timestamp or usage evidence. The Growth defaults are retention 90 days and API allowance 600 requests per minute; those values matter only when the case actually concerns retention or API use. If a signed override exists, apply it narrowly. If the documentation is silent on the requested exception, do not create one.
+
+Case 5: A Business customer in European Union asks for an audit export. The reviewer must separate product behavior from policy entitlement, identify the controlling document, and verify the relevant timestamp or usage evidence. The Business defaults are retention 365 days and API allowance 1,200 requests per minute; those values matter only when the case actually concerns retention or API use. If a signed override exists, apply it narrowly. If the documentation is silent on the requested exception, do not create one.
+
+Case 6: A Enterprise customer in Canada uses a third-party connector. The reviewer must separate product behavior from policy entitlement, identify the controlling document, and verify the relevant timestamp or usage evidence. The Enterprise defaults are retention 30 to 2,555 days, configurable by an organization owner and API allowance 3,000 requests per minute by default, with contracted overrides possible; those values matter only when the case actually concerns retention or API use. If a signed override exists, apply it narrowly. If the documentation is silent on the requested exception, do not create one.
+
+Case 7: A Starter customer in European Union requests a service credit. The reviewer must separate product behavior from policy entitlement, identify the controlling document, and verify the relevant timestamp or usage evidence. The Starter defaults are retention 30 days and API allowance 300 requests per minute; those values matter only when the case actually concerns retention or API use. If a signed override exists, apply it narrowly. If the documentation is silent on the requested exception, do not create one.
+
+Case 8: A Growth customer in Canada asks whether an old help article overrides current terms. The reviewer must separate product behavior from policy entitlement, identify the controlling document, and verify the relevant timestamp or usage evidence. The Growth defaults are retention 90 days and API allowance 600 requests per minute; those values matter only when the case actually concerns retention or API use. If a signed override exists, apply it narrowly. If the documentation is silent on the requested exception, do not create one.
+
+Case 9: A Business customer in European Union requests a refund after an upgrade. The reviewer must separate product behavior from policy entitlement, identify the controlling document, and verify the relevant timestamp or usage evidence. The Business defaults are retention 365 days and API allowance 1,200 requests per minute; those values matter only when the case actually concerns retention or API use. If a signed override exists, apply it narrowly. If the documentation is silent on the requested exception, do not create one.
+
+Case 10: A Enterprise customer in Canada asks to restore deleted content. The reviewer must separate product behavior from policy entitlement, identify the controlling document, and verify the relevant timestamp or usage evidence. The Enterprise defaults are retention 30 to 2,555 days, configurable by an organization owner and API allowance 3,000 requests per minute by default, with contracted overrides possible; those values matter only when the case actually concerns retention or API use. If a signed override exists, apply it narrowly. If the documentation is silent on the requested exception, do not create one.
+
+Case 11: A Starter customer in European Union reports an outage affecting one channel. The reviewer must separate product behavior from policy entitlement, identify the controlling document, and verify the relevant timestamp or usage evidence. The Starter defaults are retention 30 days and API allowance 300 requests per minute; those values matter only when the case actually concerns retention or API use. If a signed override exists, apply it narrowly. If the documentation is silent on the requested exception, do not create one.
+
+Case 12: A Growth customer in Canada rotates a compromised API key. The reviewer must separate product behavior from policy entitlement, identify the controlling document, and verify the relevant timestamp or usage evidence. The Growth defaults are retention 90 days and API allowance 600 requests per minute; those values matter only when the case actually concerns retention or API use. If a signed override exists, apply it narrowly. If the documentation is silent on the requested exception, do not create one.
+
+Case 13: A Business customer in European Union requests a region migration. The reviewer must separate product behavior from policy entitlement, identify the controlling document, and verify the relevant timestamp or usage evidence. The Business defaults are retention 365 days and API allowance 1,200 requests per minute; those values matter only when the case actually concerns retention or API use. If a signed override exists, apply it narrowly. If the documentation is silent on the requested exception, do not create one.
+
+Case 14: A Enterprise customer in Canada disputes a renewal charge. The reviewer must separate product behavior from policy entitlement, identify the controlling document, and verify the relevant timestamp or usage evidence. The Enterprise defaults are retention 30 to 2,555 days, configurable by an organization owner and API allowance 3,000 requests per minute by default, with contracted overrides possible; those values matter only when the case actually concerns retention or API use. If a signed override exists, apply it narrowly. If the documentation is silent on the requested exception, do not create one.
+
+Case 15: A Starter customer in European Union asks for an audit export. The reviewer must separate product behavior from policy entitlement, identify the controlling document, and verify the relevant timestamp or usage evidence. The Starter defaults are retention 30 days and API allowance 300 requests per minute; those values matter only when the case actually concerns retention or API use. If a signed override exists, apply it narrowly. If the documentation is silent on the requested exception, do not create one.
+
+Case 16: A Growth customer in Canada uses a third-party connector. The reviewer must separate product behavior from policy entitlement, identify the controlling document, and verify the relevant timestamp or usage evidence. The Growth defaults are retention 90 days and API allowance 600 requests per minute; those values matter only when the case actually concerns retention or API use. If a signed override exists, apply it narrowly. If the documentation is silent on the requested exception, do not create one.

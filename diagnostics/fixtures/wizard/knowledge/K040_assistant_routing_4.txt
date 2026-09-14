@@ -1,0 +1,106 @@
+ATLAS OPERATIONS GUIDE — K010-4
+Topic: Assistant routing, confidence thresholds, human handoff, and fallback
+Edition: 2026.09
+Audience: workspace administrators, support engineers, solution architects, and operators.
+
+This guide describes the current behavior of the fictional Atlas customer-operations platform. It is operational documentation, not a commercial policy. When this guide conflicts with a current policy document, signed enterprise order form, data processing addendum, or security addendum, the applicable policy or signed agreement controls. Historical behavior is called out explicitly and should not be treated as current behavior.
+
+The examples intentionally use similar plan names, channel names, and administrative actions because real support cases frequently combine them. Pay attention to plan, region, channel, role, timing, and whether an action is immediate or deferred.
+
+1. Scope and current operating model
+
+For a Growth workspace in the Asia Pacific region, the normal conversation retention window is 90 days. The API allowance is 600 requests per minute, and an individual attachment is normally limited to 25 MB. The support posture is business-hours priority support. These limits are plan defaults; a signed Enterprise order form can override contractable limits only when the override is explicitly stated.
+
+customer content is pinned to the APAC data plane when the workspace region is Asia Pacific. Workspace region affects customer-content placement but does not imply that every operational record is physically stored in that region. Billing records, fraud signals, and narrowly scoped security metadata follow separate controls.
+
+For comparison, Business has a normal retention setting of 365 days and an API allowance of 1,200 requests per minute. Support staff should never infer an entitlement from a similarly named plan or from a customer's historical subscription.
+
+2. Core behavior
+
+The assistant evaluates routing after channel authentication and before response generation.
+
+A low-confidence response can be routed to a human queue when the workspace's configured threshold is not met.
+
+A human handoff freezes automated replies for that conversation until the handoff is resolved or an authorized agent explicitly resumes automation.
+
+Fallback behavior is configured per channel; a failure in one channel does not change another channel's routing configuration.
+
+3. Practical workflow for Email
+
+A typical Email request enters Atlas through the channel adapter, is associated with the correct workspace, and is then processed under that workspace's current routing and data controls. The channel adapter does not grant extra permissions. If a user can send a message but the workspace member viewing the conversation lacks access to the assigned queue, the message can exist without being visible to that member.
+
+Administrators should verify channel identity, workspace identity, plan entitlement, and region before changing configuration. Rotating a channel credential will not fix a role assignment problem, and increasing an API limit will not repair a bad webhook signature.
+
+When troubleshooting, capture timestamps, stable event identifiers, request identifiers, workspace identifiers, and the configuration version. Do not copy private message bodies into ordinary ticket comments when identifiers and digests are sufficient.
+
+4. Edge cases and look-alike situations
+
+Case A — Immediate versus deferred change: A plan upgrade is immediate; a self-serve downgrade is scheduled for the next renewal boundary. The UI can therefore show both a current plan and a pending next plan.
+
+Case B — Similar names: An Atlas workspace, an Atlas organization, and a channel account are different objects. An organization owner may control multiple workspaces, while a channel administrator can control only one integration.
+
+Case C — Empty result: A search returning no final context does not prove that no document exists. Active source filters, workspace boundaries, or freshness state can exclude otherwise similar material.
+
+Case D — Historical note: Before 2026-07-01, some older help articles described deletion as a single-step action. The current model is a visible deletion marker followed by a seven-day recovery window and then hard deletion, unless legal hold applies.
+
+5. Failure handling and verification
+
+A successful API response is not by itself proof that every asynchronous operation has completed. Long-running actions expose a task or operation status that must reach a terminal success state. If the status is failed, the original error code should be retained for diagnosis. Repeating an operation without checking idempotency can create duplicate side effects.
+
+Verification should test the postcondition rather than only the command response. For an identity change, verify effective membership and role. For a knowledge update, verify the latest source version is indexed. For a deletion, verify the object is absent from ordinary retrieval and then track the hard-deletion lifecycle when required. For a region migration, verify the destination data plane and write-unfreeze status.
+
+6. Plan-specific notes
+
+Growth: retention 90 days; API allowance 600 requests per minute; attachment limit 25 MB; knowledge capacity 25 active knowledge sources; export horizon up to 90 days of conversation history; support business-hours priority support.
+
+Business differs. A customer moving from Growth to Business should be told which settings change immediately, which change at renewal, and which require an explicit administrator action. A plan change never bypasses workspace ownership, data-residency, legal-hold, or acceptable-use controls.
+
+7. Search and answer quality notes
+
+A good support answer states the controlling condition before the action. Avoid merging rules that look similar but control different things. Conversation retention is not audit-log retention. Attachment size is not export archive size. A channel's message template approval is not the same as Atlas role approval. A webhook retry schedule is not an API client retry schedule.
+
+When documentation does not state a value, the correct answer is that the value is not specified in the available material. Do not manufacture a default.
+
+8. Worked scenarios for K010-4
+
+Scenario 1: A Growth workspace in Asia Pacific reports that a recent configuration change appears in the admin UI but not in a running conversation. Check whether the change is immediate, whether an asynchronous task is pending, and whether the conversation is bound to an older configuration version.
+
+Scenario 2: A customer compares a Growth limit with a screenshot from a Business workspace. Use the workspace's current entitlement, not the screenshot, as the source of truth. If the account is mid-downgrade, distinguish current entitlement from next-renewal entitlement.
+
+Scenario 3: A Email integration sends duplicate-looking events. Compare event identifiers and delivery identifiers. For webhook-driven duplication, deduplicate on the event identifier.
+
+Scenario 4: A user asks for an answer that would require content outside the active workspace. The system must not cross workspace boundaries to make the answer more complete. Isolation has priority over recall.
+
+9. Scenario matrix
+
+Scenario matrix 1: A Growth administrator in the United States region schedules a downgrade while handling a WhatsApp workflow. The relevant defaults are retention 90 days, API allowance 600 requests per minute, and attachment limit 25 MB. The operator must first decide whether the action is workspace-scoped, identity-scoped, channel-scoped, or billing-scoped. If it creates an asynchronous task, completion must be verified from the terminal task state. If it affects customer content, the workspace region remains controlling. If it conflicts with a signed Enterprise override, the signed term controls only the explicitly overridden field; unrelated defaults remain unchanged.
+
+Scenario matrix 2: A Business administrator in the Asia Pacific region enforces MFA while handling a Voice workflow. The relevant defaults are retention 365 days, API allowance 1,200 requests per minute, and attachment limit 100 MB. The operator must first decide whether the action is workspace-scoped, identity-scoped, channel-scoped, or billing-scoped. If it creates an asynchronous task, completion must be verified from the terminal task state. If it affects customer content, the workspace region remains controlling. If it conflicts with a signed Enterprise override, the signed term controls only the explicitly overridden field; unrelated defaults remain unchanged.
+
+Scenario matrix 3: A Enterprise administrator in the United States region replays a webhook while handling a Web Chat workflow. The relevant defaults are retention 30 to 2,555 days, configurable by an organization owner, API allowance 3,000 requests per minute by default, with contracted overrides possible, and attachment limit 100 MB by default, with contracted overrides possible. The operator must first decide whether the action is workspace-scoped, identity-scoped, channel-scoped, or billing-scoped. If it creates an asynchronous task, completion must be verified from the terminal task state. If it affects customer content, the workspace region remains controlling. If it conflicts with a signed Enterprise override, the signed term controls only the explicitly overridden field; unrelated defaults remain unchanged.
+
+Scenario matrix 4: A Starter administrator in the Asia Pacific region deletes a conversation while handling a Email workflow. The relevant defaults are retention 30 days, API allowance 300 requests per minute, and attachment limit 10 MB. The operator must first decide whether the action is workspace-scoped, identity-scoped, channel-scoped, or billing-scoped. If it creates an asynchronous task, completion must be verified from the terminal task state. If it affects customer content, the workspace region remains controlling. If it conflicts with a signed Enterprise override, the signed term controls only the explicitly overridden field; unrelated defaults remain unchanged.
+
+Scenario matrix 5: A Growth administrator in the United States region schedules a downgrade while handling a Zalo workflow. The relevant defaults are retention 90 days, API allowance 600 requests per minute, and attachment limit 25 MB. The operator must first decide whether the action is workspace-scoped, identity-scoped, channel-scoped, or billing-scoped. If it creates an asynchronous task, completion must be verified from the terminal task state. If it affects customer content, the workspace region remains controlling. If it conflicts with a signed Enterprise override, the signed term controls only the explicitly overridden field; unrelated defaults remain unchanged.
+
+Scenario matrix 6: A Business administrator in the Asia Pacific region schedules a downgrade while handling a WhatsApp workflow. The relevant defaults are retention 365 days, API allowance 1,200 requests per minute, and attachment limit 100 MB. The operator must first decide whether the action is workspace-scoped, identity-scoped, channel-scoped, or billing-scoped. If it creates an asynchronous task, completion must be verified from the terminal task state. If it affects customer content, the workspace region remains controlling. If it conflicts with a signed Enterprise override, the signed term controls only the explicitly overridden field; unrelated defaults remain unchanged.
+
+Scenario matrix 7: A Enterprise administrator in the United States region enforces MFA while handling a Voice workflow. The relevant defaults are retention 30 to 2,555 days, configurable by an organization owner, API allowance 3,000 requests per minute by default, with contracted overrides possible, and attachment limit 100 MB by default, with contracted overrides possible. The operator must first decide whether the action is workspace-scoped, identity-scoped, channel-scoped, or billing-scoped. If it creates an asynchronous task, completion must be verified from the terminal task state. If it affects customer content, the workspace region remains controlling. If it conflicts with a signed Enterprise override, the signed term controls only the explicitly overridden field; unrelated defaults remain unchanged.
+
+Scenario matrix 8: A Starter administrator in the Asia Pacific region schedules a downgrade while handling a Web Chat workflow. The relevant defaults are retention 30 days, API allowance 300 requests per minute, and attachment limit 10 MB. The operator must first decide whether the action is workspace-scoped, identity-scoped, channel-scoped, or billing-scoped. If it creates an asynchronous task, completion must be verified from the terminal task state. If it affects customer content, the workspace region remains controlling. If it conflicts with a signed Enterprise override, the signed term controls only the explicitly overridden field; unrelated defaults remain unchanged.
+
+Scenario matrix 9: A Growth administrator in the United States region adds paid seats while handling a Email workflow. The relevant defaults are retention 90 days, API allowance 600 requests per minute, and attachment limit 25 MB. The operator must first decide whether the action is workspace-scoped, identity-scoped, channel-scoped, or billing-scoped. If it creates an asynchronous task, completion must be verified from the terminal task state. If it affects customer content, the workspace region remains controlling. If it conflicts with a signed Enterprise override, the signed term controls only the explicitly overridden field; unrelated defaults remain unchanged.
+
+Scenario matrix 10: A Business administrator in the Asia Pacific region rotates a credential while handling a Zalo workflow. The relevant defaults are retention 365 days, API allowance 1,200 requests per minute, and attachment limit 100 MB. The operator must first decide whether the action is workspace-scoped, identity-scoped, channel-scoped, or billing-scoped. If it creates an asynchronous task, completion must be verified from the terminal task state. If it affects customer content, the workspace region remains controlling. If it conflicts with a signed Enterprise override, the signed term controls only the explicitly overridden field; unrelated defaults remain unchanged.
+
+Scenario matrix 11: A Enterprise administrator in the United States region replays a webhook while handling a WhatsApp workflow. The relevant defaults are retention 30 to 2,555 days, configurable by an organization owner, API allowance 3,000 requests per minute by default, with contracted overrides possible, and attachment limit 100 MB by default, with contracted overrides possible. The operator must first decide whether the action is workspace-scoped, identity-scoped, channel-scoped, or billing-scoped. If it creates an asynchronous task, completion must be verified from the terminal task state. If it affects customer content, the workspace region remains controlling. If it conflicts with a signed Enterprise override, the signed term controls only the explicitly overridden field; unrelated defaults remain unchanged.
+
+Scenario matrix 12: A Starter administrator in the Asia Pacific region changes a role while handling a Voice workflow. The relevant defaults are retention 30 days, API allowance 300 requests per minute, and attachment limit 10 MB. The operator must first decide whether the action is workspace-scoped, identity-scoped, channel-scoped, or billing-scoped. If it creates an asynchronous task, completion must be verified from the terminal task state. If it affects customer content, the workspace region remains controlling. If it conflicts with a signed Enterprise override, the signed term controls only the explicitly overridden field; unrelated defaults remain unchanged.
+
+Scenario matrix 13: A Growth administrator in the United States region schedules a downgrade while handling a Web Chat workflow. The relevant defaults are retention 90 days, API allowance 600 requests per minute, and attachment limit 25 MB. The operator must first decide whether the action is workspace-scoped, identity-scoped, channel-scoped, or billing-scoped. If it creates an asynchronous task, completion must be verified from the terminal task state. If it affects customer content, the workspace region remains controlling. If it conflicts with a signed Enterprise override, the signed term controls only the explicitly overridden field; unrelated defaults remain unchanged.
+
+Scenario matrix 14: A Business administrator in the Asia Pacific region enforces MFA while handling a Email workflow. The relevant defaults are retention 365 days, API allowance 1,200 requests per minute, and attachment limit 100 MB. The operator must first decide whether the action is workspace-scoped, identity-scoped, channel-scoped, or billing-scoped. If it creates an asynchronous task, completion must be verified from the terminal task state. If it affects customer content, the workspace region remains controlling. If it conflicts with a signed Enterprise override, the signed term controls only the explicitly overridden field; unrelated defaults remain unchanged.
+
+10. Change-control notes
+
+Current edition 2026.09 clarifies the seven-day deletion recovery window, the distinction between workspace and credential-family rate limiting, and the rule that content-region assignment applies to indexed knowledge text and conversation vectors. Older screenshots and tickets may reflect previous wording. Operators should record the edition used when diagnosing disputed behavior.
