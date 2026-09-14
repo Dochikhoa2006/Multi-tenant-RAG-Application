@@ -8,6 +8,7 @@ from uuid import uuid4
 from fastapi import FastAPI
 import pytest
 
+import deployment.wizard_diagnostic_api as wizard_diagnostic_api
 from backend.api.wizard_diagnostics import build_wizard_diagnostic_router
 from backend.mappings.document_map import DocumentMap
 from backend.mappings.paragraph_map import ParagraphMap
@@ -430,6 +431,78 @@ def test_partial_resave_proves_retained_and_replaced_chunk_ids() -> None:
             probed_old_owner_count=0,
             physical_chunk_ids=(old_changed,),
         )
+
+
+def test_wizard_task_polling_uses_finite_large_corpus_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class TaskClient:
+        def __init__(self, statuses: list[str]) -> None:
+            self.statuses = iter(statuses)
+            self.last = statuses[-1]
+            self.calls = 0
+
+        def get(self, *_args: object, **_kwargs: object) -> SimpleNamespace:
+            self.calls += 1
+            status = next(self.statuses, self.last)
+            payload = {
+                "status": status,
+                "error_code": "TASK_FAILED" if status == "failed" else None,
+                "created_at": "2026-01-01T00:00:00Z",
+                "started_at": "2026-01-01T00:00:01Z",
+                "finished_at": "2026-01-01T00:00:02Z",
+            }
+            return SimpleNamespace(status_code=200, json=lambda: payload)
+
+    def api_for(statuses: list[str], name: str) -> tuple[WizardApi, TaskClient]:
+        recorder = OperationRecorder(tmp_path / f"{name}.jsonl")
+        client = TaskClient(statuses)
+        api = object.__new__(WizardApi)
+        api.recorder = recorder
+        api.client = client
+        return api, client
+
+    clock = {"now": 0.0}
+    sleep_steps = iter((901.0, 1.0))
+    monkeypatch.setattr(
+        wizard_diagnostic_api.time, "monotonic", lambda: clock["now"]
+    )
+    monkeypatch.setattr(
+        wizard_diagnostic_api.time,
+        "sleep",
+        lambda _seconds: clock.__setitem__(
+            "now", clock["now"] + next(sleep_steps, 1.0)
+        ),
+    )
+    assert wizard_diagnostic_api.TASK_TIMEOUT_SECONDS == 3600.0
+    delayed_api, delayed_client = api_for(
+        ["running", "running", "succeeded"], "delayed"
+    )
+    assert delayed_api.poll_task(
+        "wizard_diagnostic", str(uuid4()), operation_name="corpus.knowledge.save.poll"
+    )["status"] == "succeeded"
+    assert delayed_client.calls == 3
+
+    clock["now"] = 0.0
+    monkeypatch.setattr(
+        wizard_diagnostic_api.time,
+        "sleep",
+        lambda _seconds: clock.__setitem__("now", clock["now"] + 3600.0),
+    )
+    running_api, running_client = api_for(["running"], "running")
+    with pytest.raises(WizardDiagnosticError, match="timed out"):
+        running_api.poll_task(
+            "wizard_diagnostic", str(uuid4()), operation_name="corpus.policy.save.poll"
+        )
+    assert running_client.calls == 2
+
+    clock["now"] = 0.0
+    failed_api, failed_client = api_for(["failed"], "failed")
+    with pytest.raises(WizardDiagnosticError, match="ended as failed/TASK_FAILED"):
+        failed_api.poll_task(
+            "wizard_diagnostic", str(uuid4()), operation_name="corpus.knowledge.save.poll"
+        )
+    assert failed_client.calls == 1
 
 
 def test_anonymous_trace_client_is_credential_free(tmp_path: Path) -> None:

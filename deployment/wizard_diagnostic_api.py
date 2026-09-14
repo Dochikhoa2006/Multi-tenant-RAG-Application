@@ -47,7 +47,7 @@ from deployment.wizard_diagnostic import (
 
 
 COLLECTION_PREFIXES = {"knowledge": "/api/knowledge", "policy": "/api/policy"}
-TASK_TIMEOUT_SECONDS = 900.0
+TASK_TIMEOUT_SECONDS = 3600.0
 TASK_POLL_SECONDS = 1.0
 TRACE_PATH = "/api/_diagnostics/wizard/trace"
 COMPENSATION_STATUS = (
