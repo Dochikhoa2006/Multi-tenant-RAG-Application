@@ -46,7 +46,7 @@ from deployment.wizard_diagnostic_api import (
     upload_form_fields,
     wizard_saved_fingerprint,
 )
-from backend.weaviate_client.models import ChunkRecord
+from backend.weaviate_client.models import ChunkRecord, DeletionReport
 
 
 def _fixture_tree(root: Path) -> Path:
@@ -618,6 +618,265 @@ def test_diagnostic_snapshot_reads_more_than_weaviate_delete_limit_in_batches() 
     accessor._fetch_records_by_ids = incomplete
     with pytest.raises(WizardDiagnosticError, match="snapshot is incomplete"):
         storage._full_snapshots(user_id, "knowledge", document_id)
+
+
+class _RecoveryAccessor:
+    def __init__(self, physical: _IsolationPhysical) -> None:
+        self.physical = physical
+        self.batches: list[tuple[str, ...]] = []
+
+    def delete_chunks(self, chunk_ids: list[str]) -> DeletionReport:
+        assert 0 < len(chunk_ids) <= 64
+        self.batches.append(tuple(chunk_ids))
+        selected = set(chunk_ids)
+        deleted = tuple(
+            str(item.uuid) for item in self.physical.items
+            if str(item.uuid) in selected
+        )
+        self.physical.items = [
+            item for item in self.physical.items if str(item.uuid) not in selected
+        ]
+        return DeletionReport(len(deleted), len(deleted), 0, deleted, ())
+
+
+def _recovery_item(user_id: str, document_id: str, chunk_id: str):
+    return SimpleNamespace(
+        uuid=UUID(chunk_id),
+        properties={
+            "user_id": user_id,
+            "document_id": UUID(document_id),
+            "chunk_id": UUID(chunk_id),
+        },
+    )
+
+
+def _recovery_storage(document: CorpusDocument, count: int):
+    user_id = "wizard_diagnostic"
+    manager = _IsolationManager(user_id, 3)
+    name = wizard_diagnostic_api.get_collection_name(
+        user_id, "knowledge_facts" if document.collection == "knowledge" else "policy"
+    )
+    physical = manager.physical[name]
+    physical.items = [
+        _recovery_item(user_id, document.wizard_id, str(uuid4()))
+        for _ in range(count)
+    ]
+    accessor = _RecoveryAccessor(physical)
+    storage = wizard_diagnostic_api.CorpusStorage({}, user_id)
+    storage.manager = manager
+
+    def collection(selected_user, selected_collection):
+        assert (selected_user, selected_collection) == (user_id, document.collection)
+        return accessor
+
+    storage._collection = collection
+    return storage, accessor, physical
+
+
+@pytest.mark.parametrize("collection", ["knowledge", "policy"])
+@pytest.mark.parametrize("prior_deleted", [0, 10_000, 10_017])
+def test_persistent_recovery_deletes_complete_large_document_survivors(
+    collection: str, prior_deleted: int,
+) -> None:
+    document = CorpusDocument(
+        collection, str(uuid4()), status="save_submitted", task_id=str(uuid4())
+    )
+    storage, accessor, physical = _recovery_storage(document, 10_017)
+    physical.items = physical.items[prior_deleted:]
+    expected = {str(item.uuid) for item in physical.items}
+    other = _recovery_item("wizard_diagnostic", str(uuid4()), str(uuid4()))
+    physical.items.insert(0, other)
+
+    assert storage.delete_document(document) == 10_017 - prior_deleted
+
+    assert physical.items == [other]
+    deleted = [chunk_id for batch in accessor.batches for chunk_id in batch]
+    assert set(deleted) == expected
+    assert len(deleted) == len(expected)
+    assert len(accessor.batches) == (len(expected) + 63) // 64
+    assert physical.iterator_calls == [{
+        "include_vector": False,
+        "return_properties": ["user_id", "document_id", "chunk_id"],
+    }] * 2
+
+
+def test_persistent_recovery_empty_document_is_verified_without_deletion() -> None:
+    document = CorpusDocument("knowledge", str(uuid4()))
+    storage, accessor, physical = _recovery_storage(document, 0)
+
+    assert storage.delete_document(document) == 0
+    assert accessor.batches == []
+    assert len(physical.iterator_calls) == 2
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["duplicate", "uuid", "chunk_id", "document_id", "mismatch", "user", "properties"],
+)
+def test_persistent_recovery_validates_complete_inventory_before_deletion(
+    corruption: str,
+) -> None:
+    document = CorpusDocument("knowledge", str(uuid4()))
+    storage, accessor, physical = _recovery_storage(document, 130)
+    last = physical.items[-1]
+    if corruption == "duplicate":
+        physical.items.append(physical.items[0])
+    elif corruption == "uuid":
+        last.uuid = "invalid"
+    elif corruption in {"chunk_id", "document_id"}:
+        last.properties[corruption] = "invalid"
+    elif corruption == "mismatch":
+        last.properties["chunk_id"] = uuid4()
+    elif corruption == "user":
+        last.properties["user_id"] = "another_user"
+    else:
+        last.properties = None
+
+    with pytest.raises(WizardDiagnosticError, match="Physical corpus"):
+        storage.delete_document(document)
+    assert accessor.batches == []
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["exception", "unconfirmed", "short", "wrong_ids", "duplicate_ids", "matched"],
+)
+def test_persistent_recovery_stops_at_incomplete_batch(failure: str) -> None:
+    document = CorpusDocument("knowledge", str(uuid4()))
+    storage, accessor, physical = _recovery_storage(document, 130)
+    original_delete = accessor.delete_chunks
+
+    def fail_second_batch(chunk_ids):
+        if not accessor.batches:
+            return original_delete(chunk_ids)
+        if failure == "exception":
+            raise RuntimeError("batch transport failure")
+        report = original_delete(chunk_ids)
+        if failure == "unconfirmed":
+            return replace(report, remaining_ids=(chunk_ids[0],))
+        if failure == "short":
+            return DeletionReport(63, 63, 0, report.deleted_ids[:-1], ())
+        if failure == "wrong_ids":
+            return replace(report, deleted_ids=(*report.deleted_ids[:-1], str(uuid4())))
+        if failure == "duplicate_ids":
+            return replace(report, deleted_ids=(*report.deleted_ids[:-1], chunk_ids[0]))
+        return replace(report, matched=65)
+
+    accessor.delete_chunks = fail_second_batch
+    with pytest.raises((WizardDiagnosticError, RuntimeError), match="batch"):
+        storage.delete_document(document)
+    assert len(accessor.batches) == (1 if failure == "exception" else 2)
+    assert len(physical.items) == (66 if failure == "exception" else 2)
+
+
+@pytest.mark.parametrize("initial_count", [0, 65])
+def test_persistent_recovery_rescans_for_new_objects_after_batches(initial_count: int) -> None:
+    document = CorpusDocument("knowledge", str(uuid4()))
+    storage, accessor, physical = _recovery_storage(document, initial_count)
+    original_iterator = physical.iterator
+    remaining = _recovery_item("wizard_diagnostic", document.wizard_id, str(uuid4()))
+
+    def iterator(**kwargs):
+        if physical.iterator_calls:
+            # Put a newly appearing target beyond 10k unrelated objects. The
+            # final check must exhaust the iterator, even after empty discovery.
+            other_document = str(uuid4())
+            physical.items.extend(
+                _recovery_item("wizard_diagnostic", other_document, str(uuid4()))
+                for _ in range(10_001)
+            )
+            physical.items.append(remaining)
+        return original_iterator(**kwargs)
+
+    physical.iterator = iterator
+    with pytest.raises(WizardDiagnosticError, match="left persisted chunks"):
+        storage.delete_document(document)
+    assert len(physical.iterator_calls) == 2
+    assert len(accessor.batches) == (initial_count + 63) // 64
+
+
+@pytest.mark.parametrize("pending_kind", ["replacement", "cleanup"])
+@pytest.mark.parametrize("failure", ["batch", "remaining", "scan"])
+def test_cleanup_pending_retains_state_until_verified_deletion_and_can_retry(
+    tmp_path: Path, pending_kind: str, failure: str,
+) -> None:
+    user_id = "wizard_diagnostic"
+    original, fixtures = _complete_state(_fixture_tree(tmp_path), tmp_path)
+    state = begin_replacement(original, "interrupted", fixtures)
+    document = CorpusDocument("knowledge", str(uuid4()))
+    state = record_replacement_document(state, document)
+    document = replace(document, status="save_submitting")
+    state = record_replacement_document(state, document)
+    document = replace(document, status="save_submitted", task_id=str(uuid4()))
+    state = record_replacement_document(state, document)
+    storage, accessor, physical = _recovery_storage(document, 130)
+    if pending_kind == "cleanup":
+        saved = replace(
+            document, status="saved",
+            chunk_ids=tuple(sorted(str(item.uuid) for item in physical.items)),
+            storage_fingerprint="a" * 64,
+        )
+        state = replace(state, pending_replacement=None, pending_cleanup=(saved,))
+    for active_document in original.active.documents:
+        name = wizard_diagnostic_api.get_collection_name(
+            user_id,
+            "knowledge_facts" if active_document.collection == "knowledge" else "policy",
+        )
+        storage.manager.physical[name].items.extend(
+            _recovery_item(user_id, active_document.wizard_id, chunk_id)
+            for chunk_id in active_document.chunk_ids
+        )
+
+    def target_items():
+        return [
+            item for item in physical.items
+            if str(item.properties["document_id"]) == document.wizard_id
+        ]
+
+    path = tmp_path / "state.json"
+    write_corpus_state(path, state)
+    original_state = path.read_bytes()
+    recorder = OperationRecorder(tmp_path / "operations.jsonl")
+    original_delete = accessor.delete_chunks
+    original_iterator = physical.iterator
+
+    def delete(chunk_ids):
+        if failure == "batch" and accessor.batches:
+            raise RuntimeError("batch transport failure")
+        retained = target_items()[-1]
+        report = original_delete(chunk_ids)
+        if failure == "remaining" and not target_items():
+            physical.items.append(retained)
+        return report
+
+    def iterator(**kwargs):
+        if failure == "scan" and accessor.batches:
+            raise RuntimeError("final scan failure")
+        return original_iterator(**kwargs)
+
+    accessor.delete_chunks = delete
+    physical.iterator = iterator
+    with pytest.raises((WizardDiagnosticError, RuntimeError)):
+        wizard_diagnostic_api._cleanup_pending(path, state, storage, recorder)
+
+    assert path.read_bytes() == original_state
+    assert recorder.count == 0
+    expected_remaining = {"batch": 66, "remaining": 1, "scan": 0}[failure]
+    assert len(target_items()) == expected_remaining
+
+    accessor.delete_chunks = original_delete
+    physical.iterator = original_iterator
+    recovered = wizard_diagnostic_api._cleanup_pending(
+        path, load_corpus_state(path, user_id), storage, recorder
+    )
+    assert recovered.pending_replacement is None
+    assert recovered.pending_cleanup == ()
+    assert recovered.active == original.active
+    assert load_corpus_state(path, user_id) == recovered
+    assert target_items() == []
+    operation = json.loads(recorder.path.read_text())
+    assert operation["deleted_chunks"] == expected_remaining
+    assert operation["name"] == f"corpus.recovery.pending_{pending_kind}"
 
 
 def test_request_builders_preserve_negative_case_wire_values() -> None:

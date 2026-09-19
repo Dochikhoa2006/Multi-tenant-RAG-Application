@@ -50,6 +50,7 @@ COLLECTION_PREFIXES = {"knowledge": "/api/knowledge", "policy": "/api/policy"}
 TASK_TIMEOUT_SECONDS = 3600.0
 TASK_POLL_SECONDS = 1.0
 STORAGE_SNAPSHOT_BATCH_SIZE = 64
+STORAGE_DELETE_BATCH_SIZE = 64
 TRACE_PATH = "/api/_diagnostics/wizard/trace"
 COMPENSATION_STATUS = (
     "Compensation path not acceptance-tested because no safe deterministic "
@@ -1365,21 +1366,44 @@ class CorpusStorage:
                 )
 
     def delete_document(self, document: CorpusDocument) -> int:
-        report = self._collection(
+        """Retire persistent corpus chunks only after complete verified deletion."""
+
+        document_id = str(UUID(document.wizard_id))
+        # Inventory exhausts the vector-free iterator and validates all physical
+        # identities before mutation. Rediscover survivors on every retry; a
+        # save_submitted document need not have any recorded chunk IDs yet.
+        membership = self.inventory(self.diagnostic_user_id, document.collection)
+        chunk_ids = [
+            chunk_id
+            for chunk_id, parent_id in membership.items()
+            if parent_id == document_id
+        ]
+        deleted = 0
+        if chunk_ids:
+            accessor = self._collection(self.diagnostic_user_id, document.collection)
+            for offset in range(0, len(chunk_ids), STORAGE_DELETE_BATCH_SIZE):
+                batch_ids = chunk_ids[offset : offset + STORAGE_DELETE_BATCH_SIZE]
+                report = accessor.delete_chunks(batch_ids)
+                if (
+                    not report.confirmed
+                    or report.matched != len(batch_ids)
+                    or report.successful != len(batch_ids)
+                    or len(report.deleted_ids) != len(batch_ids)
+                    or set(report.deleted_ids) != set(batch_ids)
+                ):
+                    raise WizardDiagnosticError(
+                        "Corpus chunk deletion batch was not completely confirmed"
+                    )
+                deleted += report.successful
+
+        remaining = self.inventory(
             self.diagnostic_user_id, document.collection
-        ).delete_by_document(document.wizard_id)
-        if not report.confirmed:
-            raise WizardDiagnosticError(
-                "Document-scoped corpus deletion was not confirmed"
-            )
-        remaining = self.inspect_document(
-            self.diagnostic_user_id, document.collection, document.wizard_id
         )
-        if remaining.chunk_count:
+        if document_id in remaining.values():
             raise WizardDiagnosticError(
                 "Document-scoped deletion left persisted chunks"
             )
-        return report.successful
+        return deleted
 
 
 def _check(
