@@ -7,7 +7,8 @@ import inspect
 import json
 from pathlib import Path
 import textwrap
-from uuid import uuid4
+from types import SimpleNamespace
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -550,6 +551,73 @@ def test_storage_fingerprint_detects_chunk_identity_changes() -> None:
 
     with pytest.raises(WizardDiagnosticError, match="object and chunk IDs"):
         storage_integrity((replace(record, object_id=str(uuid4())),))
+
+
+def test_diagnostic_snapshot_reads_more_than_weaviate_delete_limit_in_batches() -> None:
+    user_id = "wizard_diagnostic"
+    document_id = str(uuid4())
+    object_ids = tuple(str(uuid4()) for _ in range(10_001))
+
+    class Physical:
+        def iterator(self, **kwargs: object):
+            assert kwargs == {
+                "include_vector": False,
+                "return_properties": ["user_id", "document_id", "chunk_id"],
+            }
+            for chunk_id in object_ids:
+                yield SimpleNamespace(
+                    uuid=UUID(chunk_id),
+                    properties={
+                        "user_id": user_id,
+                        "document_id": UUID(document_id),
+                        "chunk_id": UUID(chunk_id),
+                    },
+                )
+
+    class Accessor:
+        def __init__(self) -> None:
+            self._collection = Physical()
+            self.batches: list[tuple[str, ...]] = []
+
+        def _fetch_records_by_ids(self, chunk_ids):
+            self.batches.append(tuple(chunk_ids))
+            return {
+                chunk_id: ChunkRecord(
+                    chunk_id,
+                    user_id,
+                    document_id,
+                    index + 1,
+                    chunk_id,
+                    "text",
+                    ((0.0,),),
+                    (0.0,),
+                )
+                for index, chunk_id in enumerate(chunk_ids)
+            }
+
+    accessor = Accessor()
+    storage = wizard_diagnostic_api.CorpusStorage({}, user_id)
+    storage._collection = lambda *_: accessor
+
+    records = storage._full_snapshots(user_id, "knowledge", document_id)
+
+    assert tuple(record.chunk_id for record in records) == object_ids
+    assert max(map(len, accessor.batches)) <= 64
+    assert len(accessor.batches) > 1
+
+    missing = object_ids[-1]
+    original_fetch = accessor._fetch_records_by_ids
+
+    def incomplete(chunk_ids):
+        return {
+            key: value
+            for key, value in original_fetch(chunk_ids).items()
+            if key != missing
+        }
+
+    accessor._fetch_records_by_ids = incomplete
+    with pytest.raises(WizardDiagnosticError, match="snapshot is incomplete"):
+        storage._full_snapshots(user_id, "knowledge", document_id)
 
 
 def test_request_builders_preserve_negative_case_wire_values() -> None:

@@ -49,6 +49,7 @@ from deployment.wizard_diagnostic import (
 COLLECTION_PREFIXES = {"knowledge": "/api/knowledge", "policy": "/api/policy"}
 TASK_TIMEOUT_SECONDS = 3600.0
 TASK_POLL_SECONDS = 1.0
+STORAGE_SNAPSHOT_BATCH_SIZE = 64
 TRACE_PATH = "/api/_diagnostics/wizard/trace"
 COMPENSATION_STATUS = (
     "Compensation path not acceptance-tested because no safe deterministic "
@@ -1164,6 +1165,48 @@ class CorpusStorage:
     ) -> tuple[Any, ...]:
         return self._collection(user_id, collection).snapshot_by_document(wizard_id)
 
+    def _full_snapshots(
+        self, user_id: str, collection: str, wizard_id: str
+    ) -> tuple[Any, ...]:
+        accessor = self._collection(user_id, collection)
+        object_ids: list[str] = []
+        for item in accessor._collection.iterator(
+            include_vector=False,
+            return_properties=["user_id", "document_id", "chunk_id"],
+        ):
+            properties = getattr(item, "properties", None)
+            if (
+                not isinstance(properties, Mapping)
+                or properties.get("user_id") != user_id
+            ):
+                raise WizardDiagnosticError("Physical corpus membership is malformed")
+            try:
+                object_id = str(UUID(str(getattr(item, "uuid", None))))
+                chunk_id = str(UUID(str(properties.get("chunk_id"))))
+                document_id = str(UUID(str(properties.get("document_id"))))
+            except (TypeError, ValueError) as exc:
+                raise WizardDiagnosticError("Physical corpus IDs are malformed") from exc
+            if object_id != chunk_id:
+                raise WizardDiagnosticError("Physical corpus chunk IDs are inconsistent")
+            if document_id == wizard_id:
+                object_ids.append(object_id)
+        if len(set(object_ids)) != len(object_ids):
+            raise WizardDiagnosticError("Physical corpus chunk IDs are inconsistent")
+
+        records: dict[str, Any] = {}
+        for offset in range(0, len(object_ids), STORAGE_SNAPSHOT_BATCH_SIZE):
+            batch_ids = object_ids[offset : offset + STORAGE_SNAPSHOT_BATCH_SIZE]
+            batch = accessor._fetch_records_by_ids(batch_ids)
+            if set(records).intersection(batch):
+                raise WizardDiagnosticError("Persisted chunk IDs are duplicated")
+            records.update(batch)
+        if set(records) != set(object_ids):
+            raise WizardDiagnosticError("Persisted corpus snapshot is incomplete")
+        ordered = tuple(records[object_id] for object_id in object_ids)
+        if any(record.document_id != wizard_id for record in ordered):
+            raise WizardDiagnosticError("Persisted corpus document escaped its scope")
+        return ordered
+
     def inspect_document(
         self,
         user_id: str,
@@ -1171,8 +1214,13 @@ class CorpusStorage:
         wizard_id: str,
         *,
         require_nonempty: bool = False,
+        full_scan: bool = False,
     ) -> StorageIntegrity:
-        records = self.snapshots(user_id, collection, wizard_id)
+        records = (
+            self._full_snapshots(user_id, collection, wizard_id)
+            if full_scan
+            else self.snapshots(user_id, collection, wizard_id)
+        )
         if not records:
             if require_nonempty:
                 raise WizardDiagnosticError(
@@ -1199,13 +1247,23 @@ class CorpusStorage:
         )
 
     def document_membership(
-        self, user_id: str, collection: str, wizard_id: str
+        self,
+        user_id: str,
+        collection: str,
+        wizard_id: str,
+        *,
+        full_scan: bool = False,
     ) -> dict[int, list[str]]:
         """Return a sanitized physical paragraph/chunk membership view."""
 
         mapping: dict[int, list[str]] = {}
         seen: set[str] = set()
-        for record in self.snapshots(user_id, collection, wizard_id):
+        records = (
+            self._full_snapshots(user_id, collection, wizard_id)
+            if full_scan
+            else self.snapshots(user_id, collection, wizard_id)
+        )
+        for record in records:
             if record.user_id != user_id or record.document_id != wizard_id:
                 raise WizardDiagnosticError(
                     "Persisted corpus document escaped its scope"
@@ -1427,6 +1485,7 @@ def _verify_save_postcondition(
     expected_text: str,
     *,
     proof_samples: Sequence[str] = (),
+    full_storage_scan: bool = False,
 ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
     if user_id != api.diagnostic_user_id:
         return {}, {}
@@ -1460,12 +1519,23 @@ def _verify_save_postcondition(
     ):
         raise WizardDiagnosticError("Saved Wizard mapping postcondition failed")
     integrity = storage.inspect_document(
-        user_id, collection, wizard_id, require_nonempty=True
+        user_id,
+        collection,
+        wizard_id,
+        require_nonempty=True,
+        full_scan=full_storage_scan,
     )
-    physical_mapping = storage.document_membership(user_id, collection, wizard_id)
+    physical_mapping = storage.document_membership(
+        user_id, collection, wizard_id, full_scan=full_storage_scan
+    )
     _verify_mapping_and_storage(checkpoint, physical_mapping)
     other = "policy" if collection == "knowledge" else "knowledge"
-    if storage.snapshots(user_id, other, wizard_id):
+    other_records = (
+        storage._full_snapshots(user_id, other, wizard_id)
+        if full_storage_scan
+        else storage.snapshots(user_id, other, wizard_id)
+    )
+    if other_records:
         raise WizardDiagnosticError("Knowledge/Policy storage isolation failed")
     verification_latency_ms = round((time.monotonic() - started) * 1000, 3)
     api.recorder.record(
@@ -2292,6 +2362,7 @@ def _verify_generation(
             document.collection,
             document.wizard_id,
             require_nonempty=True,
+            full_scan=True,
         )
         _check(
             recorder,
@@ -2312,10 +2383,10 @@ def _verify_generation(
     _check(
         recorder,
         operation_name + ".isolation",
-        not storage.snapshots(
+        not storage._full_snapshots(
             diagnostic_user_id, "policy", knowledge.wizard_id
         )
-        and not storage.snapshots(
+        and not storage._full_snapshots(
             diagnostic_user_id, "knowledge", policy.wizard_id
         ),
     )
@@ -2484,12 +2555,14 @@ def ensure_persistent_corpus(
             submitted.task_id,
             f"corpus.{collection}.save",
             expected_text,
+            full_storage_scan=True,
         )
         integrity = storage.inspect_document(
             diagnostic_user_id,
             collection,
             document.wizard_id,
             require_nonempty=True,
+            full_scan=True,
         )
         complete = replace(
             submitted,
