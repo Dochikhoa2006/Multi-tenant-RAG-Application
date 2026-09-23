@@ -62,12 +62,6 @@ def _stop_child(child_pid: int) -> None:
         with suppress(ChildProcessError):
             os.waitpid(child_pid, 0)
 
-def _orphan_deadline(deadline: float) -> None:
-    """Last resort if the supervisor itself disappears unexpectedly."""
-    # Give the supervisor's TERM/KILL/reap sequence first ownership; this
-    # fallback fires only if that supervisor is gone or unresponsive.
-    Event().wait(max(0.0, deadline + _STOP_GRACE_SECONDS + 1.0 - monotonic()))
-    os.killpg(os.getpgrp(), signal.SIGKILL)
 
 
 def _supervise(payload: dict, lock_fd: int, deadline: float, cancelled: Event) -> bytes:
