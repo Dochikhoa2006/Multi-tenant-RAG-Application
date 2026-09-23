@@ -1,7 +1,6 @@
 """Populate this literal list before running the Phase 2 E2E diagnostic."""
 
 QUERIES: list[str] = [
-    "Need an answer I can send to an admin: We're on Growth in European Union. What's the normal conversation retention window, and does it count from creation or from the latest activity?",
     "Our Business workspace uses several API keys and together we're over 1,200 requests per minute. Can each key claim its own full limit, or is the limit shared?",
     "Customer is pushing back here: We're on Starter in United States. What's the normal conversation retention window, and does it count from creation or from the latest activity?",
     "This is from a real ticket-style scenario: Our Starter workspace uses several API keys and together we're over 300 requests per minute. Can each key claim its own full limit, or is the limit shared?",
