@@ -109,7 +109,24 @@ def _supervise(payload: dict, lock_fd: int, deadline: float, cancelled: Event) -
         os.close(read_fd)
         _stop_child(child_pid)
 
-
+    read_fd, write_fd = os.pipe()
+    child_pid = os.fork()
+    if child_pid == 0:
+        os.close(read_fd)
+        try:
+            os.setpgid(0, 0)
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            Thread(target=_orphan_deadline, args=(deadline,), daemon=True).start()
+            result = _execute_payload(payload, lock_fd, deadline)
+            encoded = json.dumps(result, allow_nan=False, separators=(",", ":")).encode()
+            if len(encoded) > _MAX_OUTPUT_BYTES:
+                os._exit(2)
+            with os.fdopen(write_fd, "wb") as output:
+                output.write(encoded)
+            os._exit(0)
+        except BaseException:
+            os._exit(2)
 def _read_payload(deadline: float, cancelled: Event) -> dict:
     contents = bytearray()
     descriptor = sys.stdin.fileno()
