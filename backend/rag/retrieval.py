@@ -15,8 +15,10 @@ from backend.model_config import (
     CONVERSATION_SEARCH,
     KNOWLEDGE_SEARCH,
     MMR_DIVERSITY_VECTOR_DIMENSION,
+    ONNX_RERANKER,
     POLICY_SEARCH,
     RERANKER_MODEL,
+    RERANKER_MODEL_REVISION,
     TEXT_PROCESSING,
     TOKEN_BUDGETS,
     RetrievalConfig,
@@ -32,9 +34,11 @@ from backend.weaviate_client.models import HydratedSearchResult, SearchResult
 from backend.wizard.diagnostics import (
     TRACE_SAMPLE_LIMIT,
     add_count,
+    capture_retrieval_candidate_pages,
     framed_content_digest,
     observe_elapsed,
     observe_stage,
+    observe_trace_metadata,
     set_flag,
     set_framed_digest,
     set_sample,
@@ -66,6 +70,30 @@ _TRACE_COLLECTION_PREFIXES = {
     "policy": "policy",
 }
 _LOGGER = logging.getLogger(__name__)
+_POLICY_EMPTY_POOL_FLOOR = -3.0
+
+
+def _eligible_candidates(
+    reranked: Sequence[dict[str, Any]],
+    config: RetrievalConfig,
+    *,
+    collection_type: str,
+) -> list[dict[str, Any]]:
+    eligible = [
+        candidate
+        for candidate in reranked
+        if candidate["rerank_score"] >= config.adaptive_relevance_floor
+    ]
+    # Rescue only a bounded, rank-strong Policy result; never expand a
+    # nonempty pool or change the already-established BGE/UUID ordering.
+    if (
+        not eligible
+        and collection_type == "policy"
+        and reranked
+        and reranked[0]["rerank_score"] >= _POLICY_EMPTY_POOL_FLOOR
+    ):
+        return [reranked[0]]
+    return eligible
 
 
 def _context_item_fingerprints(
@@ -87,6 +115,119 @@ def _context_item_fingerprints(
             yield f"{object_id}:{digest}"
 
     return fingerprints()
+
+
+def _observe_candidate_decisions(
+    *,
+    prefix: str,
+    hybrid_candidates: Sequence[SearchResult],
+    reranked: Sequence[Mapping[str, Any]],
+    eligible: Sequence[Mapping[str, Any]],
+    adaptive_pool: Sequence[Mapping[str, Any]],
+    hydrated_pool: Sequence[Mapping[str, Any]],
+    mmr_selected: Sequence[Mapping[str, Any]],
+    final_selected: Sequence[Mapping[str, Any]],
+    mmr_usable: bool,
+    config: RetrievalConfig,
+) -> None:
+    """Derive bounded evidence only inside ``observe_trace_metadata``."""
+
+    ceiling = 50 if prefix == "knowledge" else 40
+    if len(hybrid_candidates) > ceiling or len(reranked) > ceiling:
+        raise ValueError("retrieval candidate observation exceeds its ceiling")
+    hybrid_ranks = {
+        candidate.object_id: index
+        for index, candidate in enumerate(hybrid_candidates, start=1)
+    }
+    eligible_ids = {str(candidate["object_id"]) for candidate in eligible}
+    adaptive_ids = {str(candidate["object_id"]) for candidate in adaptive_pool}
+    hydrated_ids = {str(candidate["object_id"]) for candidate in hydrated_pool}
+    mmr_ids = {str(candidate["object_id"]) for candidate in mmr_selected}
+    final_ids = {str(candidate["object_id"]) for candidate in final_selected}
+    decisions: list[str] = []
+    text_digests: list[str] = []
+    collection_code = "k" if prefix == "knowledge" else "p"
+    for bge_rank, candidate in enumerate(reranked, start=1):
+        object_id = str(candidate["object_id"])
+        score = float(candidate["rerank_score"])
+        floor_pass = object_id in eligible_ids
+        effective_floor = config.adaptive_relevance_floor
+        if prefix == "policy" and floor_pass and score < effective_floor:
+            effective_floor = _POLICY_EMPTY_POOL_FLOOR
+        adaptive_inclusion = object_id in adaptive_ids
+        if not adaptive_inclusion:
+            hydration_outcome = "n"
+        elif object_id in hydrated_ids:
+            hydration_outcome = "y"
+        else:
+            hydration_outcome = "f"
+        mmr_inclusion = object_id in mmr_ids
+        final_inclusion = object_id in final_ids
+        if not floor_pass:
+            reason = "floor"
+        elif not adaptive_inclusion:
+            reason = "adaptive_gap"
+        elif hydration_outcome == "f":
+            reason = "hydration"
+        elif not mmr_inclusion:
+            reason = "mmr_limit" if mmr_usable else "fallback_limit"
+        elif not final_inclusion:
+            reason = "budget"
+        else:
+            reason = "selected"
+        decisions.append(
+            "|".join(
+                (
+                    object_id,
+                    collection_code,
+                    str(hybrid_ranks[object_id]),
+                    str(bge_rank),
+                    score.hex(),
+                    float(effective_floor).hex(),
+                    "1" if floor_pass else "0",
+                    "1" if adaptive_inclusion else "0",
+                    hydration_outcome,
+                    "1" if mmr_inclusion else "0",
+                    "1" if final_inclusion else "0",
+                    reason,
+                )
+            )
+        )
+        digest = framed_content_digest(
+            "chat-kp-candidate-text-v1",
+            (str(candidate["retrieval_text"]).encode("utf-8"),),
+        )
+        text_digests.append(f"{object_id}:{digest}")
+
+    selected_boundary = (
+        float(adaptive_pool[-1]["rerank_score"]).hex()
+        if adaptive_pool
+        else "none"
+    )
+    first_excluded = (
+        float(eligible[len(adaptive_pool)]["rerank_score"]).hex()
+        if len(adaptive_pool) < len(eligible)
+        else "none"
+    )
+    capture_retrieval_candidate_pages(
+        prefix,
+        decisions,
+        text_digests,
+        adaptive_metadata=(
+            f"gap_threshold_hex={float(config.adaptive_gap_threshold).hex()};"
+            f"eligible_count={len(eligible)};"
+            f"adaptive_count={len(adaptive_pool)};"
+            f"last_selected_raw_score_hex={selected_boundary};"
+            f"first_adaptive_excluded_raw_score_hex={first_excluded}"
+        ),
+        reranker_identity=(
+            f"model={RERANKER_MODEL};revision={RERANKER_MODEL_REVISION};"
+            f"onnx={ONNX_RERANKER.onnx_filename};"
+            f"manifest={ONNX_RERANKER.manifest_filename};"
+            f"output={ONNX_RERANKER.output_name};"
+            f"max_tokens={ONNX_RERANKER.max_tokens}"
+        ),
+    )
 
 
 def _required_text(value: object, name: str) -> str:
@@ -774,12 +915,9 @@ def retrieve(
                 exact_count=len(reranked),
             )
             with observe_stage(f"chat.{trace_prefix}_relevance_floor"):
-                eligible = [
-                    candidate
-                    for candidate in reranked
-                    if candidate["rerank_score"]
-                    >= config.adaptive_relevance_floor
-                ]
+                eligible = _eligible_candidates(
+                    reranked, config, collection_type=collection_type
+                )
             add_count(f"{trace_prefix}_relevance_input_count", len(reranked))
             add_count(f"{trace_prefix}_relevance_eligible_count", len(eligible))
             set_sample(
@@ -878,6 +1016,7 @@ def retrieve(
         if mmr_usable
         else hydrated_pool[: config.final_count]
     )
+    mmr_selected = selected
     mmr_elapsed = (perf_counter() - mmr_started) * 1000.0
     if timing_observer is not None and collection_type == "conversations":
         timing_observer("conversation_mmr_rerank", mmr_elapsed)
@@ -987,6 +1126,20 @@ def retrieve(
                     )
                 ),
             )
+    if trace_prefix is not None:
+        observe_trace_metadata(
+            _observe_candidate_decisions,
+            prefix=trace_prefix,
+            hybrid_candidates=candidates,
+            reranked=reranked,
+            eligible=eligible,
+            adaptive_pool=adaptive_pool,
+            hydrated_pool=hydrated_pool,
+            mmr_selected=mmr_selected,
+            final_selected=selected,
+            mmr_usable=mmr_usable,
+            config=config,
+        )
     return selected
 
 

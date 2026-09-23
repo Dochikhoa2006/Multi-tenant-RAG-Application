@@ -1223,6 +1223,7 @@ def verify_physical_corpus(
                 document.collection,
                 document.wizard_id,
                 require_nonempty=True,
+                full_scan=True,
             )
             if (
                 integrity.chunk_ids != document.chunk_ids

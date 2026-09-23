@@ -19,6 +19,7 @@ TRACE_SCHEMA_VERSION = "1.0"
 TRACE_SESSION_MAX_OPERATIONS = 256
 EVALUATION_SESSION_CAPACITY = 256
 TRACE_SAMPLE_LIMIT = 32
+TRACE_CANDIDATE_PAGE_COUNT = 2
 TRACE_TEXT_MAX_UTF8_BYTES = 8192
 TRACE_CAPTURE_MODES = frozenset({"deep", "evaluation"})
 TRACE_SESSION_HEADER = "X-Wizard-Diagnostic-Session-ID"
@@ -728,6 +729,75 @@ def observe_trace_metadata(
         registry.mark_fault()
 
 
+def capture_retrieval_candidate_pages(
+    collection: str,
+    decisions: Sequence[str],
+    text_digests: Sequence[str],
+    *,
+    adaptive_metadata: str,
+    reranker_identity: str,
+) -> None:
+    """Store two bounded pages of already-computed retrieval decisions."""
+
+    registry = _REGISTRY
+    handle = _ACTIVE_HANDLE.get()
+    if registry is None or handle is None:
+        return
+    try:
+        if not registry.captures_deep_trace(handle):
+            return
+        prefix = _required_text(collection, "retrieval collection", maximum=16)
+        if prefix not in {"knowledge", "policy"}:
+            raise ValueError("retrieval candidate collection is unsupported")
+        ceiling = 50 if prefix == "knowledge" else 40
+        if len(decisions) != len(text_digests) or len(decisions) > ceiling:
+            raise ValueError("retrieval candidate observation is not bounded")
+        for page_index in range(TRACE_CANDIDATE_PAGE_COUNT):
+            start = page_index * TRACE_SAMPLE_LIMIT
+            stop = start + TRACE_SAMPLE_LIMIT
+            decision_page = decisions[start:stop]
+            digest_page = text_digests[start:stop]
+            suffix = page_index + 1
+            registry.set_sample(
+                handle,
+                f"{prefix}_candidate_decisions_page_{suffix}",
+                decision_page,
+                exact_count=len(decision_page),
+            )
+            registry.set_sample(
+                handle,
+                f"{prefix}_candidate_text_digests_page_{suffix}",
+                digest_page,
+                exact_count=len(digest_page),
+            )
+        registry.set_text(
+            handle,
+            f"{prefix}_candidate_decision_fields",
+            "candidate_id|collection|hybrid_rank|bge_rank|raw_score_hex|"
+            "floor_hex|floor_pass|adaptive_inclusion|hydration_outcome|"
+            "mmr_inclusion|final_inclusion|first_exclusion_reason",
+        )
+        registry.set_text(
+            handle,
+            f"{prefix}_candidate_observation_legend",
+            "collection:k=knowledge,p=policy;hydration:n=not_requested,"
+            "y=hydrated,f=failed;booleans:0=false,1=true;"
+            "scores=python_float_hex",
+        )
+        registry.set_text(
+            handle,
+            f"{prefix}_adaptive_observation",
+            adaptive_metadata,
+        )
+        registry.set_text(
+            handle,
+            f"{prefix}_reranker_identity",
+            reranker_identity,
+        )
+    except Exception:
+        registry.mark_fault()
+
+
 def begin_request_operation(
     *,
     user_id: str,
@@ -1181,6 +1251,7 @@ __all__ = [
     "activate_operation",
     "activate_title_provider",
     "active_trace_handle",
+    "capture_retrieval_candidate_pages",
     "add_count",
     "attach_task",
     "attach_related_task",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import fcntl
 import json
@@ -97,16 +98,184 @@ def test_only_the_two_literal_observation_hooks_differ_in_generation_sources() -
         assert changes == allowed
 
 
+def _assert_historical_source(relative: str, current: bytes) -> None:
+    original = subprocess.check_output(
+        ["git", "show", f"{gate.BEHAVIORAL_BASELINE_COMMIT}:{relative}"], cwd=gate.ROOT
+    )
+    assert current == original, relative
+
+
 def test_all_other_protected_rag_sources_are_identical_to_behavioral_baseline() -> None:
     manifest = json.loads(gate.MANIFEST_PATH.read_text())
     exceptions = gate.APPROVED_EVIDENCE_HOOK_FILES | {"deployment/evaluation_bridge_worker.py"}
     for relative in manifest["files"]:
         if relative in exceptions:
             continue
-        original = subprocess.check_output(
-            ["git", "show", f"{gate.BEHAVIORAL_BASELINE_COMMIT}:{relative}"], cwd=gate.ROOT
-        )
-        assert (gate.ROOT / relative).read_bytes() == original, relative
+        _assert_historical_source(relative, (gate.ROOT / relative).read_bytes())
+
+
+def _reverse_exact_ast(tree: ast.AST, expected: str, replacement: str = "") -> None:
+    """Authorize one exact subtree, never a function-name-only exception."""
+    pattern = ast.parse(expected).body[0]
+    substitute = ast.parse(replacement).body[0] if replacement else None
+
+    class Reverse(ast.NodeTransformer):
+        count = 0
+
+        def generic_visit(self, node):
+            if ast.dump(node) == ast.dump(pattern):
+                self.count += 1
+                return substitute
+            return super().generic_visit(node)
+
+    reverse = Reverse()
+    reverse.visit(tree)
+    assert reverse.count == 1, f"expected one exact authorized subtree: {expected}"
+
+
+def _assert_retrieval_behavioral_contract(source: str) -> None:
+    """Permit only the literal Policy rescue and pinned observation hooks."""
+
+    relative = "backend/rag/retrieval.py"
+    original = ast.parse(subprocess.check_output(
+        ["git", "show", f"{gate.BEHAVIORAL_BASELINE_COMMIT}:{relative}"], cwd=gate.ROOT,
+    ))
+    current = ast.parse(source)
+    _reverse_exact_ast(current, "_POLICY_EMPTY_POOL_FLOOR = -3.0")
+    _reverse_exact_ast(current, '''
+def _eligible_candidates(
+    reranked: Sequence[dict[str, Any]],
+    config: RetrievalConfig,
+    *,
+    collection_type: str,
+) -> list[dict[str, Any]]:
+    eligible = [candidate for candidate in reranked
+                if candidate["rerank_score"] >= config.adaptive_relevance_floor]
+    if (not eligible and collection_type == "policy" and reranked
+        and reranked[0]["rerank_score"] >= _POLICY_EMPTY_POOL_FLOOR):
+        return [reranked[0]]
+    return eligible
+''')
+    _reverse_exact_ast(current, '''
+with observe_stage(f"chat.{trace_prefix}_relevance_floor"):
+    eligible = _eligible_candidates(reranked, config, collection_type=collection_type)
+''', '''
+with observe_stage(f"chat.{trace_prefix}_relevance_floor"):
+    eligible = [candidate for candidate in reranked
+                if candidate["rerank_score"] >= config.adaptive_relevance_floor]
+''')
+    observer = [n for n in current.body if isinstance(n, ast.FunctionDef)
+                and n.name == "_observe_candidate_decisions"]
+    assert len(observer) == 1
+    _reverse_exact_ast(observer[0], "effective_floor = config.adaptive_relevance_floor")
+    _reverse_exact_ast(observer[0], '''
+if prefix == "policy" and floor_pass and score < effective_floor:
+    effective_floor = _POLICY_EMPTY_POOL_FLOOR
+''')
+    # Replace the one expression only after validating its exact AST.
+    expressions = [n for n in ast.walk(observer[0]) if isinstance(n, ast.Call)
+                   and ast.dump(n) == ast.dump(ast.parse("float(effective_floor).hex()", mode="eval").body)]
+    assert len(expressions) == 1
+    expressions[0].func.value.args[0] = ast.parse(
+        "config.adaptive_relevance_floor", mode="eval"
+    ).body
+    # Pin the pre-rescue observer from b784bc29, including absence of extra calls.
+    assert hashlib.sha256(ast.dump(observer[0]).encode()).hexdigest() == (
+        "7ac10b8097fa9a4849866852c9f06226ee41e9a4ab6fe82dc8d27755bd468343"
+    )
+    allowed_imports = {
+        "backend.model_config": {"ONNX_RERANKER", "RERANKER_MODEL_REVISION"},
+        "backend.wizard.diagnostics": {
+            "capture_retrieval_candidate_pages", "observe_trace_metadata",
+        },
+    }
+    expected_hook = ast.parse('''
+if trace_prefix is not None:
+    observe_trace_metadata(
+        _observe_candidate_decisions,
+        prefix=trace_prefix,
+        hybrid_candidates=candidates,
+        reranked=reranked,
+        eligible=eligible,
+        adaptive_pool=adaptive_pool,
+        hydrated_pool=hydrated_pool,
+        mmr_selected=mmr_selected,
+        final_selected=selected,
+        mmr_usable=mmr_usable,
+        config=config,
+    )
+''').body[0]
+    alias = ast.parse("mmr_selected = selected").body[0]
+    functions = [n for n in current.body if isinstance(n, ast.FunctionDef)]
+    assert sum(n.name == "_observe_candidate_decisions" for n in functions) == 1
+    current.body = [n for n in current.body if not (
+        isinstance(n, ast.FunctionDef) and n.name == "_observe_candidate_decisions"
+    )]
+    for node in current.body:
+        if isinstance(node, ast.ImportFrom) and node.module in allowed_imports:
+            names = allowed_imports[node.module]
+            assert {n.name for n in node.names} >= names
+            node.names = [n for n in node.names if n.name not in names]
+        if isinstance(node, ast.FunctionDef) and node.name == "retrieve":
+            for allowed in (alias, expected_hook):
+                matches = [n for n in node.body if ast.dump(n) == ast.dump(allowed)]
+                assert len(matches) == 1
+                node.body.remove(matches[0])
+    assert ast.dump(current) == ast.dump(original)
+
+
+def test_retrieval_behavioral_baseline_allows_exact_policy_rescue_only() -> None:
+    _assert_retrieval_behavioral_contract((gate.ROOT / "backend/rag/retrieval.py").read_text())
+
+
+@pytest.mark.parametrize(("before", "after"), [
+    ('and collection_type == "policy"', 'and collection_type == "knowledge_facts"'),
+    ('return [reranked[0]]', 'return [reranked[1]]'),
+    ('return [reranked[0]]', 'return [reranked[2]]'),
+    ('_POLICY_EMPTY_POOL_FLOOR = -3.0', '_POLICY_EMPTY_POOL_FLOOR = -3.01'),
+    ('not eligible\n        and collection_type', 'eligible\n        and collection_type'),
+    ('return [reranked[0]]', 'return reranked[:2]'),
+    ('>= config.adaptive_relevance_floor', '> config.adaptive_relevance_floor'),
+    ('>= _POLICY_EMPTY_POOL_FLOOR', '> _POLICY_EMPTY_POOL_FLOOR'),
+    ('if largest < config.adaptive_gap_threshold:', 'if largest <= config.adaptive_gap_threshold:'),
+    ('config.mmr_lambda * normalized[index]', '0.5 * normalized[index]'),
+    ('"knowledge_facts": TOKEN_BUDGETS.knowledge_tokens', '"knowledge_facts": 9999'),
+    ('config.candidate_count,\n', '999,\n'),
+    ('raw_hydrated = hydrate(requested)', 'raw_hydrated = hydrate(requested)\n    hydrate(requested)'),
+    ('raw_hydrated = hydrate(requested)', 'raw_hydrated = []'),
+    ('adaptive_pool = eligible[:adaptive_count]', 'adaptive_pool = eligible'),
+    ('reranked = _cross_encoder(candidates, query, config, active_runtime)',
+     'reranked = _cross_encoder(candidates, query, config, active_runtime)\n    _cross_encoder(candidates, query, config, active_runtime)'),
+    ('return _normalized_candidates(\n', 'hybrid_search(query, vector, 50)\n    return _normalized_candidates(\n'),
+    ('-candidate["rerank_score"],', 'candidate["rerank_score"],'),
+    ('mmr_selected = selected', 'mmr_selected = selected\n    selected = hydrated_pool'),
+    ('digest = framed_content_digest(\n            "chat-kp-candidate-text-v1",',
+     'hydrate()\n        digest = framed_content_digest(\n            "chat-kp-candidate-text-v1",'),
+    ('_LOGGER = logging.getLogger(__name__)', '_LOGGER = logging.getLogger("unrelated-change")'),
+])
+def test_retrieval_contract_rejects_in_memory_behavioral_mutations(before, after) -> None:
+    source = (gate.ROOT / "backend/rag/retrieval.py").read_text()
+    assert before in source
+    mutated = source.replace(before, after, 1)
+    ast.parse(mutated)  # Rejection must be contractual, not a syntax error.
+    with pytest.raises(AssertionError):
+        _assert_retrieval_behavioral_contract(mutated)
+
+
+@pytest.mark.parametrize(("before", "after"), [
+    ('FIXED_KNOWLEDGE_CANDIDATE_COUNT = 50', 'FIXED_KNOWLEDGE_CANDIDATE_COUNT = 51'),
+    ('FIXED_POLICY_CANDIDATE_COUNT = 40', 'FIXED_POLICY_CANDIDATE_COUNT = 41'),
+    ('"HYBRID_ALPHA", 0.70', '"HYBRID_ALPHA", 0.60'),
+    ('"relativeScoreFusion"', '"rankedFusion"'),
+    ('_DEFAULT_ADAPTIVE_GAP_THRESHOLD = 0.15', '_DEFAULT_ADAPTIVE_GAP_THRESHOLD = 0.10'),
+    ('_DEFAULT_MMR_LAMBDA = 0.70', '_DEFAULT_MMR_LAMBDA = 0.60'),
+])
+def test_historical_configuration_rejects_in_memory_mutations(before, after) -> None:
+    relative = "backend/model_config.py"
+    source = (gate.ROOT / relative).read_text()
+    assert before in source
+    with pytest.raises(AssertionError):
+        _assert_historical_source(relative, source.replace(before, after, 1).encode())
 
 
 def test_deep_malformed_correlation_faults_deep_session_only() -> None:

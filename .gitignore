@@ -4,6 +4,7 @@
 /models/gte-modernbert-base/
 /models/bge-reranker-v2-m3-onnx/
 /models/all-MiniLM-L6-v2/
+/models/LateOn/
 /all-MiniLM-L6-v2/
 
 # Local runtime configuration may contain SGLang credentials.
@@ -27,3 +28,4 @@ __pycache__/
 .DS_Store
 qwen3-4b-awq/
 .venv/
+*.onnx

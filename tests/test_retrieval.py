@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import math
 from types import SimpleNamespace
 from uuid import UUID, uuid4, uuid5
 
@@ -19,7 +20,7 @@ from backend.model_config import (
     TOKEN_BUDGETS,
     RetrievalConfig,
 )
-from backend.rag.retrieval import _adaptive_k, _mmr, retrieve
+from backend.rag.retrieval import _adaptive_k, _eligible_candidates, _mmr, retrieve
 from backend.rag.runtime import RAGRuntime, RerankResult
 from backend.weaviate_client.models import HydratedSearchResult, SearchResult
 from backend.weaviate_client.models import IncompatibleCollectionSchemaError
@@ -593,8 +594,10 @@ def _run_traced_retrieval(
     collection: FakeCollection,
     reranker: FakeReranker,
     collection_type: str,
+    *,
+    capture_mode: str = "deep",
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
-    registry = DiagnosticTraceRegistry("diagnostic_user")
+    registry = DiagnosticTraceRegistry("diagnostic_user", capture_mode=capture_mode)
     trace_session = str(uuid4())
     operation_id = str(uuid4())
     registry.start("diagnostic_user", trace_session, "run")
@@ -619,10 +622,305 @@ def _run_traced_retrieval(
             )
     finally:
         uninstall_registry(registry)
+    if capture_mode == "evaluation":
+        registry.finish(handle, "succeeded")
     operation = registry.snapshot(
         "diagnostic_user", trace_session, operation_id
     )["operations"][0]
     return results, operation
+
+
+def _candidate_observations(
+    operation: dict[str, object], prefix: str
+) -> list[dict[str, str]]:
+    samples = operation["samples"]
+    texts = operation["texts"]
+    assert isinstance(samples, dict)
+    assert isinstance(texts, dict)
+    fields = texts[f"{prefix}_candidate_decision_fields"].split("|")
+    rows: list[str] = []
+    for page in (1, 2):
+        rows.extend(samples[f"{prefix}_candidate_decisions_page_{page}"]["items"])
+    return [dict(zip(fields, row.split("|"), strict=True)) for row in rows]
+
+
+@pytest.mark.parametrize(
+    ("collection_type", "prefix", "candidate_count"),
+    [
+        ("knowledge_facts", "knowledge", 50),
+        ("policy", "policy", 40),
+    ],
+)
+def test_candidate_observation_is_complete_and_does_not_change_work(
+    collection_type: str,
+    prefix: str,
+    candidate_count: int,
+) -> None:
+    fixtures = [
+        _chunk(index, "duplicate text", (1.0, 0.0), 0.5)
+        for index in range(1, candidate_count + 1)
+    ]
+    plain_collection = FakeCollection(fixtures)
+    plain_reranker = FakeReranker(
+        [RerankResult(index, 0.5) for index in range(candidate_count)]
+    )
+    plain = retrieve(
+        plain_collection,
+        "rewritten question",
+        [[0.3, 0.7]],
+        collection_type,
+        runtime=_runtime(plain_reranker),
+    )
+    traced_collection = FakeCollection(fixtures)
+    traced_reranker = FakeReranker(
+        [RerankResult(index, 0.5) for index in range(candidate_count)]
+    )
+    traced, operation = _run_traced_retrieval(
+        traced_collection,
+        traced_reranker,
+        collection_type,
+    )
+
+    assert traced == plain
+    assert traced_collection.calls == plain_collection.calls
+    assert traced_collection.hydration_calls == plain_collection.hydration_calls
+    assert traced_reranker.calls == plain_reranker.calls
+    rows = _candidate_observations(operation, prefix)
+    assert len(rows) == candidate_count
+    assert [int(row["hybrid_rank"]) for row in rows] == list(
+        range(1, candidate_count + 1)
+    )
+    assert [int(row["bge_rank"]) for row in rows] == list(
+        range(1, candidate_count + 1)
+    )
+    assert operation["samples"][f"{prefix}_candidate_decisions_page_1"][
+        "exact_count"
+    ] == 32
+    assert operation["samples"][f"{prefix}_candidate_decisions_page_2"][
+        "exact_count"
+    ] == candidate_count - 32
+    digest_rows = []
+    for page in (1, 2):
+        digest_rows.extend(
+            operation["samples"][f"{prefix}_candidate_text_digests_page_{page}"][
+                "items"
+            ]
+        )
+    assert len(digest_rows) == candidate_count
+    assert len({row.split(":", 1)[1] for row in digest_rows}) == 1
+    assert "mmr_limit" in {
+        row["first_exclusion_reason"] for row in rows
+    }
+
+
+def test_candidate_observation_distinguishes_floor_and_adaptive_rejection() -> None:
+    collection = FakeCollection(
+        [
+            _chunk(1, "one", (1.0, 0.0), 0.5),
+            _chunk(2, "two", (0.0, 1.0), 0.5),
+            _chunk(3, "three", (1.0, 1.0), 0.5),
+            _chunk(4, "four", (1.0, -1.0), 0.5),
+        ]
+    )
+    reranker = FakeReranker(
+        [
+            RerankResult(0, 3.0),
+            RerankResult(1, 2.9),
+            RerankResult(2, -0.9),
+            RerankResult(3, -1.1),
+        ]
+    )
+
+    _, operation = _run_traced_retrieval(
+        collection, reranker, "knowledge_facts"
+    )
+    rows = _candidate_observations(operation, "knowledge")
+
+    assert [row["first_exclusion_reason"] for row in rows] == [
+        "selected",
+        "selected",
+        "adaptive_gap",
+        "floor",
+    ]
+    assert rows[2]["floor_pass"] == "1"
+    assert rows[2]["adaptive_inclusion"] == "0"
+    assert rows[3]["floor_pass"] == "0"
+    assert float.fromhex(rows[3]["raw_score_hex"]) == -1.1
+
+
+def test_candidate_observation_floor_equality_and_all_negative_scores() -> None:
+    collection = FakeCollection(
+        [
+            _chunk(1, "boundary", (1.0, 0.0), 0.5),
+            _chunk(2, "below", (0.0, 1.0), 0.5),
+        ]
+    )
+    reranker = FakeReranker(
+        [RerankResult(0, -1.0), RerankResult(1, -1.0001)]
+    )
+
+    _, operation = _run_traced_retrieval(
+        collection, reranker, "knowledge_facts"
+    )
+    rows = _candidate_observations(operation, "knowledge")
+
+    assert rows[0]["floor_pass"] == "1"
+    assert rows[0]["first_exclusion_reason"] == "selected"
+    assert rows[1]["floor_pass"] == "0"
+    assert rows[1]["first_exclusion_reason"] == "floor"
+    assert float.fromhex(rows[0]["floor_hex"]) == -1.0
+
+    all_rejected, rejected_operation = _run_traced_retrieval(
+        FakeCollection(
+            [
+                _chunk(1, "first", (1.0, 0.0), 0.5),
+                _chunk(2, "second", (0.0, 1.0), 0.5),
+            ]
+        ),
+        FakeReranker(
+            [RerankResult(0, -1.01), RerankResult(1, -2.0)]
+        ),
+        "knowledge_facts",
+    )
+    assert all_rejected == []
+    assert {
+        row["first_exclusion_reason"]
+        for row in _candidate_observations(rejected_operation, "knowledge")
+    } == {"floor"}
+
+
+def test_candidate_observation_records_hydration_mmr_fallback_and_budget() -> None:
+    class MixedCollection(FakeCollection):
+        def hydrate_mmr_head(
+            self,
+            candidates: Sequence[SearchResult],
+        ) -> list[HydratedSearchResult]:
+            hydrated = super().hydrate_mmr_head(candidates)
+            first = hydrated[0]
+            hydrated[0] = HydratedSearchResult(
+                first.object_id,
+                first.canonical_id,
+                None,
+                quarantine_reason="malformed_candidate",
+            )
+            second = hydrated[1]
+            hydrated[1] = HydratedSearchResult(
+                second.object_id,
+                second.canonical_id,
+                None,
+                second.raw_text,
+                second.segment_index,
+            )
+            return hydrated
+
+    long_texts = [f"item-{index} " + "word " * 400 for index in range(1, 11)]
+    fixtures = [
+        _chunk(index, text, (1.0, 0.0), 0.5)
+        for index, text in enumerate(long_texts, start=1)
+    ]
+    collection = MixedCollection(fixtures)
+    reranker = FakeReranker(
+        [RerankResult(index, 0.5) for index in range(len(fixtures))]
+    )
+
+    _, operation = _run_traced_retrieval(
+        collection, reranker, "knowledge_facts"
+    )
+    rows = _candidate_observations(operation, "knowledge")
+
+    assert rows[0]["hydration_outcome"] == "f"
+    assert rows[0]["first_exclusion_reason"] == "hydration"
+    assert rows[1]["hydration_outcome"] == "y"
+    assert rows[9]["first_exclusion_reason"] == "fallback_limit"
+    assert "budget" in {row["first_exclusion_reason"] for row in rows}
+
+
+def test_candidate_observer_failure_cannot_change_retrieval() -> None:
+    class FaultingRegistry(DiagnosticTraceRegistry):
+        def set_text(
+            self, handle: object, name: str, value: str
+        ) -> None:
+            if name == "knowledge_candidate_decision_fields":
+                raise RuntimeError("observer fault")
+            super().set_text(handle, name, value)  # type: ignore[arg-type]
+
+    fixtures = [
+        _chunk(1, "first", (1.0, 0.0), 0.5),
+        _chunk(2, "second", (0.0, 1.0), 0.5),
+    ]
+    plain_collection = FakeCollection(fixtures)
+    plain_reranker = FakeReranker()
+    expected = retrieve(
+        plain_collection,
+        "rewritten question",
+        [[0.3, 0.7]],
+        "knowledge_facts",
+        runtime=_runtime(plain_reranker),
+    )
+    registry = FaultingRegistry("diagnostic_user")
+    trace_session = str(uuid4())
+    registry.start("diagnostic_user", trace_session, "run")
+    handle = registry.begin_operation(
+        user_id="diagnostic_user",
+        session_id=trace_session,
+        operation_id=str(uuid4()),
+        kind="chat_query",
+        collection_type="conversations",
+        wizard_id=str(uuid4()),
+    )
+    assert handle is not None
+    traced_collection = FakeCollection(fixtures)
+    traced_reranker = FakeReranker()
+    install_registry(registry)
+    try:
+        with activate_operation(handle):
+            actual = retrieve(
+                traced_collection,
+                "rewritten question",
+                [[0.3, 0.7]],
+                "knowledge_facts",
+                runtime=_runtime(traced_reranker),
+            )
+    finally:
+        uninstall_registry(registry)
+
+    snapshot = registry.snapshot("diagnostic_user", trace_session)
+    assert actual == expected
+    assert traced_collection.calls == plain_collection.calls
+    assert traced_collection.hydration_calls == plain_collection.hydration_calls
+    assert traced_reranker.calls == plain_reranker.calls
+    assert snapshot["trace_faulted"] is True
+
+
+def test_candidate_derivation_runs_only_in_deep_trace_and_fault_is_isolated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.rag import retrieval
+
+    observations: list[object] = []
+
+    def failed_observer(**kwargs: object) -> None:
+        observations.append(kwargs)
+        raise RuntimeError("derivation failed before sample recording")
+
+    monkeypatch.setattr(retrieval, "_observe_candidate_decisions", failed_observer)
+    fixtures = [_chunk(1, "first", (1.0, 0.0), 0.5)]
+    plain_collection, plain_reranker = FakeCollection(fixtures), FakeReranker()
+    plain = retrieve(
+        plain_collection, "rewritten question", [[0.3, 0.7]],
+        "knowledge_facts", runtime=_runtime(plain_reranker),
+    )
+    assert observations == []
+    for mode in ("evaluation", "deep"):
+        collection, reranker = FakeCollection(fixtures), FakeReranker()
+        actual, _ = _run_traced_retrieval(
+            collection, reranker, "knowledge_facts", capture_mode=mode,
+        )
+        assert actual == plain
+        assert collection.calls == plain_collection.calls
+        assert collection.hydration_calls == plain_collection.hydration_calls
+        assert reranker.calls == plain_reranker.calls
+        assert len(observations) == (1 if mode == "deep" else 0)
 
 
 def test_kp_trace_records_empty_pool_without_extra_model_or_storage_calls() -> None:
@@ -742,10 +1040,101 @@ def test_relevance_floor_can_produce_no_context() -> None:
         "query",
         [[1.0]],
         "policy",
-        runtime=_runtime(FakeReranker([RerankResult(0, -2.0)])),
+        runtime=_runtime(FakeReranker([RerankResult(0, -3.01)])),
     )
     assert results == []
     assert collection.hydration_calls == []
+
+
+@pytest.mark.parametrize(
+    ("scores", "expected"),
+    [([], []), ([-3.0], [1]), ([math.nextafter(-3.0, -math.inf)], []),
+     ([-1.0, -2.0], [1]), ([-0.5, -0.6, -2.0], [1, 2]),
+     ([-2.0, -2.0, -2.1], [1])],
+)
+def test_policy_rescue_boundaries_and_nonempty_pool(scores, expected) -> None:
+    candidates = [_candidate(i, s, [1.0]) for i, s in enumerate(scores, 1)]
+    selected = _eligible_candidates(candidates, POLICY_SEARCH, collection_type="policy")
+    assert [c["object_id"] for c in selected] == [_uuid(i) for i in expected]
+    assert all(any(c is original for original in candidates) for c in selected)
+    assert _adaptive_k(selected, POLICY_SEARCH) == len(selected)
+
+
+@pytest.mark.parametrize("floor", [-4.0, -2.5, -1.0, 0.0])
+def test_policy_rescue_preserves_configured_floor(floor) -> None:
+    config = replace(POLICY_SEARCH, adaptive_relevance_floor=floor)
+    candidates = [_candidate(1, -2.0, [1.0]), _candidate(2, -3.5, [1.0])]
+    ordinary = [c for c in candidates if c["rerank_score"] >= floor]
+    assert _eligible_candidates(candidates, config, collection_type="policy") == (
+        ordinary or candidates[:1]
+    )
+
+
+@pytest.mark.parametrize("collection_type", ["knowledge_facts", "conversations"])
+def test_policy_rescue_does_not_apply_to_other_collections(collection_type) -> None:
+    fixture = (_conversation_segment(1, 10, 0) if collection_type == "conversations"
+               else _chunk(1, "rule", [1.0], 0.0))
+    collection = FakeCollection([fixture])
+    reranker = FakeReranker([RerankResult(0, -2.0)])
+    assert retrieve(collection, "query", [[1.0]], collection_type, runtime=_runtime(reranker)) == []
+    assert len(collection.calls) == len(reranker.calls) == 1
+    assert collection.hydration_calls == []
+
+
+@pytest.mark.parametrize("observer_fault", [False, True])
+def test_policy_rescue_trace_tie_order_and_call_parity(monkeypatch, observer_fault) -> None:
+    import backend.rag.retrieval as module
+    fixtures = [_chunk(2, "second", [0.0, 1.0], 0.0), _chunk(1, "first", [1.0, 0.0], 0.0)]
+    scores = [RerankResult(0, -2.0), RerankResult(1, -2.0)]
+    plain_collection = FakeCollection(fixtures)
+    plain_reranker = FakeReranker(scores)
+    plain = retrieve(plain_collection, "rewritten question", [[0.3, 0.7]], "policy", runtime=_runtime(plain_reranker))
+    if observer_fault:
+        def fail(**kwargs):
+            raise RuntimeError("observation only")
+        monkeypatch.setattr(module, "_observe_candidate_decisions", fail)
+    collection = FakeCollection(fixtures)
+    reranker = FakeReranker(scores)
+    traced, operation = _run_traced_retrieval(collection, reranker, "policy")
+    assert traced == plain
+    assert [r["object_id"] for r in traced] == [_uuid(1)]
+    assert collection.calls == plain_collection.calls
+    assert collection.hydration_calls == plain_collection.hydration_calls
+    assert reranker.calls == plain_reranker.calls
+    assert len(collection.calls) == len(collection.hydration_calls) == len(reranker.calls) == 1
+    if not observer_fault:
+        rows = _candidate_observations(operation, "policy")
+        assert float.fromhex(rows[0]["floor_hex"]) == -3.0
+        assert rows[0]["first_exclusion_reason"] == "selected"
+        assert float.fromhex(rows[1]["floor_hex"]) == -1.0
+        assert rows[1]["first_exclusion_reason"] == "floor"
+
+
+@pytest.mark.parametrize("outcome", ["valid", "missing", "malformed", "vector", "budget"])
+def test_policy_rescue_uses_unchanged_hydration_and_budget(outcome) -> None:
+    class Collection(FakeCollection):
+        def hydrate_mmr_head(self, candidates):
+            hydrated = super().hydrate_mmr_head(candidates)
+            if outcome == "missing":
+                return []
+            if outcome == "malformed":
+                return [replace(hydrated[0], quarantine_reason="malformed_candidate")]
+            if outcome == "vector":
+                return [replace(hydrated[0], diversity_vector=None)]
+            return hydrated
+    text = "word " * (TOKEN_BUDGETS.policy_tokens + 1) if outcome == "budget" else "support"
+    collection = Collection([_chunk(1, text, [1.0], 0.0)])
+    reranker = FakeReranker([RerankResult(0, -2.697265625)])
+    if outcome == "missing":
+        with pytest.raises(TypeError, match="one ordered result"):
+            retrieve(collection, "query", [[1.0]], "policy", runtime=_runtime(reranker))
+    else:
+        results, operation = _run_traced_retrieval(collection, reranker, "policy")
+        assert bool(results) == (outcome in {"valid", "vector"})
+        row = _candidate_observations(operation, "policy")[0]
+        assert row["first_exclusion_reason"] == {"valid": "selected", "vector": "selected", "malformed": "hydration", "budget": "budget"}[outcome]
+        assert operation["flags"]["policy_mmr_fallback"] == (outcome == "vector")
+    assert len(collection.calls) == len(collection.hydration_calls) == len(reranker.calls) == 1
 
 
 @pytest.mark.parametrize("collection_type", ["unknown", "knowledge", ""])

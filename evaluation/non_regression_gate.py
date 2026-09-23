@@ -37,6 +37,7 @@ APPROVED_EVIDENCE_HOOK_FILES = frozenset(
         "backend/config.py",
         "backend/providers/sglang_query_rewriter.py",
         "backend/rag/generator.py",
+        "backend/rag/retrieval.py",
         "backend/runtime_app.py",
         "backend/wizard/diagnostics.py",
         "deployment/e2e_diagnostic.py",

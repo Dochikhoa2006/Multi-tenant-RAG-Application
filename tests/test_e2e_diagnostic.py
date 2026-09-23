@@ -4,6 +4,8 @@ from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from uuid import UUID
 
 import pytest
 
@@ -486,6 +488,116 @@ def _complete_state(root: Path):
         state = record_replacement_document(state, saved)
     state = mark_replacement_verified(state)
     return promote_replacement(state), fixtures
+
+
+@pytest.mark.parametrize("failure", [None, "hydration", "fingerprint", "membership"])
+def test_phase2_full_corpus_verification_precedes_any_query(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str | None,
+) -> None:
+    from deployment import e2e_diagnostic_api as api
+    from deployment import wizard_diagnostic_api as wizard
+    from backend.config import get_collection_name
+    from backend.weaviate_client.models import ChunkRecord
+    from deployment.wizard_diagnostic import WizardDiagnosticError
+
+    state, _ = _complete_state(tmp_path)
+    monkeypatch.setattr(wizard, "LATEON_EMBEDDING_DIMENSION", 1)
+    monkeypatch.setattr(wizard, "GTE_EMBEDDING_DIMENSION", 1)
+    documents = []
+    records = {}
+    for document in state.active.documents:
+        count = 10_001 if document.collection == "knowledge" else 2
+        base = 100_000 if document.collection == "knowledge" else 200_000
+        items = tuple(
+            ChunkRecord(
+                str(UUID(int=base + index)), USER_ID, document.wizard_id,
+                index + 1, str(UUID(int=base + index)), "persisted text",
+                ((0.25,),), (0.5,),
+            )
+            for index in range(count)
+        )
+        integrity = wizard.storage_integrity(items)
+        documents.append(replace(
+            document, chunk_ids=integrity.chunk_ids,
+            storage_fingerprint=integrity.fingerprint,
+        ))
+        records[document.collection] = {item.chunk_id: item for item in items}
+    state = replace(state, active=replace(state.active, documents=tuple(documents)))
+    before = state.payload()
+    last_id = documents[0].chunk_ids[-1]
+    if failure == "fingerprint":
+        records["knowledge"][last_id] = replace(
+            records["knowledge"][last_id], raw_text="unexpected change"
+        )
+    if failure == "membership":
+        records["knowledge"][last_id] = replace(
+            records["knowledge"][last_id], user_id="another_user"
+        )
+    batches = []
+
+    def physical(collection):
+        def iterator(**kwargs):
+            assert kwargs == {
+                "include_vector": False,
+                "return_properties": ["user_id", "document_id", "chunk_id"],
+            }
+            for record in records[collection].values():
+                yield SimpleNamespace(uuid=UUID(record.object_id), properties={
+                    "user_id": record.user_id,
+                    "document_id": UUID(record.document_id),
+                    "chunk_id": UUID(record.chunk_id),
+                })
+        return SimpleNamespace(iterator=iterator)
+
+    class Storage(wizard.CorpusStorage):
+        def __enter__(self):
+            physicals = {
+                get_collection_name(USER_ID, kind): physical(collection)
+                for collection, kind in (("knowledge", "knowledge_facts"), ("policy", "policy"))
+            }
+            self.manager = SimpleNamespace(client=SimpleNamespace(collections=SimpleNamespace(
+                exists=lambda name: name in physicals, use=physicals.__getitem__,
+            )))
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def _collection(self, user_id, collection):
+            assert user_id == USER_ID
+
+            def fetch(ids):
+                assert 0 < len(ids) <= 64
+                batches.append(tuple(ids))
+                return {
+                    key: records[collection][key] for key in ids
+                    if not (failure == "hydration" and key == last_id)
+                }
+
+            # No bounded snapshot method: the real vector-free full scan and
+            # batched hydration must handle the complete physical document.
+            return SimpleNamespace(_collection=physical(collection), _fetch_records_by_ids=fetch)
+
+    monkeypatch.setattr(api, "CorpusStorage", Storage)
+    if failure is None:
+        assert api.verify_physical_corpus({}, state, state.active) == {
+            "knowledge": 10_001, "policy": 2,
+        }
+        assert sum(map(len, batches)) == 10_003
+    else:
+        def forbidden(*args, **kwargs):
+            pytest.fail("Corpus verification failure must precede HTTP/query submission")
+
+        monkeypatch.setattr(api.httpx, "Client", forbidden)
+        monkeypatch.setattr(api, "_execute_query", forbidden)
+        progress = {}
+        with pytest.raises((E2EDiagnosticError, WizardDiagnosticError)):
+            api.run_e2e_phase_2d(
+                "https://unused.invalid", {}, {}, state, state.active,
+                None, None, progress, continuous=False, run_id="test",
+            )
+        assert progress["physical_corpus_status"] == "failed"
+    assert state.payload() == before
 
 
 def test_query_loader_is_static_ordered_and_preserves_exact_strings(
