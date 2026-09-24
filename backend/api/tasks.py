@@ -78,7 +78,13 @@ async def get_post_generation_acceptance(
         ],
     }
 
+class SessionDetailResource(SessionResource):
+    conversations: list[ConversationResource]
 
+
+class WizardCreateRequest(BaseModel):
+    user_id: str = Field(min_length=1)
+    
 @router.get("/{task_id}", response_model=TaskResource)
 async def get_task(
     task_id: str,
