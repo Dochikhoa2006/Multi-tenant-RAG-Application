@@ -18,6 +18,21 @@ class SessionCreateRequest(BaseModel):
     user_id: str = Field(min_length=1)
 
 
+def validated_document_collection_type(collection_type: object) -> str:
+    normalized = required_identifier(collection_type, "collection_type").lower()
+    if normalized not in DOCUMENT_COLLECTION_TYPES:
+        allowed = ", ".join(sorted(DOCUMENT_COLLECTION_TYPES))
+        raise ValueError(f"collection_type must be one of: {allowed}")
+    return normalized
+
+
+def positive_paragraph_id(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("paragraph_id must be an integer")
+    if value <= 0:
+        raise ValueError("paragraph_id must be greater than zero")
+    return value
+
 class SessionTitleRequest(BaseModel):
     user_id: str = Field(min_length=1)
     title: str = Field(min_length=1)
