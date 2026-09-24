@@ -19,6 +19,20 @@ from fastapi import (
     status,
 )
 
+def validated_user_id(user_id: object) -> str:
+    if not isinstance(user_id, str):
+        raise TypeError("user_id must be a string")
+    get_collection_name(user_id, "conversations")
+    return user_id
+
+
+def validated_document_collection_type(collection_type: object) -> str:
+    normalized = required_identifier(collection_type, "collection_type").lower()
+    if normalized not in DOCUMENT_COLLECTION_TYPES:
+        allowed = ", ".join(sorted(DOCUMENT_COLLECTION_TYPES))
+        raise ValueError(f"collection_type must be one of: {allowed}")
+    return normalized
+
 from backend.api.dependencies import get_services
 from backend.api.errors import (
     log_internal_error,
