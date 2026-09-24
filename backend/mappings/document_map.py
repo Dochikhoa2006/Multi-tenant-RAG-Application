@@ -45,11 +45,6 @@ class DocumentMap:
 
         return list(self._documents)
 
-    def get_full_text(self, document_id: str) -> str:
-        key = required_uuid(document_id, "document_id")
-        return "".join(self._documents[key].values())
-
-
     def update_paragraphs(
         self,
         document_id: str,
