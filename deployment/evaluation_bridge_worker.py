@@ -37,16 +37,6 @@ def _orphan_deadline(deadline: float) -> None:
     Event().wait(max(0.0, deadline + _STOP_GRACE_SECONDS + 1.0 - monotonic()))
     os.killpg(os.getpgrp(), signal.SIGKILL)
 
-def _execute_payload(payload: dict, lock_fd: int, deadline: float) -> dict:
-    # Potentially blocking imports and hydration belong to the child, never
-    # the process enforcing the admitted deadline.
-    from deployment.evaluation_bridge import run_admitted_evaluation_payload
-
-    return run_admitted_evaluation_payload(
-        payload,
-        execution_lock_fd=lock_fd,
-        timeout_seconds=max(0.001, deadline - monotonic()),
-    )
 
 def _stop_child(child_pid: int) -> None:
     # Evaluator descendants inherit the child's group. Stop the group even
