@@ -37,11 +37,7 @@ CONTEXT_LENGTH = int(os.getenv("QWEN_MODAL_CONTEXT_LENGTH", "32768"))
 MEM_FRACTION_STATIC = os.getenv("QWEN_MODAL_MEM_FRACTION_STATIC", "0.80")
 OTLP_TRACES_ENDPOINT = os.getenv("QWEN_SGLANG_OTLP_TRACES_ENDPOINT", "").strip()
 VOLUME_NAME = os.getenv("QWEN_MODAL_MODEL_VOLUME", "rag-qwen-models")
-CUDA_GRAPH_MAX_BATCH = int(os.getenv("QWEN_MODAL_CUDA_GRAPH_MAX_BATCH", "8"))
-CONTEXT_LENGTH = int(os.getenv("QWEN_MODAL_CONTEXT_LENGTH", "32768"))
-MEM_FRACTION_STATIC = os.getenv("QWEN_MODAL_MEM_FRACTION_STATIC", "0.80")
-OTLP_TRACES_ENDPOINT = os.getenv("QWEN_SGLANG_OTLP_TRACES_ENDPOINT", "").strip()
-VOLUME_NAME = os.getenv("QWEN_MODAL_MODEL_VOLUME", "rag-qwen-models")
+
 
 for name, value in (
     ("QWEN_MODAL_SGLANG_PORT", PORT),
@@ -141,6 +137,8 @@ def _validate_checkpoint_manifest() -> None:
     ):
         raise RuntimeError("Checkpoint is not the expected Qwen3-4B AWQ model")
 
+model_volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=False)
+app = modal.App("rag-qwen-answer-title-sglang")
 
 def _check_running(process: subprocess.Popen[Any]) -> None:
     return_code = process.poll()
