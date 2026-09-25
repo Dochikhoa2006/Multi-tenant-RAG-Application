@@ -137,8 +137,6 @@ def _validate_checkpoint_manifest() -> None:
     ):
         raise RuntimeError("Checkpoint is not the expected Qwen3-4B AWQ model")
 
-model_volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=False)
-app = modal.App("rag-qwen-answer-title-sglang")
 
 def _check_running(process: subprocess.Popen[Any]) -> None:
     return_code = process.poll()
