@@ -16,7 +16,7 @@ from time import monotonic
 
 _MAX_INPUT_BYTES = 32 * 1024 * 1024
 _MAX_OUTPUT_BYTES = 1_048_576
-_STOP_GRACE_SECONDS = 5.0
+_STOP_GRACE_SECONDS = 5.1
 
 
 def _execute_payload(payload: dict, lock_fd: int, deadline: float) -> dict:
