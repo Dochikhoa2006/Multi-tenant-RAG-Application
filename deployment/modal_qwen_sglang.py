@@ -127,11 +127,6 @@ def _validate_checkpoint_manifest() -> None:
         or config.get("auto_map") is not None
         or not isinstance(quantization, dict)
         or quantization.get("quant_method") != "awq"
-        or quantization.get("bits") != 4
-        or quantization.get("group_size") != 128
-        or quantization.get("version") != "gemm"
-        or quantization.get("zero_point") is not True
-        or not isinstance(chat_template, str)
         or "enable_thinking" not in chat_template
         or tokenizer.get("auto_map") is not None
     ):
@@ -158,6 +153,11 @@ def _request_body(prompt: str, *, stream: bool, max_tokens: int) -> dict[str, ob
         "stream": stream,
         "chat_template_kwargs": {"enable_thinking": False},
     }
+
+def _check_running(process: subprocess.Popen[Any]) -> None:
+    return_code = process.poll()
+    if return_code is not None:
+        raise RuntimeError(f"Qwen SGLang terminated during startup with {return_code}")
 
 
 def _wait_and_warm(

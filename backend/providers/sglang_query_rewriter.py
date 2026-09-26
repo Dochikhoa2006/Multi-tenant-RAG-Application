@@ -156,9 +156,6 @@ class SGLangGraniteQueryRewriter:
         self.last_diagnostics: GraniteRewriteDiagnostics | None = None
         self._thread_diagnostics = threading.local()
 
-class _TransientSGLangQueryRewriteError(SGLangQueryRewriteError):
-    """A request failed before any rewrite was exposed and may be retried once."""
-
     @property
     def current_diagnostics(self) -> GraniteRewriteDiagnostics | None:
         """Return diagnostics for the most recent call on the current thread."""
