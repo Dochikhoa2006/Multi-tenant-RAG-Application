@@ -63,6 +63,13 @@ def _sha256(path: Path) -> str:
             digest.update(block)
     return digest.hexdigest()
 
+def _required_text(value: object, name: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a string")
+    if not value.strip():
+        raise ValueError(f"{name} must not be empty")
+    return value
+
 
 def _validated_artifacts(
     config: ONNXModelConfig,
