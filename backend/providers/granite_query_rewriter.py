@@ -326,6 +326,36 @@ class GraniteQueryRewriter:
                 )
             pair_count -= 1
 
+    def parse_granite_rewrite(
+        response_prefill: str,
+        continuation: str,
+    ) -> tuple[str, bool]:
+        """Strictly parse, or deterministically repair, one Granite continuation."""
+
+        full_output = response_prefill + continuation
+        try:
+            return _exact_rewritten_question(json.loads(full_output)), True
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+        repaired: set[str] = set()
+        stripped = continuation.rstrip()
+        repair_inputs = (
+            continuation,
+            f'{response_prefill}{stripped}"}}',
+            f"{response_prefill}{stripped}}}",
+        )
+        for candidate in repair_inputs:
+            try:
+                repaired.add(_exact_rewritten_question(json.loads(candidate)))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+        if len(repaired) == 1:
+            return repaired.pop(), False
+        raise GraniteRewriteFormatError(
+            "Granite rewrite did not satisfy the strict or repairable JSON contract"
+        )
+
     def _to_device(self, encoded: Mapping[str, Any]) -> Mapping[str, Any]:
         if callable(getattr(encoded, "to", None)):
             return encoded.to(self.config.device)

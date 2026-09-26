@@ -23,7 +23,6 @@ _PUBLIC_TASK_CANCELLED = (
     "Background operation was cancelled. Retry the original operation."
 )
 
-
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -67,10 +66,6 @@ class _TaskRecord:
             started_at=self.started_at,
             finished_at=self.finished_at,
         )
-
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
 
 class InMemoryTaskQueue:
     """Run work serially per user while retaining observable task outcomes."""
