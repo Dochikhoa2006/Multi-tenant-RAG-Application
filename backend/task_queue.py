@@ -68,6 +68,9 @@ class _TaskRecord:
             finished_at=self.finished_at,
         )
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
 
 class InMemoryTaskQueue:
     """Run work serially per user while retaining observable task outcomes."""
