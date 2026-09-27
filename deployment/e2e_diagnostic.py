@@ -393,8 +393,8 @@ print(json.dumps(out, sort_keys=True, allow_nan=False))
     rules = FixtureRules.from_config(config)
     environment.update({
         "SUPPORTED_FILE_EXTENSIONS": ",".join(rules.supported_extensions),
-        "TEXT_FILE_ENCODING": rules.text_encoding,
         "TEXT_FILE_JOIN_SEPARATOR": rules.text_join_separator,
+        "TEXT_FILE_ENCODING": rules.text_encoding,
     })
     inspected = subprocess.run(
         [sys.executable, "-c", script], cwd=root, env=environment,
