@@ -2089,14 +2089,7 @@ def run_e2e_phase_2d(
     dataset_evaluation: bool = False,
 ) -> dict[str, int]:
     """Verify the retained corpus and trace real public chat requests serially."""
-
-    evaluation={
-            "status": "skipped",
-            "error_code": "RAG_NOT_SUCCEEDED",
-            "queue_wait_ms": 0.0,
-            "execution_ms": 0.0,
-            "evaluation_ms": 0.0,
-        }
+    
     try:
         physical_counts = verify_physical_corpus(config, state, active)
     except BaseException:

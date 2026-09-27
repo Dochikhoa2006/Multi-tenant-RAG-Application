@@ -471,7 +471,7 @@ def write_dataset_report(
             outcome = {key: item.get(key) for key in ("name", "status", "score", "duration_ms", "error_code")}
             score = outcome["score"]
             if score is not None and (isinstance(score, bool) or not isinstance(score, (int, float))
-                                      or not math.isfinite(score) or not 0 <= score <= 1):
+                                    or not math.isfinite(score) or not 0 <= score <= 1):
                 outcome.update(status="failed", score=None, error_code="INVALID_METRIC_SCORE")
             metrics.append(outcome)
             if outcome["status"] == "failed":
