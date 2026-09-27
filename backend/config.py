@@ -183,6 +183,32 @@ def get_collection_name(user_id: str, collection_type: str) -> str:
             f"user_id does not match configured USER_ID_PATTERN {USER_ID_PATTERN!r}"
         )
 
+def _required_string(name: str, default: str) -> str:
+    value = os.getenv(name, default).strip()
+    if not value:
+        raise ValueError(f"{name} must not be empty")
+    return value
+
+
+def _supported_extensions() -> frozenset[str]:
+    raw_value = _required_string(
+        "SUPPORTED_FILE_EXTENSIONS",
+        ".txt,.md,.csv,.json,.xml,.log",
+    )
+    extensions: set[str] = set()
+    for item in raw_value.split(","):
+        extension = item.strip().lower()
+        if not extension:
+            continue
+        if not extension.startswith("."):
+            extension = f".{extension}"
+        extensions.add(extension)
+
+    if not extensions:
+        raise ValueError("SUPPORTED_FILE_EXTENSIONS must contain at least one extension")
+    return frozenset(extensions)
+
+
     if not isinstance(collection_type, str):
         raise TypeError("collection_type must be a string")
     normalized_collection_type = collection_type.strip().lower()
