@@ -133,22 +133,3 @@ def delete_wizard(
                 failed_stage, affected, recovery_errors
             ) from exc
         raise WizardDeleteError(failed_stage, affected) from exc
-
-        set_control("save_delete_executed", True)
-        active_runtime = resolve_runtime(runtime)
-        document_map = active_runtime.document_map(user_id, collection_type)
-        paragraph_map = active_runtime.paragraph_map(user_id, collection_type)
-
-        # Validate and snapshot both mappings before the destructive storage call.
-        paragraph_data = document_map.get_paragraph_data(document_id)
-        chunk_mappings = paragraph_map.get_document_chunks(document_id)
-        collection = active_runtime.collection(user_id, collection_type)
-        with observe_stage("delete.recovery_snapshot"):
-            snapshots = collection.snapshot_by_document(document_id)
-        add_count("recovery_snapshot_chunk_count", len(snapshots))
-        set_sample(
-            "delete_snapshot_chunk_ids",
-            [record.chunk_id for record in snapshots],
-            exact_count=len(snapshots),
-        )
-        failed_stage = "storage_delete"

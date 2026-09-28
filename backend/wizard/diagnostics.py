@@ -559,7 +559,7 @@ class DiagnosticTraceRegistry:
 
     def finish(self, handle: TraceHandle, outcome: str) -> None:
         if outcome not in {"succeeded", "failed"}:
-            raise ValueError("diagnostic operation outcome is invalid")
+            raise ValueError("diagnostic operation outcomes are invalid")
         with self._lock:
             operation = self._operation(handle)
             operation.outcome = outcome
