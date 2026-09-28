@@ -296,6 +296,34 @@ def _validated_multi_vector(value: object) -> tuple[tuple[float, ...], ...]:
     return rows
 
 
+@dataclass(frozen=True)
+class _SavedParagraph:
+    paragraph_id: int
+    text: str
+    start: int
+    end: int
+
+
+@dataclass(frozen=True)
+class _ParagraphUnion:
+    paragraph_ids: tuple[int, ...]
+    current_text: str
+
+
+@dataclass(frozen=True)
+class _StagedChunk:
+    chunk_id: str
+    raw_text: str
+    late_interaction: tuple[tuple[float, ...], ...]
+    mmr_diversity: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class _ParagraphNode:
+    raw_text: str
+    chunks: tuple[_StagedChunk, ...]
+    old_paragraph_id: int | None
+    
 def _batch_vectors(
     runtime: WizardRuntime,
     texts: list[str],
