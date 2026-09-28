@@ -234,6 +234,28 @@ class _Stage:
         }
 
 
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _uuid_text(value: object, name: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a UUID string")
+    try:
+        return str(UUID(value))
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a valid UUID") from exc
+
+
+def _required_text(value: object, name: str, *, maximum: int = 256) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a string")
+    if not value or value != value.strip():
+        raise ValueError(f"{name} must be non-empty without surrounding whitespace")
+    if len(value) > maximum:
+        raise ValueError(f"{name} is too long")
+    return value
+
 @dataclass
 class _Sample:
     exact_count: int
